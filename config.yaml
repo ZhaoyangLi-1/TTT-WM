@@ -1,0 +1,51 @@
+experiment_name: ar_video
+seed: 42
+
+model:
+  resolution: 64
+  num_channels: 3
+  patch_size: 8
+  d_model: 256
+  n_heads: 4
+  n_layers: 4
+  mlp_ratio: 4.0
+  dropout: 0.1
+  frames_in: 2
+  frames_out: 3
+
+data:
+  type: synthetic           # "synthetic" | "real"
+  root: /path/to/clips      # only used when type=real
+  val_split: 0.1
+  extensions: [png, jpg, jpeg]
+  n_train: 2000             # only used when type=synthetic
+  n_val: 200
+  moving_dot: true
+  num_workers: 4
+  pin_memory: true
+
+train:
+  epochs: 100
+  batch_size: 16
+  optimizer:
+    lr: 1.0e-4
+    weight_decay: 1.0e-2
+    betas: [0.9, 0.95]
+    no_decay_norm: true     # bias & norm params get weight_decay=0
+  scheduler:
+    warmup_fraction: 0.05
+  ema:
+    enabled: true
+    decay: 0.999            # higher = slower update  (0.999 is typical)
+    update_every: 1         # update EMA every N optimizer steps
+  grad_clip: 1.0
+  amp: true
+  ckpt_dir: checkpoints
+  save_every: 10
+  resume: ""
+  log_every: 50
+  device: "auto"                # "" = auto (cuda > mps > cpu)
+
+hydra:
+  run:
+    dir: outputs/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
