@@ -36,7 +36,12 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
-from ar_video_patch_transformer import ARPatchConfig, ARVideoPatchTransformer
+try:
+    from cosmos_model import ARPatchConfig, ARVideoPatchTransformer
+    _NEW_MODEL = True
+except ImportError:
+    from model import ARPatchConfig, ARVideoPatchTransformer
+    _NEW_MODEL = False
 
 log = logging.getLogger(__name__)
 
@@ -264,7 +269,9 @@ class Trainer:
 
         # ── model ───────────────────────────────────────────────────────
         mcfg = cfg.model
-        self.model_cfg = ARPatchConfig(
+
+        # Base fields shared by both old and new model
+        config_kwargs = dict(
             resolution   = mcfg.resolution,
             num_channels = mcfg.num_channels,
             patch_size   = mcfg.patch_size,
@@ -276,6 +283,16 @@ class Trainer:
             frames_in    = mcfg.frames_in,
             frames_out   = mcfg.frames_out,
         )
+
+        # New-model-only fields (read from config if present, else use dataclass defaults)
+        if _NEW_MODEL:
+            config_kwargs["qk_norm"]       = mcfg.get("qk_norm",       True)
+            config_kwargs["parallel_attn"] = mcfg.get("parallel_attn", False)
+            log.info("Using new Cosmos-style ARVideoPatchTransformer")
+        else:
+            log.info("Using original Emu3-style ARVideoPatchTransformer")
+
+        self.model_cfg = ARPatchConfig(**config_kwargs)
         self.model = ARVideoPatchTransformer(self.model_cfg).to(self.device)
         n_params = sum(p.numel() for p in self.model.parameters()) / 1e6
         log.info(f"Parameters: {n_params:.2f} M")
