@@ -32,6 +32,7 @@ import time
 from pathlib import Path
 
 import hydra
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -507,6 +508,63 @@ class Trainer:
             self.ema.restore(self.model)
         return loss
 
+    # ── wandb video helpers ──────────────────────────────────────────────
+
+    @staticmethod
+    def _frames_to_uint8(frames: torch.Tensor) -> np.ndarray:
+        """
+        Convert model frames from [-1, 1] to uint8 numpy array.
+        frames: (T, C, H, W)  →  (T, H, W, C) uint8
+        """
+        x = (frames.clamp(-1, 1) * 0.5 + 0.5) * 255.0  # [0, 255]
+        x = x.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)  # (T, H, W, C)
+        return x
+
+    @torch.no_grad()
+    def _log_val_videos(self, n_samples: int = 4):
+        """
+        Run the model on a few val samples and log pred vs target videos to wandb.
+        Each video shows the full sequence: [context | predicted/target frames].
+        """
+        self.model.eval()
+        if self.ema is not None:
+            self.ema.apply(self.model)
+
+        val_iter = iter(self.val_loader)
+        context, target = next(val_iter)
+        context = context.to(self.device)
+        target  = target.to(self.device)
+
+        with torch.cuda.amp.autocast(enabled=self.use_amp):
+            pred_frames, _ = self.model(context, target)
+
+        if self.ema is not None:
+            self.ema.restore(self.model)
+
+        n = min(n_samples, context.shape[0])
+        videos = {}
+        for i in range(n):
+            # Build full sequences: context + target / context + prediction
+            ctx_np  = self._frames_to_uint8(context[i])        # (fin, H, W, C)
+            tgt_np  = self._frames_to_uint8(target[i])         # (fout, H, W, C)
+            pred_np = self._frames_to_uint8(pred_frames[i])    # (fout, H, W, C)
+
+            gt_video   = np.concatenate([ctx_np, tgt_np], axis=0)    # (T, H, W, C)
+            pred_video = np.concatenate([ctx_np, pred_np], axis=0)   # (T, H, W, C)
+
+            # wandb.Video expects (T, C, H, W)
+            gt_video   = gt_video.transpose(0, 3, 1, 2)
+            pred_video = pred_video.transpose(0, 3, 1, 2)
+
+            videos[f"val/sample_{i}_target"] = wandb.Video(
+                gt_video, fps=4, format="mp4"
+            )
+            videos[f"val/sample_{i}_pred"] = wandb.Video(
+                pred_video, fps=4, format="mp4"
+            )
+
+        wandb.log(videos, step=self.global_step)
+
     # ── main loop ────────────────────────────────────────────────────────
 
     def train(self):
@@ -536,6 +594,9 @@ class Trainer:
                 "epoch/val_loss":  val_loss,
                 "epoch/lr":        self.scheduler.get_last_lr()[0],
             }, step=self.global_step)
+
+            # log prediction vs target videos
+            self._log_val_videos(n_samples=4)
 
             self._save_checkpoint(epoch, val_loss, tag="last")
 

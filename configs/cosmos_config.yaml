@@ -24,9 +24,8 @@ model:
   frames_out: 1            # target frames to predict per step
 
 data:
-  dataset_root: ${oc.env:TTT_WM_DATA_ROOT,/ariesdv0/zhaoyang/data}
   type: real                           # "synthetic" | "real"
-  root: ${dataset_root}/libero         # LeRobot v2 dataset root
+  root: ${oc.env:TTT_WM_DATA_ROOT,/ariesdv0/zhaoyang/data}/libero  # LeRobot v2 dataset root
   image_key: image                     # column name in parquet ("image" or "wrist_image")
   val_split: 0.1
   extensions: [png, jpg, jpeg]         # unused for LeRobot data, kept for compat
