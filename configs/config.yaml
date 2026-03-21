@@ -14,8 +14,9 @@ model:
   frames_out: 3
 
 data:
+  dataset_root: ${oc.env:TTT_WM_DATA_ROOT,/ariesdv0/zhaoyang/data}
   type: real                           # "synthetic" | "real"
-  root: /scr2/zhaoyang/libero         # LeRobot v2 dataset root
+  root: ${dataset_root}/libero         # LeRobot v2 dataset root
   image_key: image                     # column name in parquet ("image" or "wrist_image")
   val_split: 0.1
   extensions: [png, jpg, jpeg]         # unused for LeRobot data, kept for compat
@@ -46,6 +47,10 @@ train:
   resume: ""
   log_every: 50
   device: "auto"                # "" = auto (cuda > mps > cpu)
+
+wandb:
+  project: TTT-WM
+  name: ${experiment_name}
 
 hydra:
   run:

@@ -35,6 +35,7 @@ import hydra
 import pandas as pd
 import torch
 import torch.nn as nn
+import wandb
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
@@ -392,10 +393,20 @@ class Trainer:
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
         self.start_epoch   = 0
         self.best_val_loss = float("inf")
+        self.best_ckpt_path: Path | None = None
         self.global_step   = 0
 
         if cfg.train.resume:
             self._load_checkpoint(cfg.train.resume)
+
+        # ── wandb ──────────────────────────────────────────────────────
+        wandb_cfg = cfg.get("wandb", {})
+        wandb.init(
+            project = wandb_cfg.get("project", "TTT-WM"),
+            name    = wandb_cfg.get("name", cfg.experiment_name),
+            config  = OmegaConf.to_container(cfg, resolve=True),
+            resume  = "allow" if cfg.train.resume else None,
+        )
 
     # ── checkpoint ───────────────────────────────────────────────────────
 
@@ -467,8 +478,15 @@ class Trainer:
                             self.global_step % ema_cfg.update_every == 0):
                         self.ema.update(self.model)
 
+                    # wandb log every gradient step
+                    lr = self.scheduler.get_last_lr()[0]
+                    wandb.log({
+                        "train/loss": loss.item(),
+                        "train/lr":   lr,
+                        "global_step": self.global_step,
+                    }, step=self.global_step)
+
                     if self.global_step % log_every == 0:
-                        lr = self.scheduler.get_last_lr()[0]
                         log.info(
                             f"step {self.global_step:06d} | "
                             f"loss {loss.item():.6f} | lr {lr:.2e}"
@@ -510,14 +528,32 @@ class Trainer:
                 f"{elapsed:.1f}s"
             )
 
+            # wandb epoch-level logging
+            wandb.log({
+                "epoch":           epoch,
+                "epoch/train_loss": train_loss,
+                "epoch/val_loss":  val_loss,
+                "epoch/lr":        self.scheduler.get_last_lr()[0],
+            }, step=self.global_step)
+
             self._save_checkpoint(epoch, val_loss, tag="last")
 
             if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
-                self._save_checkpoint(epoch, val_loss, tag="best")
+                # delete previous best checkpoint
+                if self.best_ckpt_path is not None and self.best_ckpt_path.exists():
+                    self.best_ckpt_path.unlink()
+                    log.info(f"Removed old best ckpt: {self.best_ckpt_path}")
+                self.best_val_loss  = val_loss
+                best_tag = f"best_epoch{epoch:04d}_loss{val_loss:.6f}"
+                self._save_checkpoint(epoch, val_loss, tag=best_tag)
+                self.best_ckpt_path = self.ckpt_dir / f"{best_tag}.pt"
+                wandb.run.summary["best_val_loss"] = val_loss
+                wandb.run.summary["best_epoch"]    = epoch
 
             if (epoch + 1) % tcfg.save_every == 0:
                 self._save_checkpoint(epoch, val_loss, tag=f"epoch_{epoch:04d}")
+
+        wandb.finish()
 
 
 # ---------------------------------------------------------------------------
