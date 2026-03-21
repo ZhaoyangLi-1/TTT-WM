@@ -308,8 +308,9 @@ class Trainer:
         self.cfg = cfg
 
         # ── device ──────────────────────────────────────────────────────
-        if cfg.train.device:
-            self.device = torch.device(cfg.train.device)
+        dev = cfg.train.device
+        if dev and dev not in ("", "auto"):
+            self.device = torch.device(dev)
         elif torch.cuda.is_available():
             self.device = torch.device("cuda")
         elif torch.backends.mps.is_available():
