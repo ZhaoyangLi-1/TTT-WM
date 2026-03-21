@@ -41,6 +41,7 @@ from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+from tqdm import tqdm
 
 try:
     from cosmos_model import ARPatchConfig, ARVideoPatchTransformer
@@ -451,9 +452,10 @@ class Trainer:
         ema_cfg   = self.cfg.train.ema
         log_every = self.cfg.train.log_every
 
+        pbar = tqdm(loader, desc="train" if train else "val", leave=False)
         ctx = torch.enable_grad() if train else torch.no_grad()
         with ctx:
-            for context, target in loader:
+            for context, target in pbar:
                 context = context.to(self.device, non_blocking=True)
                 target  = target.to(self.device,  non_blocking=True)
 
@@ -488,11 +490,16 @@ class Trainer:
                         "global_step": self.global_step,
                     }, step=self.global_step)
 
+                    # tqdm postfix
+                    pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{lr:.2e}")
+
                     if self.global_step % log_every == 0:
                         log.info(
                             f"step {self.global_step:06d} | "
                             f"loss {loss.item():.6f} | lr {lr:.2e}"
                         )
+                else:
+                    pbar.set_postfix(loss=f"{loss.item():.4f}")
 
                 total_loss += loss.item()
                 n_batches  += 1
