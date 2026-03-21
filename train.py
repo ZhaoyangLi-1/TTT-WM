@@ -321,6 +321,13 @@ class Trainer:
             self.device = torch.device("cpu")
         log.info(f"Device: {self.device}")
 
+        # ── performance flags ──────────────────────────────────────────
+        if self.device.type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32       = True
+            torch.backends.cudnn.benchmark        = True
+            log.info("Enabled TF32 + cuDNN benchmark")
+
         torch.manual_seed(cfg.seed)
 
         # ── model ───────────────────────────────────────────────────────
@@ -353,6 +360,11 @@ class Trainer:
         n_params = sum(p.numel() for p in self.model.parameters()) / 1e6
         log.info(f"Parameters: {n_params:.2f} M")
 
+        # ── torch.compile (H100 / SM90 benefits significantly) ─────────
+        if cfg.train.get("compile", False) and hasattr(torch, "compile"):
+            self.model = torch.compile(self.model)
+            log.info("torch.compile enabled")
+
         # ── EMA ─────────────────────────────────────────────────────────
         ema_cfg = cfg.train.ema
         self.ema = EMA(self.model, decay=ema_cfg.decay) if ema_cfg.enabled else None
@@ -368,9 +380,12 @@ class Trainer:
 
         # ── data ────────────────────────────────────────────────────────
         train_ds, val_ds = build_datasets(cfg.data, cfg.model)
+        n_workers = cfg.data.num_workers
         loader_kw = dict(
-            num_workers = cfg.data.num_workers,
-            pin_memory  = cfg.data.pin_memory and self.device.type == "cuda",
+            num_workers        = n_workers,
+            pin_memory         = cfg.data.pin_memory and self.device.type == "cuda",
+            persistent_workers = cfg.data.get("persistent_workers", False) and n_workers > 0,
+            prefetch_factor    = cfg.data.get("prefetch_factor", 2) if n_workers > 0 else None,
         )
         self.train_loader = DataLoader(
             train_ds, batch_size=cfg.train.batch_size,
