@@ -1,6 +1,8 @@
 experiment_name: cosmos_ar_video
 seed: 42
 
+outputs_root: ${oc.env:TTT_WM_OUTPUTS_ROOT,/ariesdv0/zhaoyang/data}
+
 model:
   resolution: 128
   num_channels: 3
@@ -62,4 +64,4 @@ wandb:
 
 hydra:
   run:
-    dir: TTT-WM-outputs/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
+    dir: ${outputs_root}/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}

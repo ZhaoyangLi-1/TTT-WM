@@ -13,6 +13,8 @@ model:
   frames_in: 2
   frames_out: 3
 
+outputs_root: ${oc.env:TTT_WM_OUTPUTS_ROOT,/ariesdv0/zhaoyang/data}
+
 data:
   dataset_root: ${oc.env:TTT_WM_DATA_ROOT,/ariesdv0/zhaoyang/data}
   type: real                           # "synthetic" | "real"
@@ -54,4 +56,4 @@ wandb:
 
 hydra:
   run:
-    dir: outputs/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
+    dir: ${outputs_root}/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
