@@ -74,7 +74,8 @@ class EMA:
     """
 
     def __init__(self, model: nn.Module, decay: float):
-        self.decay  = decay
+        self.decay        = decay
+        self.num_updates  = 0
         self.shadow = copy.deepcopy(model)
         self.shadow.eval()
         for p in self.shadow.parameters():
@@ -82,8 +83,12 @@ class EMA:
 
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
+        # Bias-correction warmup: effective decay starts low and ramps to self.decay
+        # Prevents EMA from lagging far behind early in training (DiT / Karras style)
+        d = min(self.decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
+        self.num_updates += 1
         for s, m in zip(self.shadow.parameters(), model.parameters()):
-            s.data.mul_(self.decay).add_(m.data, alpha=1.0 - self.decay)
+            s.data.mul_(d).add_(m.data, alpha=1.0 - d)
         for s_buf, m_buf in zip(self.shadow.buffers(), model.buffers()):
             s_buf.data.copy_(m_buf.data)
 
@@ -622,8 +627,9 @@ class Trainer:
         for epoch in range(self.start_epoch, tcfg.epochs):
             t0 = time.time()
 
-            train_loss = self._run_epoch(self.train_loader, train=True)
-            val_loss   = self._val_loss()
+            train_loss    = self._run_epoch(self.train_loader, train=True)
+            val_loss      = self._val_loss()                          # EMA if enabled
+            val_loss_raw  = self._run_epoch(self.val_loader, train=False)  # current weights
 
             elapsed = time.time() - t0
             ema_tag = " [EMA]" if self.ema else ""
@@ -631,14 +637,16 @@ class Trainer:
                 f"epoch {epoch:04d} | "
                 f"train {train_loss:.6f} | "
                 f"val{ema_tag} {val_loss:.6f} | "
+                f"val[raw] {val_loss_raw:.6f} | "
                 f"{elapsed:.1f}s"
             )
 
             # wandb epoch-level logging
             wandb.log({
-                "epoch":           epoch,
-                "epoch/train_loss": train_loss,
-                "epoch/val_loss":  val_loss,
+                "epoch":              epoch,
+                "epoch/train_loss":   train_loss,
+                "epoch/val_loss":     val_loss,
+                "epoch/val_loss_raw": val_loss_raw,
                 "epoch/lr":        self.scheduler.get_last_lr()[0],
             }, step=self.global_step)
 
