@@ -376,7 +376,7 @@ class Trainer:
 
         # ── AMP ─────────────────────────────────────────────────────────
         self.use_amp = cfg.train.amp and self.device.type == "cuda"
-        self.scaler  = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.scaler  = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
         # ── data ────────────────────────────────────────────────────────
         train_ds, val_ds = build_datasets(cfg.data, cfg.model)
@@ -474,7 +474,7 @@ class Trainer:
                 context = context.to(self.device, non_blocking=True)
                 target  = target.to(self.device,  non_blocking=True)
 
-                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                with torch.amp.autocast("cuda", enabled=self.use_amp):
                     _, loss = self.model(context, target)
 
                 if train:
@@ -557,7 +557,7 @@ class Trainer:
         context = context.to(self.device)
         target  = target.to(self.device)
 
-        with torch.cuda.amp.autocast(enabled=self.use_amp):
+        with torch.amp.autocast("cuda", enabled=self.use_amp):
             pred_frames, _ = self.model(context, target)
 
         if self.ema is not None:
