@@ -1,0 +1,16 @@
+outputs
+wandb
+__pycache__/
+checkpoints
+*.png
+*.gif
+results
+data
+diffusion_policy
+checkpoints*
+.DS_Store
+logs
+cluster_checkpoints
+figures
+.cursor
+src
