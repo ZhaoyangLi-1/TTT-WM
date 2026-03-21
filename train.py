@@ -559,10 +559,12 @@ class Trainer:
         if self.ema is not None:
             self.ema.apply(self.model)
 
-        val_iter = iter(self.val_loader)
-        context, target = next(val_iter)
-        context = context.to(self.device)
-        target  = target.to(self.device)
+        # Random indices spread across val set → diverse scenes/episodes
+        ds = self.val_loader.dataset
+        indices = torch.randperm(len(ds))[:n_samples].tolist()
+        ctx_list, tgt_list = zip(*[ds[i] for i in indices])
+        context = torch.stack(ctx_list).to(self.device)
+        target  = torch.stack(tgt_list).to(self.device)
 
         with torch.amp.autocast("cuda", enabled=self.use_amp):
             pred_frames, _ = self.model(context, target)
