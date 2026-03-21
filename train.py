@@ -24,11 +24,15 @@ Weight decay grouping
 """
 
 import copy
+import functools
+import io
+import json
 import logging
 import time
 from pathlib import Path
 
 import hydra
+import pandas as pd
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
@@ -155,53 +159,101 @@ def build_optimizer(model: nn.Module, opt_cfg: DictConfig) -> torch.optim.Optimi
 
 class VideoFrameDataset(Dataset):
     """
-    Real video dataset.
+    LeRobot-v2 parquet video dataset (e.g. LIBERO).
 
+    Directory layout (LeRobot v2.0):
         data.root/
-            clip_000/
-                0000.png  0001.png  ...
-            clip_001/
-                ...
+            meta/
+                info.json          # total_episodes, total_chunks, chunks_size, …
+                episodes.jsonl     # per-episode metadata (length, tasks, …)
+            data/
+                chunk-000/
+                    episode_000000.parquet
+                    episode_000001.parquet
+                    …
+                chunk-001/
+                    …
 
-    Each sample: sliding window of frames_in + frames_out consecutive frames.
-    Returns (context, target) in [-1, 1].
+    Each parquet row has an `image` column stored as
+    ``{"bytes": <png bytes>, "path": "frame_XXXXXX.png"}``.
+
+    Each sample is a sliding window of ``frames_in + frames_out``
+    consecutive frames from one episode.  Returns (context, target) in [-1, 1].
     """
 
     def __init__(self, data_cfg: DictConfig, model_cfg: DictConfig, split: str):
         self.T   = model_cfg.frames_in + model_cfg.frames_out
         self.fin = model_cfg.frames_in
+        self.image_key = data_cfg.get("image_key", "image")
         self.transform = transforms.Compose([
             transforms.Resize((model_cfg.resolution, model_cfg.resolution)),
             transforms.ToTensor(),
             transforms.Normalize([0.5] * 3, [0.5] * 3),
         ])
 
-        root      = Path(data_cfg.root)
-        exts      = list(data_cfg.extensions)
-        clip_dirs = sorted(d for d in root.iterdir() if d.is_dir())
-        n_val     = max(1, int(len(clip_dirs) * data_cfg.val_split))
-        clip_dirs = clip_dirs[n_val:] if split == "train" else clip_dirs[:n_val]
+        root = Path(data_cfg.root)
 
+        # ── read meta ──────────────────────────────────────────────────
+        with open(root / "meta" / "info.json") as f:
+            info = json.load(f)
+        total_episodes = info["total_episodes"]
+        chunks_size    = info["chunks_size"]
+
+        # ── build episode file list ────────────────────────────────────
+        episode_files = []
+        for ep_idx in range(total_episodes):
+            chunk_idx = ep_idx // chunks_size
+            path = root / "data" / f"chunk-{chunk_idx:03d}" / f"episode_{ep_idx:06d}.parquet"
+            episode_files.append(path)
+
+        # ── read episode lengths from episodes.jsonl ───────────────────
+        ep_lengths = {}
+        with open(root / "meta" / "episodes.jsonl") as f:
+            for line in f:
+                rec = json.loads(line)
+                ep_lengths[rec["episode_index"]] = rec["length"]
+
+        # ── train / val split ──────────────────────────────────────────
+        n_val = max(1, int(total_episodes * data_cfg.val_split))
+        if split == "train":
+            ep_indices = list(range(n_val, total_episodes))
+        else:
+            ep_indices = list(range(n_val))
+
+        # ── build sliding-window sample index ──────────────────────────
+        # Each sample is (episode_file_path_str, start_frame_index)
         self.samples = []
-        for clip_dir in clip_dirs:
-            frames = []
-            for ext in exts:
-                frames += sorted(clip_dir.glob(f"*.{ext}"))
-            frames.sort()
-            for start in range(len(frames) - self.T + 1):
-                self.samples.append((frames, start))
+        for ep_idx in ep_indices:
+            length = ep_lengths[ep_idx]
+            if length < self.T:
+                continue
+            ep_path_str = str(episode_files[ep_idx])
+            for start in range(length - self.T + 1):
+                self.samples.append((ep_path_str, start))
 
-        log.info(f"[{split}] {len(self.samples)} windows / {len(clip_dirs)} clips")
+        log.info(
+            f"[{split}] {len(self.samples)} windows / "
+            f"{len(ep_indices)} episodes"
+        )
+
+        # LRU cache for parquet reads (avoids re-reading the same file
+        # for different windows within the same episode)
+        self._read_parquet = functools.lru_cache(maxsize=32)(
+            lambda path: pd.read_parquet(path, columns=[self.image_key])
+        )
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        paths, start = self.samples[idx]
-        imgs = [
-            self.transform(Image.open(paths[start + t]).convert("RGB"))
-            for t in range(self.T)
-        ]
+        parquet_path, start = self.samples[idx]
+        df = self._read_parquet(parquet_path)
+        imgs = []
+        for t in range(self.T):
+            img_data = df.iloc[start + t][self.image_key]
+            png_bytes = img_data["bytes"]
+            img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+            imgs.append(self.transform(img))
         frames = torch.stack(imgs)
         return frames[: self.fin], frames[self.fin :]
 

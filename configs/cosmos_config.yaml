@@ -2,7 +2,7 @@ experiment_name: cosmos_ar_video
 seed: 42
 
 model:
-  resolution: 64
+  resolution: 128
   num_channels: 3
   patch_size: 8            # 8×8 patches → 64 patches/frame
 
@@ -18,15 +18,16 @@ model:
   parallel_attn: false     # parallel attn+mlp block (enable for throughput)
 
   # AR window
-  frames_in: 4             # context frames per step
-  frames_out: 4            # target frames to predict per step
+  frames_in: 1             # context frames per step
+  frames_out: 1            # target frames to predict per step
 
 data:
-  type: synthetic           # "synthetic" | "real"
-  root: /path/to/clips      # only used when type=real
+  type: real                           # "synthetic" | "real"
+  root: /scr2/zhaoyang/libero         # LeRobot v2 dataset root
+  image_key: image                     # column name in parquet ("image" or "wrist_image")
   val_split: 0.1
-  extensions: [png, jpg, jpeg]
-  n_train: 2000
+  extensions: [png, jpg, jpeg]         # unused for LeRobot data, kept for compat
+  n_train: 2000                        # only used when type=synthetic
   n_val:   200
   moving_dot: true
   num_workers: 4
@@ -34,7 +35,7 @@ data:
 
 train:
   epochs: 100
-  batch_size: 16
+  batch_size: 32
   optimizer:
     lr: 3.0e-4             # Cosmos / GPT training typically uses higher lr
     weight_decay: 1.0e-2
@@ -56,4 +57,4 @@ train:
 
 hydra:
   run:
-    dir: outputs/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
+    dir: TTT-WM-outputs/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
