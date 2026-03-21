@@ -193,6 +193,7 @@ class VideoFrameDataset(Dataset):
         self.T      = model_cfg.frames_in + model_cfg.frames_out
         self.fin    = model_cfg.frames_in
         self.stride = data_cfg.get("frame_stride", 1)
+        self.gap    = data_cfg.get("frame_gap", self.stride)  # extra gap between last context and first target
         self.image_key = data_cfg.get("image_key", "image")
         self.transform = transforms.Compose([
             transforms.Resize((model_cfg.resolution, model_cfg.resolution)),
@@ -232,7 +233,11 @@ class VideoFrameDataset(Dataset):
         # ── build sliding-window sample index ──────────────────────────
         # Each sample is (episode_file_path_str, start_frame_index)
         self.samples = []
-        span = (self.T - 1) * self.stride + 1  # total frames spanned by one window
+        # span: total frames covered by one window
+        # context occupies fin*stride frames, then a gap, then fout*stride frames
+        fout = self.T - self.fin
+        span = (self.fin - 1) * self.stride + self.gap + (fout - 1) * self.stride + 1
+        self._target_offset = (self.fin - 1) * self.stride + self.gap  # index of first target frame
         for ep_idx in ep_indices:
             length = ep_lengths[ep_idx]
             if length < span:
@@ -260,7 +265,11 @@ class VideoFrameDataset(Dataset):
         df = self._read_parquet(parquet_path)
         imgs = []
         for t in range(self.T):
-            img_data = df.iloc[start + t * self.stride][self.image_key]
+            if t < self.fin:
+                frame_idx = start + t * self.stride
+            else:
+                frame_idx = start + self._target_offset + (t - self.fin) * self.stride
+            img_data = df.iloc[frame_idx][self.image_key]
             png_bytes = img_data["bytes"]
             img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
             imgs.append(self.transform(img))
