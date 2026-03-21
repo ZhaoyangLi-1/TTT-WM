@@ -425,6 +425,9 @@ class Trainer:
             config  = OmegaConf.to_container(cfg, resolve=True),
             resume  = "allow" if cfg.train.resume else None,
         )
+        # let epoch-level metrics use "epoch" as x-axis instead of global_step
+        wandb.define_metric("epoch")
+        wandb.define_metric("epoch/*", step_metric="epoch")
 
     # ── checkpoint ───────────────────────────────────────────────────────
 
@@ -545,8 +548,10 @@ class Trainer:
     @torch.no_grad()
     def _log_val_videos(self, n_samples: int = 4):
         """
-        Run the model on a few val samples and log pred vs target videos to wandb.
-        Each video shows the full sequence: [context | predicted/target frames].
+        Run the model on a few val samples and log pred vs target media to wandb.
+        - If total frames (context + target) <= 2: log side-by-side images
+          (context | target | prediction) so the comparison is clear.
+        - Otherwise: log videos as before.
         """
         self.model.eval()
         if self.ema is not None:
@@ -564,28 +569,44 @@ class Trainer:
             self.ema.restore(self.model)
 
         n = min(n_samples, context.shape[0])
-        videos = {}
+        total_frames = context.shape[1] + target.shape[1]
+        media = {}
+
         for i in range(n):
-            # Build full sequences: context + target / context + prediction
             ctx_np  = self._frames_to_uint8(context[i])        # (fin, H, W, C)
             tgt_np  = self._frames_to_uint8(target[i])         # (fout, H, W, C)
             pred_np = self._frames_to_uint8(pred_frames[i])    # (fout, H, W, C)
 
-            gt_video   = np.concatenate([ctx_np, tgt_np], axis=0)    # (T, H, W, C)
-            pred_video = np.concatenate([ctx_np, pred_np], axis=0)   # (T, H, W, C)
+            if total_frames <= 2:
+                # Few frames — log as a single side-by-side image:
+                # [context | target | prediction]  with labels
+                parts = []
+                for f in range(ctx_np.shape[0]):
+                    parts.append(ctx_np[f])
+                for f in range(tgt_np.shape[0]):
+                    parts.append(tgt_np[f])
+                for f in range(pred_np.shape[0]):
+                    parts.append(pred_np[f])
+                composite = np.concatenate(parts, axis=1)  # (H, W*N, C)
+                caption = "context | target | prediction"
+                media[f"val/sample_{i}"] = wandb.Image(
+                    composite, caption=caption,
+                )
+            else:
+                # Enough frames — log as videos
+                gt_video   = np.concatenate([ctx_np, tgt_np], axis=0)
+                pred_video = np.concatenate([ctx_np, pred_np], axis=0)
+                # wandb.Video expects (T, C, H, W)
+                gt_video   = gt_video.transpose(0, 3, 1, 2)
+                pred_video = pred_video.transpose(0, 3, 1, 2)
+                media[f"val/sample_{i}_target"] = wandb.Video(
+                    gt_video, fps=4, format="mp4"
+                )
+                media[f"val/sample_{i}_pred"] = wandb.Video(
+                    pred_video, fps=4, format="mp4"
+                )
 
-            # wandb.Video expects (T, C, H, W)
-            gt_video   = gt_video.transpose(0, 3, 1, 2)
-            pred_video = pred_video.transpose(0, 3, 1, 2)
-
-            videos[f"val/sample_{i}_target"] = wandb.Video(
-                gt_video, fps=4, format="mp4"
-            )
-            videos[f"val/sample_{i}_pred"] = wandb.Video(
-                pred_video, fps=4, format="mp4"
-            )
-
-        wandb.log(videos, step=self.global_step)
+        wandb.log(media, step=self.global_step)
 
     # ── main loop ────────────────────────────────────────────────────────
 
