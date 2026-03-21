@@ -185,8 +185,9 @@ class VideoFrameDataset(Dataset):
     """
 
     def __init__(self, data_cfg: DictConfig, model_cfg: DictConfig, split: str):
-        self.T   = model_cfg.frames_in + model_cfg.frames_out
-        self.fin = model_cfg.frames_in
+        self.T      = model_cfg.frames_in + model_cfg.frames_out
+        self.fin    = model_cfg.frames_in
+        self.stride = data_cfg.get("frame_stride", 1)
         self.image_key = data_cfg.get("image_key", "image")
         self.transform = transforms.Compose([
             transforms.Resize((model_cfg.resolution, model_cfg.resolution)),
@@ -226,12 +227,13 @@ class VideoFrameDataset(Dataset):
         # ── build sliding-window sample index ──────────────────────────
         # Each sample is (episode_file_path_str, start_frame_index)
         self.samples = []
+        span = (self.T - 1) * self.stride + 1  # total frames spanned by one window
         for ep_idx in ep_indices:
             length = ep_lengths[ep_idx]
-            if length < self.T:
+            if length < span:
                 continue
             ep_path_str = str(episode_files[ep_idx])
-            for start in range(length - self.T + 1):
+            for start in range(length - span + 1):
                 self.samples.append((ep_path_str, start))
 
         log.info(
@@ -253,7 +255,7 @@ class VideoFrameDataset(Dataset):
         df = self._read_parquet(parquet_path)
         imgs = []
         for t in range(self.T):
-            img_data = df.iloc[start + t][self.image_key]
+            img_data = df.iloc[start + t * self.stride][self.image_key]
             png_bytes = img_data["bytes"]
             img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
             imgs.append(self.transform(img))
