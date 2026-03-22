@@ -43,12 +43,8 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm import tqdm
 
-try:
-    from cosmos_model import ARPatchConfig, ARVideoPatchTransformer
-    _NEW_MODEL = True
-except ImportError:
-    from model import ARPatchConfig, ARVideoPatchTransformer
-    _NEW_MODEL = False
+from model import ARPatchConfig as _EmuConfig, ARVideoPatchTransformer as _EmuModel
+from cosmos_model import ARPatchConfig as _CosmosConfig, ARVideoPatchTransformer as _CosmosModel
 
 log = logging.getLogger(__name__)
 
@@ -349,7 +345,9 @@ class Trainer:
         # ── model ───────────────────────────────────────────────────────
         mcfg = cfg.model
 
-        # Base fields shared by both old and new model
+        # Select model variant based on config
+        use_cosmos = mcfg.get("arch", "emu3") == "cosmos"
+
         config_kwargs = dict(
             resolution   = mcfg.resolution,
             num_channels = mcfg.num_channels,
@@ -363,16 +361,16 @@ class Trainer:
             frames_out   = mcfg.frames_out,
         )
 
-        # New-model-only fields (read from config if present, else use dataclass defaults)
-        if _NEW_MODEL:
+        if use_cosmos:
             config_kwargs["qk_norm"]       = mcfg.get("qk_norm",       True)
             config_kwargs["parallel_attn"] = mcfg.get("parallel_attn", False)
-            log.info("Using new Cosmos-style ARVideoPatchTransformer")
+            self.model_cfg = _CosmosConfig(**config_kwargs)
+            self.model = _CosmosModel(self.model_cfg).to(self.device)
+            log.info("Using Cosmos-style ARVideoPatchTransformer (block-causal)")
         else:
-            log.info("Using original Emu3-style ARVideoPatchTransformer")
-
-        self.model_cfg = ARPatchConfig(**config_kwargs)
-        self.model = ARVideoPatchTransformer(self.model_cfg).to(self.device)
+            self.model_cfg = _EmuConfig(**config_kwargs)
+            self.model = _EmuModel(self.model_cfg).to(self.device)
+            log.info("Using Emu3-style ARVideoPatchTransformer (fully causal)")
         n_params = sum(p.numel() for p in self.model.parameters()) / 1e6
         log.info(f"Parameters: {n_params:.2f} M")
 

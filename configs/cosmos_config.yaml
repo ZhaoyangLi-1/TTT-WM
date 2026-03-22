@@ -1,23 +1,20 @@
-experiment_name: cosmos_ar_video
+experiment_name: causal_ar_video
 seed: 42
 
 outputs_root: ${oc.env:TTT_WM_OUTPUTS_ROOT,/ariesdv0/zhaoyang/data}
 
 model:
+  arch: emu3               # "emu3" (fully causal) or "cosmos" (block-causal)
   resolution: 128
   num_channels: 3
-  patch_size: 8            # 8×8 patches → 64 patches/frame
+  patch_size: 8            # 8×8 patches → 256 patches/frame
 
-  # Cosmos-style transformer
+  # Emu3-style causal transformer (fully causal, no block-causal leakage)
   d_model: 512
   n_heads: 8
   n_layers: 8
-  mlp_ratio: 2.6667        # SwiGLU convention ≈ 8/3
-  dropout: 0.0             # Cosmos uses 0 dropout; rely on weight decay + EMA
-
-  # Cosmos innovations (toggle here)
-  qk_norm: true            # RMSNorm on Q and K — stabilises training
-  parallel_attn: false     # parallel attn+mlp block (enable for throughput)
+  mlp_ratio: 4.0           # standard GELU MLP
+  dropout: 0.1             # causal model benefits from dropout
 
   # AR window
   frames_in: 1             # context frames per step
@@ -44,7 +41,7 @@ train:
   epochs: 100
   batch_size: 64             # H100 80G — 22M model @ 128x128, seq_len=512 tokens
   optimizer:
-    lr: 3.0e-4             # Cosmos / GPT training typically uses higher lr
+    lr: 1.0e-4             # Cosmos / GPT training typically uses higher lr
     weight_decay: 1.0e-2
     betas: [0.9, 0.95]
     no_decay_norm: true    # bias & norm params get weight_decay=0

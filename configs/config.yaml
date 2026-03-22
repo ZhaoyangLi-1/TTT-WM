@@ -2,6 +2,7 @@ experiment_name: ar_video
 seed: 42
 
 model:
+  arch: emu3               # "emu3" (fully causal) or "cosmos" (block-causal)
   resolution: 128
   num_channels: 3
   patch_size: 8
@@ -42,7 +43,7 @@ train:
     update_every: 1         # update EMA every N optimizer steps
   grad_clip: 1.0
   amp: true
-  ckpt_dir: outputs/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
+  ckpt_dir: ${outputs_root}/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
   save_every: 10
   resume: ""
   log_every: 50

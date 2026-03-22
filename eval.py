@@ -30,13 +30,8 @@ import torch
 from PIL import Image
 from torchvision import transforms
 
-# Import model — try Cosmos-style first, fall back to original
-try:
-    from cosmos_model import ARPatchConfig, ARVideoPatchTransformer
-    _NEW_MODEL = True
-except ImportError:
-    from model import ARPatchConfig, ARVideoPatchTransformer
-    _NEW_MODEL = False
+from model import ARPatchConfig as _EmuConfig, ARVideoPatchTransformer as _EmuModel
+from cosmos_model import ARPatchConfig as _CosmosConfig, ARVideoPatchTransformer as _CosmosModel
 
 
 def load_model_from_checkpoint(ckpt_path: str, device: torch.device, use_ema: bool = False):
@@ -46,6 +41,8 @@ def load_model_from_checkpoint(ckpt_path: str, device: torch.device, use_ema: bo
     # Reconstruct model config from checkpoint
     cfg = ckpt["cfg"]
     mcfg = cfg["model"]
+
+    use_cosmos = mcfg.get("arch", "emu3") == "cosmos"
 
     config_kwargs = dict(
         resolution=mcfg["resolution"],
@@ -60,9 +57,16 @@ def load_model_from_checkpoint(ckpt_path: str, device: torch.device, use_ema: bo
         frames_out=mcfg["frames_out"],
     )
 
-    if _NEW_MODEL:
+    if use_cosmos:
         config_kwargs["qk_norm"] = mcfg.get("qk_norm", True)
         config_kwargs["parallel_attn"] = mcfg.get("parallel_attn", False)
+        ARPatchConfig = _CosmosConfig
+        ARVideoPatchTransformer = _CosmosModel
+        print("Detected Cosmos-style model from checkpoint config")
+    else:
+        ARPatchConfig = _EmuConfig
+        ARVideoPatchTransformer = _EmuModel
+        print("Detected Emu3-style model from checkpoint config")
 
     model_cfg = ARPatchConfig(**config_kwargs)
     model = ARVideoPatchTransformer(model_cfg).to(device)
@@ -262,8 +266,8 @@ def main():
     parser.add_argument("--device", type=str, default="cuda", help="Device (cuda/cpu)")
     parser.add_argument("--with-gt", action="store_true",
                         help="Include ground-truth side-by-side comparison")
-    parser.add_argument("--refine-iters", type=int, default=3,
-                        help="Iterative refinement steps per frame (fixes block-causal inference)")
+    parser.add_argument("--resolution", type=int, default=None,
+                        help="Override eval resolution (default: use training resolution).")
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device != "cuda" else "cpu")
@@ -271,6 +275,17 @@ def main():
 
     # Load model
     model, model_cfg, train_cfg = load_model_from_checkpoint(args.checkpoint, device, args.use_ema)
+
+    # Override resolution if requested
+    if args.resolution is not None:
+        old_res = model_cfg.resolution
+        assert args.resolution % model_cfg.patch_size == 0, \
+            f"Resolution {args.resolution} must be divisible by patch_size {model_cfg.patch_size}"
+        model_cfg.resolution = args.resolution
+        old_np = (old_res // model_cfg.patch_size) ** 2
+        new_np = model_cfg.n_patches
+        print(f"Resolution override: {old_res} -> {args.resolution} "
+              f"(patches/frame: {old_np} -> {new_np}, seq_len x{new_np/old_np:.1f})")
 
     # Load episode
     df, image_key = load_episode_frames(args.dataset, args.episode, args.image_key)
@@ -286,13 +301,10 @@ def main():
     context = context.unsqueeze(0).to(device)  # (1, frames_in, C, H, W)
     print(f"Context: {n_context} frames, shape={context.shape}")
 
-    # Generate
+    # Generate (fully causal model — standard AR generation works correctly)
     print(f"Generating {args.n_steps} AR steps (each produces {model_cfg.frames_out} frames)...")
-    print(f"Using iterative refinement with {args.refine_iters} iterations per frame")
     with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-        generated = generate_iterative_refinement(
-            model, context, n_steps=args.n_steps, refine_iters=args.refine_iters,
-        )  # (1, n_steps*frames_out, C, H, W)
+        generated = model.generate(context, n_steps=args.n_steps)  # (1, n_steps*frames_out, C, H, W)
 
     total_gen_frames = generated.shape[1]
     print(f"Generated {total_gen_frames} frames, shape={generated.shape}")
