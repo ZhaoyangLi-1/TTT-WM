@@ -42,7 +42,7 @@ data:
 train:
   compile: true               # torch.compile — significant speedup on H100
   epochs: 100
-  batch_size: 128             # H100 80G — 22M model @ 128x128, seq_len=512 tokens
+  batch_size: 64             # H100 80G — 22M model @ 128x128, seq_len=512 tokens
   optimizer:
     lr: 3.0e-4             # Cosmos / GPT training typically uses higher lr
     weight_decay: 1.0e-2
