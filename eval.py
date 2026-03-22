@@ -146,6 +146,45 @@ def extract_context_frames(
     return torch.stack(frames)  # (n_context, C, H, W)
 
 
+@torch.no_grad()
+def generate_iterative_refinement(model, context_frames, n_steps, refine_iters=3):
+    """
+    AR generation via iterative refinement for block-causal models.
+
+    The block-causal model's generate() doesn't work for frames_in=1, frames_out=1
+    because during training, target tokens see each other via bidirectional
+    within-frame attention. At inference time, the standard generate() only has
+    context tokens, so the output is noise.
+
+    Fix: feed [context, target_guess] through the TRAINING forward path
+    (which uses block-causal attention over both frames), and iteratively
+    refine the target guess using the model's prediction.
+
+    Steps per AR step:
+      1. target_guess = context (or zeros)
+      2. pred, _ = model(context, target_guess)  — teacher-forcing path
+      3. target_guess = pred
+      4. Repeat 2-3 for refine_iters
+      5. Use final pred as generated frame, slide window
+    """
+    cfg = model.cfg
+    window = context_frames[:, -cfg.frames_in:].clone()
+    all_generated = []
+
+    for step in range(n_steps):
+        # Initialize target guess as the last context frame (better than zeros)
+        target_guess = window[:, -1:].clone()  # (B, 1, C, H, W)
+
+        for it in range(refine_iters):
+            pred_frame, _ = model(window, target_guess)  # (B, frames_out, C, H, W)
+            target_guess = pred_frame.clamp(-1, 1)
+
+        all_generated.append(target_guess)
+        window = torch.cat([window, target_guess], dim=1)[:, -cfg.frames_in:]
+
+    return torch.cat(all_generated, dim=1)
+
+
 def frames_to_uint8(frames: torch.Tensor) -> np.ndarray:
     """Convert frames from [-1, 1] to uint8 numpy. (T, C, H, W) -> (T, H, W, C)."""
     x = (frames.clamp(-1, 1) * 0.5 + 0.5) * 255.0
@@ -223,6 +262,8 @@ def main():
     parser.add_argument("--device", type=str, default="cuda", help="Device (cuda/cpu)")
     parser.add_argument("--with-gt", action="store_true",
                         help="Include ground-truth side-by-side comparison")
+    parser.add_argument("--refine-iters", type=int, default=3,
+                        help="Iterative refinement steps per frame (fixes block-causal inference)")
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device != "cuda" else "cpu")
@@ -247,8 +288,11 @@ def main():
 
     # Generate
     print(f"Generating {args.n_steps} AR steps (each produces {model_cfg.frames_out} frames)...")
-    with torch.no_grad(), torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-        generated = model.generate(context, n_steps=args.n_steps)  # (1, n_steps*frames_out, C, H, W)
+    print(f"Using iterative refinement with {args.refine_iters} iterations per frame")
+    with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
+        generated = generate_iterative_refinement(
+            model, context, n_steps=args.n_steps, refine_iters=args.refine_iters,
+        )  # (1, n_steps*frames_out, C, H, W)
 
     total_gen_frames = generated.shape[1]
     print(f"Generated {total_gen_frames} frames, shape={generated.shape}")
