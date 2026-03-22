@@ -67,12 +67,19 @@ def load_model_from_checkpoint(ckpt_path: str, device: torch.device, use_ema: bo
     model_cfg = ARPatchConfig(**config_kwargs)
     model = ARVideoPatchTransformer(model_cfg).to(device)
 
+    def _strip_compiled_prefix(state_dict):
+        """Remove '_orig_mod.' prefix added by torch.compile."""
+        prefix = "_orig_mod."
+        if any(k.startswith(prefix) for k in state_dict):
+            state_dict = {k.removeprefix(prefix): v for k, v in state_dict.items()}
+        return state_dict
+
     # Load weights (EMA or live)
     if use_ema and "ema" in ckpt:
-        model.load_state_dict(ckpt["ema"])
+        model.load_state_dict(_strip_compiled_prefix(ckpt["ema"]))
         print(f"Loaded EMA weights from {ckpt_path}")
     else:
-        model.load_state_dict(ckpt["model"])
+        model.load_state_dict(_strip_compiled_prefix(ckpt["model"]))
         if use_ema:
             print(f"Warning: --use-ema requested but no EMA weights in checkpoint, using live weights")
         print(f"Loaded model weights from {ckpt_path}")
