@@ -45,6 +45,13 @@ train:
     update_every: 1         # update EMA every N optimizer steps
   grad_clip: 1.0
   amp: true
+  # ── memory / throughput ─────────────────────────────────────────
+  # effective_batch = batch_size x grad_accum_steps x n_gpus
+  # H100 x 8, batch_size=16, grad_accum_steps=1  -> effective B=128
+  # H100 x 1, batch_size=16, grad_accum_steps=8  -> effective B=128
+  grad_accum_steps: 1
+  # torch.compile gives ~20-30 pct throughput on H100. Disable for debugging.
+  compile: false
   ckpt_dir: ${outputs_root}/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
   save_every: 10
   resume: ""
