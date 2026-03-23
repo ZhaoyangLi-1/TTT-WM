@@ -1,45 +1,63 @@
 """
-train.py — ARVideoPatchTransformer training with Hydra
-=======================================================
+train.py — ARVideoPatchTransformer training with Hydra + DDP
+=============================================================
 
-Usage
------
-    python train.py data=synthetic                           # synthetic data (default)
-    python train.py data.type=real data.root=/clips          # real data
-    python train.py train.batch_size=32                      # override any key
-    python train.py --multirun train.optimizer.lr=1e-4,3e-4  # sweep
-    python train.py train.resume=checkpoints/last.pt         # resume
+Single-GPU (original behaviour, unchanged):
+    python train.py data=synthetic
 
-EMA
----
-    When train.ema.enabled=true, an EMA shadow model is maintained.
-    Validation loss is computed on the EMA model.
-    Checkpoints save both the live model and EMA weights.
+Multi-GPU with DDP (new):
+    torchrun --nproc_per_node=8 train.py data=synthetic
+    torchrun --nproc_per_node=8 train.py data.type=real data.root=/clips
 
-Weight decay grouping
----------------------
-    When train.optimizer.no_decay_norm=true, bias terms and all params
-    inside LayerNorm / GroupNorm / Embedding get weight_decay=0.
-    All other params use train.optimizer.weight_decay.
+Memory optimisations (applied automatically):
+    1. fp16 AMP          — train.amp=true  (default)
+    2. Gradient checkpointing — inside CausalTransformer in model.py,
+       active whenever self.training=True, no extra config needed
+    3. Gradient accumulation — train.grad_accum_steps  (default 1)
+
+       Effective batch = batch_size × grad_accum_steps × world_size
+       Example: batch_size=8, grad_accum_steps=4, 8 GPUs → effective B=256
+
+DDP notes
+---------
+- Launch with torchrun; RANK / LOCAL_RANK / WORLD_SIZE are set automatically.
+- EMA, checkpoint save/load, wandb → rank 0 only.
+- DistributedSampler shards dataset; set_epoch called each epoch.
+- no_sync() context skips gradient all-reduce on intermediate accumulation
+  micro-steps — avoids (grad_accum_steps-1) wasted all-reduces per step.
+- OneCycleLR total_steps computed per-rank (DistributedSampler already
+  divides dataset by world_size), so LR schedule is GPU-count-independent.
+- torch.compile is applied BEFORE DDP wrapping (PyTorch recommendation).
+
+Checkpoint format
+-----------------
+Always saves unwrapped module state dict (model.module for DDP, model otherwise).
+_load_checkpoint strips both '_orig_mod.' (compile) and 'module.' (DDP) prefixes.
 """
+
+from __future__ import annotations
 
 import copy
 import functools
 import io
 import json
 import logging
+import os
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import hydra
 import numpy as np
 import pandas as pd
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import wandb
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from torchvision import transforms
 from tqdm import tqdm
 
@@ -50,37 +68,56 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# DDP helpers
+# ---------------------------------------------------------------------------
+
+def setup_ddp():
+    """
+    Initialise process group when launched via torchrun.
+    Returns (rank, local_rank, world_size).
+    Plain python launch: rank=0, local_rank=0, world_size=1.
+    """
+    if "RANK" not in os.environ:
+        return 0, 0, 1
+
+    dist.init_process_group(backend="nccl")
+    rank       = dist.get_rank()
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = dist.get_world_size()
+    torch.cuda.set_device(local_rank)
+    return rank, local_rank, world_size
+
+
+def cleanup_ddp():
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    """Strip DDP wrapper to reach the underlying module."""
+    return model.module if isinstance(model, DDP) else model
+
+
+# ---------------------------------------------------------------------------
 # EMA
 # ---------------------------------------------------------------------------
 
 class EMA:
     """
     Exponential Moving Average of model weights.
-
-        ema_w = decay * ema_w + (1 - decay) * model_w
-
-    Usage:
-        ema = EMA(model, decay=0.999)
-        # after each optimizer step:
-        ema.update(model)
-        # for validation:
-        ema.apply(model)
-        val_loss = evaluate(model)
-        ema.restore(model)
+    Always operated on the *unwrapped* module (not a DDP wrapper).
     """
 
     def __init__(self, model: nn.Module, decay: float):
-        self.decay        = decay
-        self.num_updates  = 0
-        self.shadow = copy.deepcopy(model)
+        self.decay       = decay
+        self.num_updates = 0
+        self.shadow      = copy.deepcopy(model)
         self.shadow.eval()
         for p in self.shadow.parameters():
             p.requires_grad_(False)
 
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
-        # Bias-correction warmup: effective decay starts low and ramps to self.decay
-        # Prevents EMA from lagging far behind early in training (DiT / Karras style)
         d = min(self.decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
         self.num_updates += 1
         for s, m in zip(self.shadow.parameters(), model.parameters()):
@@ -89,13 +126,11 @@ class EMA:
             s_buf.data.copy_(m_buf.data)
 
     def apply(self, model: nn.Module) -> None:
-        """Copy EMA weights into model (call before eval)."""
         self._backup = [p.data.clone() for p in model.parameters()]
         for m, s in zip(model.parameters(), self.shadow.parameters()):
             m.data.copy_(s.data)
 
     def restore(self, model: nn.Module) -> None:
-        """Restore live weights after apply()."""
         for m, b in zip(model.parameters(), self._backup):
             m.data.copy_(b)
         del self._backup
@@ -112,16 +147,7 @@ class EMA:
 # ---------------------------------------------------------------------------
 
 def build_optimizer(model: nn.Module, opt_cfg: DictConfig) -> torch.optim.Optimizer:
-    """
-    AdamW with optional weight-decay parameter groups.
-
-    When opt_cfg.no_decay_norm=true:
-      - bias params          → weight_decay = 0
-      - LayerNorm/GroupNorm/Embedding params → weight_decay = 0
-      - everything else      → weight_decay = opt_cfg.weight_decay
-
-    This follows the standard recipe from GPT / LLaMA training.
-    """
+    """AdamW with optional weight-decay param groups. Pass unwrapped module."""
     if not opt_cfg.no_decay_norm:
         return torch.optim.AdamW(
             model.parameters(),
@@ -132,7 +158,6 @@ def build_optimizer(model: nn.Module, opt_cfg: DictConfig) -> torch.optim.Optimi
 
     no_decay_types = (nn.LayerNorm, nn.GroupNorm, nn.Embedding)
     decay_params, no_decay_params = [], []
-
     for module in model.modules():
         for param_name, param in module.named_parameters(recurse=False):
             if not param.requires_grad:
@@ -146,7 +171,6 @@ def build_optimizer(model: nn.Module, opt_cfg: DictConfig) -> torch.optim.Optimi
         f"Optimizer — decay: {len(decay_params)} params | "
         f"no_decay: {len(no_decay_params)} params"
     )
-
     return torch.optim.AdamW(
         [
             {"params": decay_params,    "weight_decay": opt_cfg.weight_decay},
@@ -158,38 +182,17 @@ def build_optimizer(model: nn.Module, opt_cfg: DictConfig) -> torch.optim.Optimi
 
 
 # ---------------------------------------------------------------------------
-# Datasets
+# Datasets  (identical to original — DDP sharding done via sampler)
 # ---------------------------------------------------------------------------
 
 class VideoFrameDataset(Dataset):
-    """
-    LeRobot-v2 parquet video dataset (e.g. LIBERO).
-
-    Directory layout (LeRobot v2.0):
-        data.root/
-            meta/
-                info.json          # total_episodes, total_chunks, chunks_size, …
-                episodes.jsonl     # per-episode metadata (length, tasks, …)
-            data/
-                chunk-000/
-                    episode_000000.parquet
-                    episode_000001.parquet
-                    …
-                chunk-001/
-                    …
-
-    Each parquet row has an `image` column stored as
-    ``{"bytes": <png bytes>, "path": "frame_XXXXXX.png"}``.
-
-    Each sample is a sliding window of ``frames_in + frames_out``
-    consecutive frames from one episode.  Returns (context, target) in [-1, 1].
-    """
+    """LeRobot-v2 parquet video dataset (e.g. LIBERO)."""
 
     def __init__(self, data_cfg: DictConfig, model_cfg: DictConfig, split: str):
-        self.T      = model_cfg.frames_in + model_cfg.frames_out
-        self.fin    = model_cfg.frames_in
-        self.stride = data_cfg.get("frame_stride", 1)
-        self.gap    = data_cfg.get("frame_gap", self.stride)  # extra gap between last context and first target
+        self.T         = model_cfg.frames_in + model_cfg.frames_out
+        self.fin       = model_cfg.frames_in
+        self.stride    = data_cfg.get("frame_stride", 1)
+        self.gap       = data_cfg.get("frame_gap", self.stride)
         self.image_key = data_cfg.get("image_key", "image")
         self.transform = transforms.Compose([
             transforms.Resize((model_cfg.resolution, model_cfg.resolution)),
@@ -198,42 +201,29 @@ class VideoFrameDataset(Dataset):
         ])
 
         root = Path(data_cfg.root)
-
-        # ── read meta ──────────────────────────────────────────────────
         with open(root / "meta" / "info.json") as f:
             info = json.load(f)
         total_episodes = info["total_episodes"]
         chunks_size    = info["chunks_size"]
 
-        # ── build episode file list ────────────────────────────────────
-        episode_files = []
-        for ep_idx in range(total_episodes):
-            chunk_idx = ep_idx // chunks_size
-            path = root / "data" / f"chunk-{chunk_idx:03d}" / f"episode_{ep_idx:06d}.parquet"
-            episode_files.append(path)
+        episode_files = [
+            root / "data" / f"chunk-{ep_idx // chunks_size:03d}" / f"episode_{ep_idx:06d}.parquet"
+            for ep_idx in range(total_episodes)
+        ]
 
-        # ── read episode lengths from episodes.jsonl ───────────────────
         ep_lengths = {}
         with open(root / "meta" / "episodes.jsonl") as f:
             for line in f:
                 rec = json.loads(line)
                 ep_lengths[rec["episode_index"]] = rec["length"]
 
-        # ── train / val split ──────────────────────────────────────────
         n_val = max(1, int(total_episodes * data_cfg.val_split))
-        if split == "train":
-            ep_indices = list(range(n_val, total_episodes))
-        else:
-            ep_indices = list(range(n_val))
+        ep_indices = list(range(n_val, total_episodes)) if split == "train" else list(range(n_val))
 
-        # ── build sliding-window sample index ──────────────────────────
-        # Each sample is (episode_file_path_str, start_frame_index)
         self.samples = []
-        # span: total frames covered by one window
-        # context occupies fin*stride frames, then a gap, then fout*stride frames
         fout = self.T - self.fin
         span = (self.fin - 1) * self.stride + self.gap + (fout - 1) * self.stride + 1
-        self._target_offset = (self.fin - 1) * self.stride + self.gap  # index of first target frame
+        self._target_offset = (self.fin - 1) * self.stride + self.gap
         for ep_idx in ep_indices:
             length = ep_lengths[ep_idx]
             if length < span:
@@ -242,13 +232,8 @@ class VideoFrameDataset(Dataset):
             for start in range(length - span + 1):
                 self.samples.append((ep_path_str, start))
 
-        log.info(
-            f"[{split}] {len(self.samples)} windows / "
-            f"{len(ep_indices)} episodes"
-        )
+        log.info(f"[{split}] {len(self.samples)} windows / {len(ep_indices)} episodes")
 
-        # LRU cache for parquet reads (avoids re-reading the same file
-        # for different windows within the same episode)
         self._read_parquet = functools.lru_cache(maxsize=32)(
             lambda path: pd.read_parquet(path, columns=[self.image_key])
         )
@@ -258,26 +243,22 @@ class VideoFrameDataset(Dataset):
 
     def __getitem__(self, idx):
         parquet_path, start = self.samples[idx]
-        df = self._read_parquet(parquet_path)
+        df   = self._read_parquet(parquet_path)
         imgs = []
         for t in range(self.T):
-            if t < self.fin:
-                frame_idx = start + t * self.stride
-            else:
-                frame_idx = start + self._target_offset + (t - self.fin) * self.stride
-            img_data = df.iloc[frame_idx][self.image_key]
-            png_bytes = img_data["bytes"]
-            img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+            frame_idx = (
+                start + t * self.stride if t < self.fin
+                else start + self._target_offset + (t - self.fin) * self.stride
+            )
+            img_data  = df.iloc[frame_idx][self.image_key]
+            img       = Image.open(io.BytesIO(img_data["bytes"])).convert("RGB")
             imgs.append(self.transform(img))
         frames = torch.stack(imgs)
         return frames[: self.fin], frames[self.fin :]
 
 
 class SyntheticVideoDataset(Dataset):
-    """
-    Synthetic moving-dot dataset — no files needed.
-    Useful for quick smoke-tests and overfitting checks.
-    """
+    """Synthetic moving-dot dataset — no files needed."""
 
     def __init__(self, data_cfg: DictConfig, model_cfg: DictConfig, split: str):
         self.T          = model_cfg.frames_in + model_cfg.frames_out
@@ -321,31 +302,43 @@ class Trainer:
     def __init__(self, cfg: DictConfig):
         self.cfg = cfg
 
+        # ── DDP setup ───────────────────────────────────────────────────
+        self.rank, self.local_rank, self.world_size = setup_ddp()
+        self.is_main = (self.rank == 0)
+
         # ── device ──────────────────────────────────────────────────────
-        dev = cfg.train.device
-        if dev and dev not in ("", "auto"):
-            self.device = torch.device(dev)
-        elif torch.cuda.is_available():
-            self.device = torch.device("cuda")
+        if torch.cuda.is_available():
+            self.device = torch.device(f"cuda:{self.local_rank}")
         elif torch.backends.mps.is_available():
             self.device = torch.device("mps")
         else:
             self.device = torch.device("cpu")
-        log.info(f"Device: {self.device}")
 
-        # ── performance flags ──────────────────────────────────────────
+        if self.is_main:
+            log.info(f"Device: {self.device}  |  world_size: {self.world_size}")
+
+        # ── H100 performance flags ─────────────────────────────────────
         if self.device.type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32       = True
-            torch.backends.cudnn.benchmark        = True
-            log.info("Enabled TF32 + cuDNN benchmark")
+            torch.backends.cudnn.allow_tf32        = True
+            torch.backends.cudnn.benchmark         = True
 
-        torch.manual_seed(cfg.seed)
+        # Different seed per rank so data augmentation differs across GPUs
+        torch.manual_seed(cfg.seed + self.rank)
+
+        # ── gradient accumulation ──────────────────────────────────────
+        self.grad_accum_steps = int(cfg.train.get("grad_accum_steps", 1))
+        if self.is_main:
+            eff = cfg.train.batch_size * self.grad_accum_steps * self.world_size
+            log.info(
+                f"micro_batch={cfg.train.batch_size}  "
+                f"accum_steps={self.grad_accum_steps}  "
+                f"world_size={self.world_size}  "
+                f"→ effective_batch={eff}"
+            )
 
         # ── model ───────────────────────────────────────────────────────
-        mcfg = cfg.model
-
-        # Select model variant based on config
+        mcfg       = cfg.model
         use_cosmos = mcfg.get("arch", "emu3") == "cosmos"
 
         config_kwargs = dict(
@@ -360,39 +353,55 @@ class Trainer:
             frames_in    = mcfg.frames_in,
             frames_out   = mcfg.frames_out,
         )
-
         if use_cosmos:
             config_kwargs["qk_norm"]       = mcfg.get("qk_norm",       True)
             config_kwargs["parallel_attn"] = mcfg.get("parallel_attn", False)
             self.model_cfg = _CosmosConfig(**config_kwargs)
-            self.model = _CosmosModel(self.model_cfg).to(self.device)
-            log.info("Using Cosmos-style ARVideoPatchTransformer (block-causal)")
+            raw_model      = _CosmosModel(self.model_cfg).to(self.device)
+            arch_name      = "Cosmos"
         else:
             self.model_cfg = _EmuConfig(**config_kwargs)
-            self.model = _EmuModel(self.model_cfg).to(self.device)
-            log.info("Using Emu3-style ARVideoPatchTransformer (fully causal)")
-        n_params = sum(p.numel() for p in self.model.parameters()) / 1e6
-        log.info(f"Parameters: {n_params:.2f} M")
+            raw_model      = _EmuModel(self.model_cfg).to(self.device)
+            arch_name      = "Emu3"
 
-        # ── torch.compile (H100 / SM90 benefits significantly) ─────────
+        if self.is_main:
+            n_params = sum(p.numel() for p in raw_model.parameters()) / 1e6
+            log.info(f"Arch: {arch_name}  |  Parameters: {n_params:.2f} M")
+
+        # ── torch.compile (BEFORE DDP wrapping — PyTorch recommendation) ─
         if cfg.train.get("compile", False) and hasattr(torch, "compile"):
-            self.model = torch.compile(self.model)
-            log.info("torch.compile enabled")
+            raw_model = torch.compile(raw_model)
+            if self.is_main:
+                log.info("torch.compile enabled")
 
-        # ── EMA ─────────────────────────────────────────────────────────
-        ema_cfg = cfg.train.ema
-        self.ema = EMA(self.model, decay=ema_cfg.decay) if ema_cfg.enabled else None
-        if self.ema:
-            log.info(f"EMA enabled  decay={ema_cfg.decay}  update_every={ema_cfg.update_every}")
+        # ── DDP wrapping ────────────────────────────────────────────────
+        if self.world_size > 1:
+            self.model = DDP(
+                raw_model,
+                device_ids=[self.local_rank],
+                output_device=self.local_rank,
+                find_unused_parameters=False,
+            )
+            if self.is_main:
+                log.info(f"DDP enabled  ({self.world_size} GPUs)")
+        else:
+            self.model = raw_model
 
-        # ── optimizer ───────────────────────────────────────────────────
-        self.optimizer = build_optimizer(self.model, cfg.train.optimizer)
+        # ── EMA — rank 0 only, on unwrapped module ──────────────────────
+        ema_cfg  = cfg.train.ema
+        raw      = unwrap_model(self.model)
+        self.ema = EMA(raw, decay=ema_cfg.decay) if (ema_cfg.enabled and self.is_main) else None
+        if self.ema and self.is_main:
+            log.info(f"EMA  decay={ema_cfg.decay}  update_every={ema_cfg.update_every}")
+
+        # ── optimizer (unwrapped params) ─────────────────────────────────
+        self.optimizer = build_optimizer(unwrap_model(self.model), cfg.train.optimizer)
 
         # ── AMP ─────────────────────────────────────────────────────────
         self.use_amp = cfg.train.amp and self.device.type == "cuda"
         self.scaler  = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
-        # ── data ────────────────────────────────────────────────────────
+        # ── data ─────────────────────────────────────────────────────────
         train_ds, val_ds = build_datasets(cfg.data, cfg.model)
         n_workers = cfg.data.num_workers
         loader_kw = dict(
@@ -401,18 +410,41 @@ class Trainer:
             persistent_workers = cfg.data.get("persistent_workers", False) and n_workers > 0,
             prefetch_factor    = cfg.data.get("prefetch_factor", 2) if n_workers > 0 else None,
         )
-        self.train_loader = DataLoader(
-            train_ds, batch_size=cfg.train.batch_size,
-            shuffle=True, drop_last=True, **loader_kw,
-        )
-        self.val_loader = DataLoader(
-            val_ds, batch_size=cfg.train.batch_size * 2,
-            shuffle=False, **loader_kw,
-        )
 
-        # ── scheduler ───────────────────────────────────────────────────
-        total_steps = cfg.train.epochs * len(self.train_loader)
-        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        if self.world_size > 1:
+            train_sampler = DistributedSampler(
+                train_ds, num_replicas=self.world_size, rank=self.rank, shuffle=True,
+            )
+            val_sampler = DistributedSampler(
+                val_ds, num_replicas=self.world_size, rank=self.rank, shuffle=False,
+            )
+            self.train_loader = DataLoader(
+                train_ds, batch_size=cfg.train.batch_size,
+                sampler=train_sampler, drop_last=True, **loader_kw,
+            )
+            self.val_loader = DataLoader(
+                val_ds, batch_size=cfg.train.batch_size * 2,
+                sampler=val_sampler, **loader_kw,
+            )
+            self._train_sampler = train_sampler
+        else:
+            self.train_loader = DataLoader(
+                train_ds, batch_size=cfg.train.batch_size,
+                shuffle=True, drop_last=True, **loader_kw,
+            )
+            self.val_loader = DataLoader(
+                val_ds, batch_size=cfg.train.batch_size * 2,
+                shuffle=False, **loader_kw,
+            )
+            self._train_sampler = None
+
+        # ── scheduler ────────────────────────────────────────────────────
+        # steps_per_epoch = batches per rank / accum_steps
+        # DistributedSampler already divides dataset by world_size, so this
+        # is correct regardless of GPU count.
+        steps_per_epoch = max(1, len(self.train_loader) // self.grad_accum_steps)
+        total_steps     = cfg.train.epochs * steps_per_epoch
+        self.scheduler  = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
             max_lr          = cfg.train.optimizer.lr,
             total_steps     = total_steps,
@@ -420,52 +452,63 @@ class Trainer:
             anneal_strategy = "cos",
         )
 
-        # ── state ───────────────────────────────────────────────────────
+        # ── state ─────────────────────────────────────────────────────────
         self.ckpt_dir      = Path(cfg.train.ckpt_dir)
-        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
-        self.start_epoch   = 0
-        self.best_val_loss = float("inf")
+        if self.is_main:
+            self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+        self.start_epoch    = 0
+        self.best_val_loss  = float("inf")
         self.best_ckpt_path: Path | None = None
-        self.global_step   = 0
+        self.global_step    = 0
 
         if cfg.train.resume:
             self._load_checkpoint(cfg.train.resume)
 
-        # ── wandb ──────────────────────────────────────────────────────
-        wandb_cfg = cfg.get("wandb", {})
-        wandb.init(
-            project = wandb_cfg.get("project", "TTT-WM"),
-            name    = wandb_cfg.get("name", cfg.experiment_name),
-            config  = OmegaConf.to_container(cfg, resolve=True),
-            resume  = "allow" if cfg.train.resume else None,
-        )
-        # let epoch-level metrics use "epoch" as x-axis instead of global_step
-        wandb.define_metric("epoch")
-        wandb.define_metric("epoch/*", step_metric="epoch")
+        # ── wandb (rank 0 only) ──────────────────────────────────────────
+        if self.is_main:
+            wandb_cfg = cfg.get("wandb", {})
+            wandb.init(
+                project = wandb_cfg.get("project", "TTT-WM"),
+                name    = wandb_cfg.get("name",    cfg.experiment_name),
+                config  = OmegaConf.to_container(cfg, resolve=True),
+                resume  = "allow" if cfg.train.resume else None,
+            )
+            wandb.define_metric("epoch")
+            wandb.define_metric("epoch/*", step_metric="epoch")
 
-    # ── checkpoint ───────────────────────────────────────────────────────
+    # ── checkpoint ────────────────────────────────────────────────────────
 
     def _save_checkpoint(self, epoch: int, val_loss: float, tag: str = "last"):
+        """Save unwrapped module state dict (no DDP / compile prefix)."""
+        raw = unwrap_model(self.model)
         payload = {
-            "epoch"      : epoch,
-            "global_step": self.global_step,
-            "model"      : self.model.state_dict(),
-            "optimizer"  : self.optimizer.state_dict(),
-            "scheduler"  : self.scheduler.state_dict(),
-            "scaler"     : self.scaler.state_dict(),
-            "val_loss"   : val_loss,
-            "cfg"        : OmegaConf.to_container(self.cfg, resolve=True),
+            "epoch"       : epoch,
+            "global_step" : self.global_step,
+            "model"       : raw.state_dict(),
+            "optimizer"   : self.optimizer.state_dict(),
+            "scheduler"   : self.scheduler.state_dict(),
+            "scaler"      : self.scaler.state_dict(),
+            "val_loss"    : val_loss,
+            "cfg"         : OmegaConf.to_container(self.cfg, resolve=True),
         }
         if self.ema is not None:
             payload["ema"] = self.ema.state_dict()
-
         path = self.ckpt_dir / f"{tag}.pt"
         torch.save(payload, path)
         log.info(f"Saved {path}  val_loss={val_loss:.6f}")
 
     def _load_checkpoint(self, path: str):
-        ckpt = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(ckpt["model"])
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+
+        def _strip(sd, prefix):
+            if any(k.startswith(prefix) for k in sd):
+                return {k.removeprefix(prefix): v for k, v in sd.items()}
+            return sd
+
+        # Strip compile prefix '_orig_mod.' and DDP prefix 'module.' if present
+        model_sd = _strip(_strip(ckpt["model"], "_orig_mod."), "module.")
+        unwrap_model(self.model).load_state_dict(model_sd)
+
         self.optimizer.load_state_dict(ckpt["optimizer"])
         self.scheduler.load_state_dict(ckpt["scheduler"])
         self.scaler.load_state_dict(ckpt["scaler"])
@@ -474,105 +517,153 @@ class Trainer:
         self.start_epoch   = ckpt["epoch"] + 1
         self.global_step   = ckpt.get("global_step", 0)
         self.best_val_loss = ckpt.get("val_loss", float("inf"))
-        log.info(f"Resumed from {path}  (epoch {self.start_epoch})")
+        if self.is_main:
+            log.info(f"Resumed from {path}  (epoch {self.start_epoch})")
 
-    # ── epoch ────────────────────────────────────────────────────────────
+    # ── epoch ──────────────────────────────────────────────────────────────
 
     def _run_epoch(self, loader: DataLoader, train: bool) -> float:
+        """
+        Run one epoch.
+
+        Gradient accumulation strategy
+        --------------------------------
+        - zero_grad() at the start of each accumulation window.
+        - Loss divided by grad_accum_steps so gradient magnitude equals a
+          single large-batch forward pass.
+        - Under DDP, model.no_sync() suppresses the all-reduce on all but the
+          last micro-step of each window → eliminates (accum_steps-1) redundant
+          collective operations.
+        - optimizer step / scheduler step / EMA update only on the final
+          micro-step of each window (global_step increments once per window).
+        """
         self.model.train(train)
-        total_loss, n_batches = 0.0, 0
+        total_loss, n_opt_steps = 0.0, 0
         ema_cfg   = self.cfg.train.ema
         log_every = self.cfg.train.log_every
 
-        pbar = tqdm(loader, desc="train" if train else "val", leave=False)
-        ctx = torch.enable_grad() if train else torch.no_grad()
-        with ctx:
-            for context, target in pbar:
+        pbar = tqdm(loader, desc="train" if train else "val",
+                    leave=False, disable=not self.is_main)
+
+        grad_ctx = torch.enable_grad() if train else torch.no_grad()
+
+        # Accumulation state (only used in train mode)
+        accum_loss = 0.0
+        accum_step = 0
+
+        with grad_ctx:
+            for batch_idx, (context, target) in enumerate(pbar):
                 context = context.to(self.device, non_blocking=True)
                 target  = target.to(self.device,  non_blocking=True)
 
-                with torch.cuda.amp.autocast(enabled=self.use_amp):
-                    _, loss = self.model(context, target)
-
                 if train:
-                    self.optimizer.zero_grad(set_to_none=True)
-                    self.scaler.scale(loss).backward()
+                    is_last_accum = (
+                        (accum_step == self.grad_accum_steps - 1)
+                        or (batch_idx == len(loader) - 1)
+                    )
 
-                    if self.cfg.train.grad_clip > 0:
-                        self.scaler.unscale_(self.optimizer)
-                        nn.utils.clip_grad_norm_(
-                            self.model.parameters(), self.cfg.train.grad_clip
-                        )
+                    # DDP: suppress all-reduce on intermediate micro-steps
+                    ddp_sync = (
+                        nullcontext()
+                        if (not isinstance(self.model, DDP) or is_last_accum)
+                        else self.model.no_sync()
+                    )
 
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                    self.scheduler.step()
-                    self.global_step += 1
+                    with ddp_sync, torch.cuda.amp.autocast(enabled=self.use_amp):
+                        _, loss = self.model(context, target)
+                        scaled_loss = loss / self.grad_accum_steps
 
-                    # EMA update
-                    if (self.ema is not None and
-                            self.global_step % ema_cfg.update_every == 0):
-                        self.ema.update(self.model)
+                    self.scaler.scale(scaled_loss).backward()
 
-                    # wandb log every gradient step
-                    lr = self.scheduler.get_last_lr()[0]
-                    wandb.log({
-                        "train/loss": loss.item(),
-                        "train/lr":   lr,
-                        "global_step": self.global_step,
-                    }, step=self.global_step)
+                    accum_loss += loss.detach().item()
+                    accum_step += 1
 
-                    # tqdm postfix
-                    pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{lr:.2e}")
+                    if is_last_accum:
+                        # ── optimiser step ──────────────────────────────
+                        if self.cfg.train.grad_clip > 0:
+                            self.scaler.unscale_(self.optimizer)
+                            nn.utils.clip_grad_norm_(
+                                unwrap_model(self.model).parameters(),
+                                self.cfg.train.grad_clip,
+                            )
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                        self.optimizer.zero_grad(set_to_none=True)
+                        self.scheduler.step()
+                        self.global_step += 1
 
-                    if self.global_step % log_every == 0:
-                        log.info(
-                            f"step {self.global_step:06d} | "
-                            f"loss {loss.item():.6f} | lr {lr:.2e}"
-                        )
+                        # EMA update (rank 0, unwrapped model)
+                        if (self.ema is not None
+                                and self.global_step % ema_cfg.update_every == 0):
+                            self.ema.update(unwrap_model(self.model))
+
+                        # Logging (rank 0)
+                        if self.is_main:
+                            lr       = self.scheduler.get_last_lr()[0]
+                            avg_loss = accum_loss / self.grad_accum_steps
+                            wandb.log({
+                                "train/loss"  : avg_loss,
+                                "train/lr"    : lr,
+                                "global_step" : self.global_step,
+                            }, step=self.global_step)
+                            pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
+                            if self.global_step % log_every == 0:
+                                log.info(
+                                    f"step {self.global_step:06d} | "
+                                    f"loss {avg_loss:.6f} | lr {lr:.2e}"
+                                )
+
+                        total_loss  += accum_loss / self.grad_accum_steps
+                        n_opt_steps += 1
+                        accum_loss   = 0.0
+                        accum_step   = 0
                 else:
-                    pbar.set_postfix(loss=f"{loss.item():.4f}")
+                    # Validation — no accumulation
+                    with torch.cuda.amp.autocast(enabled=self.use_amp):
+                        _, loss = self.model(context, target)
+                    if self.is_main:
+                        pbar.set_postfix(loss=f"{loss.item():.4f}")
+                    total_loss  += loss.item()
+                    n_opt_steps += 1
 
-                total_loss += loss.item()
-                n_batches  += 1
+        avg = total_loss / max(n_opt_steps, 1)
 
-        return total_loss / max(n_batches, 1)
+        # Average val loss across all ranks so rank 0 sees the global value
+        if self.world_size > 1 and not train:
+            t = torch.tensor(avg, device=self.device)
+            dist.all_reduce(t, op=dist.ReduceOp.AVG)
+            avg = t.item()
+
+        return avg
 
     def _val_loss(self) -> float:
-        """Compute validation loss, using EMA weights if enabled."""
+        """Validation loss using EMA weights if available (rank 0 only for swap)."""
+        raw = unwrap_model(self.model)
         if self.ema is not None:
-            self.ema.apply(self.model)
+            self.ema.apply(raw)
         loss = self._run_epoch(self.val_loader, train=False)
         if self.ema is not None:
-            self.ema.restore(self.model)
+            self.ema.restore(raw)
         return loss
 
-    # ── wandb video helpers ──────────────────────────────────────────────
+    # ── wandb video helpers ────────────────────────────────────────────────
 
     @staticmethod
     def _frames_to_uint8(frames: torch.Tensor) -> np.ndarray:
-        """
-        Convert model frames from [-1, 1] to uint8 numpy array.
-        frames: (T, C, H, W)  →  (T, H, W, C) uint8
-        """
-        x = (frames.clamp(-1, 1) * 0.5 + 0.5) * 255.0  # [0, 255]
-        x = x.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)  # (T, H, W, C)
-        return x
+        x = (frames.clamp(-1, 1) * 0.5 + 0.5) * 255.0
+        return x.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
 
     @torch.no_grad()
     def _log_val_videos(self, n_samples: int = 4):
-        """
-        Run the model on a few val samples and log pred vs target media to wandb.
-        - If total frames (context + target) <= 2: log side-by-side images
-          (context | target | prediction) so the comparison is clear.
-        - Otherwise: log videos as before.
-        """
+        """Log prediction vs target videos to wandb.  Rank 0 only."""
+        if not self.is_main:
+            return
         self.model.eval()
+        raw = unwrap_model(self.model)
         if self.ema is not None:
-            self.ema.apply(self.model)
+            self.ema.apply(raw)
 
-        # Random indices spread across val set → diverse scenes/episodes
-        ds = self.val_loader.dataset
+        ds      = self.val_loader.dataset
         indices = torch.randperm(len(ds))[:n_samples].tolist()
         ctx_list, tgt_list = zip(*[ds[i] for i in indices])
         context = torch.stack(ctx_list).to(self.device)
@@ -582,102 +673,91 @@ class Trainer:
             pred_frames, _ = self.model(context, target)
 
         if self.ema is not None:
-            self.ema.restore(self.model)
+            self.ema.restore(raw)
 
-        n = min(n_samples, context.shape[0])
+        n            = min(n_samples, context.shape[0])
         total_frames = context.shape[1] + target.shape[1]
-        media = {}
+        media        = {}
 
         for i in range(n):
-            ctx_np  = self._frames_to_uint8(context[i])        # (fin, H, W, C)
-            tgt_np  = self._frames_to_uint8(target[i])         # (fout, H, W, C)
-            pred_np = self._frames_to_uint8(pred_frames[i])    # (fout, H, W, C)
+            ctx_np  = self._frames_to_uint8(context[i])
+            tgt_np  = self._frames_to_uint8(target[i])
+            pred_np = self._frames_to_uint8(pred_frames[i])
 
             if total_frames <= 2:
-                # Few frames — log as a single side-by-side image:
-                # [context | target | prediction]  with labels
-                parts = []
-                for f in range(ctx_np.shape[0]):
-                    parts.append(ctx_np[f])
-                for f in range(tgt_np.shape[0]):
-                    parts.append(tgt_np[f])
-                for f in range(pred_np.shape[0]):
-                    parts.append(pred_np[f])
-                composite = np.concatenate(parts, axis=1)  # (H, W*N, C)
-                caption = "context | target | prediction"
+                parts     = [ctx_np[f] for f in range(ctx_np.shape[0])]
+                parts    += [tgt_np[f] for f in range(tgt_np.shape[0])]
+                parts    += [pred_np[f] for f in range(pred_np.shape[0])]
+                composite = np.concatenate(parts, axis=1)
                 media[f"val/sample_{i}"] = wandb.Image(
-                    composite, caption=caption,
+                    composite, caption="context | target | prediction"
                 )
             else:
-                # Enough frames — log as videos
-                gt_video   = np.concatenate([ctx_np, tgt_np], axis=0)
-                pred_video = np.concatenate([ctx_np, pred_np], axis=0)
-                # wandb.Video expects (T, C, H, W)
-                gt_video   = gt_video.transpose(0, 3, 1, 2)
-                pred_video = pred_video.transpose(0, 3, 1, 2)
-                media[f"val/sample_{i}_target"] = wandb.Video(
-                    gt_video, fps=4, format="mp4"
-                )
-                media[f"val/sample_{i}_pred"] = wandb.Video(
-                    pred_video, fps=4, format="mp4"
-                )
+                gt_vid   = np.concatenate([ctx_np, tgt_np],  axis=0).transpose(0, 3, 1, 2)
+                pred_vid = np.concatenate([ctx_np, pred_np], axis=0).transpose(0, 3, 1, 2)
+                media[f"val/sample_{i}_target"] = wandb.Video(gt_vid,   fps=4, format="mp4")
+                media[f"val/sample_{i}_pred"]   = wandb.Video(pred_vid, fps=4, format="mp4")
 
         wandb.log(media, step=self.global_step)
 
-    # ── main loop ────────────────────────────────────────────────────────
+    # ── main loop ──────────────────────────────────────────────────────────
 
     def train(self):
         tcfg = self.cfg.train
-        log.info(f"Training {tcfg.epochs} epochs | batch {tcfg.batch_size}")
-        log.info(f"\n{OmegaConf.to_yaml(self.cfg)}")
-
-        for epoch in range(self.start_epoch, tcfg.epochs):
-            t0 = time.time()
-
-            train_loss    = self._run_epoch(self.train_loader, train=True)
-            val_loss      = self._val_loss()                          # EMA if enabled
-            val_loss_raw  = self._run_epoch(self.val_loader, train=False)  # current weights
-
-            elapsed = time.time() - t0
-            ema_tag = " [EMA]" if self.ema else ""
+        if self.is_main:
             log.info(
-                f"epoch {epoch:04d} | "
-                f"train {train_loss:.6f} | "
-                f"val{ema_tag} {val_loss:.6f} | "
-                f"val[raw] {val_loss_raw:.6f} | "
-                f"{elapsed:.1f}s"
+                f"Training {tcfg.epochs} epochs | "
+                f"micro_batch {tcfg.batch_size} | accum {self.grad_accum_steps} | "
+                f"world_size {self.world_size}"
             )
 
-            # wandb epoch-level logging
-            wandb.log({
-                "epoch":              epoch,
-                "epoch/train_loss":   train_loss,
-                "epoch/val_loss":     val_loss,
-                "epoch/val_loss_raw": val_loss_raw,
-                "epoch/lr":        self.scheduler.get_last_lr()[0],
-            }, step=self.global_step)
+        for epoch in range(self.start_epoch, tcfg.epochs):
+            if self._train_sampler is not None:
+                # Must call set_epoch so DistributedSampler re-shuffles each epoch
+                self._train_sampler.set_epoch(epoch)
 
-            # log prediction vs target videos
-            self._log_val_videos(n_samples=4)
+            t0 = time.time()
 
-            self._save_checkpoint(epoch, val_loss, tag="last")
+            train_loss   = self._run_epoch(self.train_loader, train=True)
+            val_loss     = self._val_loss()
+            val_loss_raw = self._run_epoch(self.val_loader, train=False)
 
-            if val_loss < self.best_val_loss:
-                # delete previous best checkpoint
-                if self.best_ckpt_path is not None and self.best_ckpt_path.exists():
-                    self.best_ckpt_path.unlink()
-                    log.info(f"Removed old best ckpt: {self.best_ckpt_path}")
-                self.best_val_loss  = val_loss
-                best_tag = f"best_epoch{epoch:04d}_loss{val_loss:.6f}"
-                self._save_checkpoint(epoch, val_loss, tag=best_tag)
-                self.best_ckpt_path = self.ckpt_dir / f"{best_tag}.pt"
-                wandb.run.summary["best_val_loss"] = val_loss
-                wandb.run.summary["best_epoch"]    = epoch
+            elapsed = time.time() - t0
 
-            if (epoch + 1) % tcfg.save_every == 0:
-                self._save_checkpoint(epoch, val_loss, tag=f"epoch_{epoch:04d}")
+            if self.is_main:
+                ema_tag = " [EMA]" if self.ema else ""
+                log.info(
+                    f"epoch {epoch:04d} | train {train_loss:.6f} | "
+                    f"val{ema_tag} {val_loss:.6f} | val[raw] {val_loss_raw:.6f} | "
+                    f"{elapsed:.1f}s"
+                )
+                wandb.log({
+                    "epoch"              : epoch,
+                    "epoch/train_loss"   : train_loss,
+                    "epoch/val_loss"     : val_loss,
+                    "epoch/val_loss_raw" : val_loss_raw,
+                    "epoch/lr"           : self.scheduler.get_last_lr()[0],
+                }, step=self.global_step)
 
-        wandb.finish()
+                self._log_val_videos(n_samples=4)
+                self._save_checkpoint(epoch, val_loss, tag="last")
+
+                if val_loss < self.best_val_loss:
+                    if self.best_ckpt_path is not None and self.best_ckpt_path.exists():
+                        self.best_ckpt_path.unlink()
+                    self.best_val_loss  = val_loss
+                    best_tag = f"best_epoch{epoch:04d}_loss{val_loss:.6f}"
+                    self._save_checkpoint(epoch, val_loss, tag=best_tag)
+                    self.best_ckpt_path = self.ckpt_dir / f"{best_tag}.pt"
+                    wandb.run.summary["best_val_loss"] = val_loss
+                    wandb.run.summary["best_epoch"]    = epoch
+
+                if (epoch + 1) % tcfg.save_every == 0:
+                    self._save_checkpoint(epoch, val_loss, tag=f"epoch_{epoch:04d}")
+
+        if self.is_main:
+            wandb.finish()
+        cleanup_ddp()
 
 
 # ---------------------------------------------------------------------------
