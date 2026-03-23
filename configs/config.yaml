@@ -51,7 +51,7 @@ train:
   # H100 x 1, batch_size=16, grad_accum_steps=8  -> effective B=128
   grad_accum_steps: 1
   # torch.compile gives ~20-30 pct throughput on H100. Disable for debugging.
-  compile: false
+  compile: true
   ckpt_dir: ${outputs_root}/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
   save_every: 10
   resume: ""
