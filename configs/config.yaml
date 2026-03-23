@@ -17,7 +17,7 @@ model:
   frames_out: 1
 
 data:
-  dataset_root: ${oc.env:TTT_WM_DATA_ROOT,/ariesdv0/zhaoyang/data}
+  dataset_root: ${oc.env:TTT_WM_DATA_ROOT,/ariesdv0/zhaoyang}
   type: real                           # "synthetic" | "real"
   root: ${data.dataset_root}/libero    # LeRobot v2 dataset root
   image_key: image                     # column name in parquet ("image" or "wrist_image")

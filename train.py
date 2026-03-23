@@ -27,7 +27,7 @@ DDP notes
   micro-steps — avoids (grad_accum_steps-1) wasted all-reduces per step.
 - OneCycleLR total_steps computed per-rank (DistributedSampler already
   divides dataset by world_size), so LR schedule is GPU-count-independent.
-- torch.compile is applied BEFORE DDP wrapping (PyTorch recommendation).
+- torch.compile is applied AFTER DDP wrapping for grad-checkpoint compatibility.
 
 Checkpoint format
 -----------------
@@ -368,11 +368,7 @@ class Trainer:
             n_params = sum(p.numel() for p in raw_model.parameters()) / 1e6
             log.info(f"Arch: {arch_name}  |  Parameters: {n_params:.2f} M")
 
-        # ── torch.compile (BEFORE DDP wrapping — PyTorch recommendation) ─
-        if cfg.train.get("compile", False) and hasattr(torch, "compile"):
-            raw_model = torch.compile(raw_model)
-            if self.is_main:
-                log.info("torch.compile enabled")
+        # compile is applied AFTER DDP — see below
 
         # ── DDP wrapping ────────────────────────────────────────────────
         if self.world_size > 1:
@@ -387,6 +383,18 @@ class Trainer:
         else:
             self.model = raw_model
 
+        # ── torch.compile ───────────────────────────────────────────────
+        # gradient checkpointing uses higher-order ops that are incompatible
+        # with DDPOptimizer's bucket-splitting pass regardless of compile order.
+        # optimize_ddp=False disables that pass; dynamo compiles the full graph
+        # as one unit. Cost: one large all-reduce bucket instead of N small ones
+        # — negligible for 2 GPUs, and compile kernel fusion more than covers it.
+        if cfg.train.get("compile", False) and hasattr(torch, "compile"):
+            torch._dynamo.config.optimize_ddp = False
+            self.model = torch.compile(self.model)
+            if self.is_main:
+                log.info("torch.compile enabled (optimize_ddp=False, grad-ckpt compatible)")
+
         # ── EMA — rank 0 only, on unwrapped module ──────────────────────
         ema_cfg  = cfg.train.ema
         raw      = unwrap_model(self.model)
@@ -399,7 +407,7 @@ class Trainer:
 
         # ── AMP ─────────────────────────────────────────────────────────
         self.use_amp = cfg.train.amp and self.device.type == "cuda"
-        self.scaler  = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.scaler  = torch.amp.GradScaler('cuda', enabled=self.use_amp)
 
         # ── data ─────────────────────────────────────────────────────────
         train_ds, val_ds = build_datasets(cfg.data, cfg.model)
@@ -569,7 +577,7 @@ class Trainer:
                         else self.model.no_sync()
                     )
 
-                    with ddp_sync, torch.cuda.amp.autocast(enabled=self.use_amp):
+                    with ddp_sync, torch.amp.autocast('cuda', enabled=self.use_amp):
                         _, loss = self.model(context, target)
                         scaled_loss = loss / self.grad_accum_steps
 
@@ -619,7 +627,7 @@ class Trainer:
                         accum_step   = 0
                 else:
                     # Validation — no accumulation
-                    with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    with torch.amp.autocast('cuda', enabled=self.use_amp):
                         _, loss = self.model(context, target)
                     if self.is_main:
                         pbar.set_postfix(loss=f"{loss.item():.4f}")
@@ -669,7 +677,7 @@ class Trainer:
         context = torch.stack(ctx_list).to(self.device)
         target  = torch.stack(tgt_list).to(self.device)
 
-        with torch.cuda.amp.autocast(enabled=self.use_amp):
+        with torch.amp.autocast('cuda', enabled=self.use_amp):
             pred_frames, _ = self.model(context, target)
 
         if self.ema is not None:
