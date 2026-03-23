@@ -31,7 +31,7 @@ data:
 
 train:
   epochs: 100
-  batch_size: 16
+  batch_size: 64
   optimizer:
     lr: 1.0e-4
     weight_decay: 1.0e-2
