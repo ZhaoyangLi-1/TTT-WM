@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-
+from flash_attn import flash_attn_func, flash_attn_with_kvcache
 
 @dataclass
 class ARPatchConfig:
@@ -94,16 +94,18 @@ class PatchPositionEmbedding(nn.Module):
 
 class CausalSelfAttention(nn.Module):
     """
-    Multi-head causal self-attention with FlashAttention via SDPA.
+    Multi-head causal self-attention using flash_attn 2.8.
 
-    Uses F.scaled_dot_product_attention which dispatches to FlashAttention-2
-    on H100 / A100 with PyTorch >= 2.1.  No explicit O(B*H*S*S) attention
-    tensor is ever materialised — this alone saves ~50 MB per block at
-    B=32, S=320, on top of what gradient checkpointing saves.
+    flash_attn tensor layout : (B, S, n_heads, head_dim)  ← note: NOT (B, n_heads, S, head_dim)
 
-    Two modes:
-      Prefill (kv_cache=None, L>1) : is_causal=True  → FA-2 fused kernel
-      Decode  (kv_cache given, L=1): is_causal=False → single-query kernel
+    Two call paths:
+      Prefill  (kv_cache=None, L>1) : flash_attn_func        — causal=True
+      Decode   (kv_cache given, L=1): flash_attn_with_kvcache — updates cache in-place
+
+    KV-cache layout change vs SDPA version:
+      SDPA stored  : (B, n_heads, S, head_dim)
+      flash_attn   : (B, S, n_heads, head_dim)
+    The cache stored in generate() is in flash_attn layout throughout.
     """
 
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
@@ -112,7 +114,7 @@ class CausalSelfAttention(nn.Module):
         self.n_heads  = n_heads
         self.head_dim = d_model // n_heads
         self.d_model  = d_model
-        self.dropout  = dropout  # forwarded to SDPA during training only
+        self.dropout  = dropout
 
         self.qkv      = nn.Linear(d_model, 3 * d_model)
         self.out_proj = nn.Linear(d_model, d_model)
@@ -120,29 +122,65 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: torch.Tensor,
                 kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        x        : (B, L, D)
+        kv_cache : None  or  (k_cache, v_cache) each (B, S_prev, n_heads, head_dim)
+        Returns  : (B, L, D), new_cache
+        """
+
         B, L, D = x.shape
+        # Reshape to flash_attn layout: (B, L, 3, n_heads, head_dim)
         qkv = self.qkv(x).reshape(B, L, 3, self.n_heads, self.head_dim)
-        q, k, v = qkv.permute(2, 0, 3, 1, 4)  # (B, n_heads, L, head_dim)
+        q = qkv[:, :, 0]  # (B, L, n_heads, head_dim)
+        k = qkv[:, :, 1]
+        v = qkv[:, :, 2]
 
-        if kv_cache is not None:
-            k = torch.cat([kv_cache[0], k], dim=2)
-            v = torch.cat([kv_cache[1], v], dim=2)
-
-        new_cache = (k, v)
-
-        # Prefill with full sequence → causal mask handled inside FA-2 kernel.
-        # Decode (L==1) → single query always attends to all cached keys, no mask.
-        is_causal    = (L > 1) and (kv_cache is None)
         attn_dropout = self.dropout if self.training else 0.0
 
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask = None,
-            dropout_p = attn_dropout,
-            is_causal = is_causal,
-        )  # (B, n_heads, L, head_dim) — no S×S tensor ever allocated
+        if kv_cache is None:
+            # ── Prefill: process full sequence with causal mask ──────────
+            # flash_attn_func input : (B, S, n_heads, head_dim)
+            # flash_attn_func output: (B, S, n_heads, head_dim)
+            out = flash_attn_func(
+                q, k, v,
+                dropout_p = attn_dropout,
+                causal    = True,
+            )
+            # Store cache in flash_attn layout (B, S, n_heads, head_dim)
+            new_cache = (k, v)
+        else:
+            # ── Decode: single new token, update cache in-place ──────────
+            # flash_attn_with_kvcache expects pre-allocated cache tensors
+            # and appends k/v at the position indicated by cache_seqlens.
+            k_cache, v_cache = kv_cache          # (B, S_prev, n_heads, head_dim)
+            S_prev = k_cache.shape[1]
 
-        out = out.transpose(1, 2).reshape(B, L, D)
+            # Allocate extended cache (old + 1 new token)
+            new_k_cache = torch.cat([k_cache, k], dim=1)  # (B, S_prev+1, n_heads, head_dim)
+            new_v_cache = torch.cat([v_cache, v], dim=1)
+
+            # cache_seqlens: how many valid tokens are already in the cache
+            # after appending, total = S_prev + 1
+            cache_seqlens = torch.full(
+                (B,), S_prev, device=x.device, dtype=torch.int32
+            )
+
+            # flash_attn_with_kvcache: q shape (B, 1, n_heads, head_dim)
+            # k_cache/v_cache shape   (B, S_total, n_heads, head_dim)
+            # k/v (new tokens)        (B, 1, n_heads, head_dim)
+            out = flash_attn_with_kvcache(
+                q,
+                new_k_cache,
+                new_v_cache,
+                k             = k,
+                v             = v,
+                cache_seqlens = cache_seqlens,
+                causal        = False,   # single query, no causal mask needed
+            )
+            new_cache = (new_k_cache, new_v_cache)
+
+        # out: (B, L, n_heads, head_dim) → (B, L, D)
+        out = out.reshape(B, L, D)
         return self.out_proj(out), new_cache
 
 

@@ -299,7 +299,7 @@ def main():
         f"Generating {args.n_steps} AR steps "
         f"(each produces {model_cfg.frames_out} frames) ..."
     )
-    with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+    with torch.amp.autocast('cuda', enabled=(device.type == "cuda")):
         generated = model.generate(context, n_steps=args.n_steps)
 
     total_gen = generated.shape[1]

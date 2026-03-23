@@ -8,9 +8,9 @@ model:
   resolution: 256
   num_channels: 3
   patch_size: 8
-  d_model: 512
-  n_heads: 8
-  n_layers: 8
+  d_model: 768
+  n_heads: 12
+  n_layers: 12
   mlp_ratio: 4.0
   dropout: 0.1
   frames_in: 1
@@ -26,25 +26,26 @@ data:
   n_train: 2000                        # only used when type=synthetic
   n_val: 200
   moving_dot: true
-  num_workers: 4
+  num_workers: 8
   pin_memory: true
 
 train:
   epochs: 100
-  batch_size: 128
+  batch_size: 256
   optimizer:
-    lr: 1.0e-4
+    lr: 1.4e-4
     weight_decay: 1.0e-2
     betas: [0.9, 0.95]
     no_decay_norm: true     # bias & norm params get weight_decay=0
   scheduler:
-    warmup_fraction: 0.05
+    warmup_fraction: 0.10
   ema:
     enabled: true
-    decay: 0.999            # higher = slower update  (0.999 is typical)
+    decay: 0.998            # higher = slower update  (0.999 is typical)
     update_every: 1         # update EMA every N optimizer steps
   grad_clip: 1.0
   amp: true
+  amp_dtype: bf16
   # ── memory / throughput ─────────────────────────────────────────
   # effective_batch = batch_size x grad_accum_steps x n_gpus
   # H100 x 8, batch_size=16, grad_accum_steps=1  -> effective B=128
