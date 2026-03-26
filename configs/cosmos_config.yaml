@@ -26,8 +26,8 @@ data:
   image_key: image                     # column name in parquet ("image" or "wrist_image")
   action_key: actions                  # column name for actions in parquet
   action_dim: 7                        # dimensionality of action vector
-  use_goal: false                        # condition on episode goal frame (last frame)
-  frame_gap: 8                         # m: number of action steps between input and target
+  use_goal: false                      # condition on episode goal frame (last frame)
+  frame_gap: 4                         # m: number of action steps between input and target
   val_split: 0.1                       # unused for real data; train uses all non-heldout tasks and val uses held-out tasks
   test_task_count: 3                   # fallback only when meta/test_tasks.json and test_tasks are both absent
   test_tasks: []                       # optional explicit task names; overrides meta/test_tasks.json when non-empty

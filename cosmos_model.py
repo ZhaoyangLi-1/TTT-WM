@@ -73,6 +73,7 @@ class ARPatchConfig:
 
     # actions
     action_dim: int = 7
+    max_actions: int = 0
 
     @property
     def n_patches(self) -> int:
@@ -85,6 +86,10 @@ class ARPatchConfig:
     @property
     def head_dim(self) -> int:
         return self.d_model // self.n_heads
+
+    @property
+    def max_temporal_positions(self) -> int:
+        return self.frames_in + self.frames_out + self.max_actions + 1
 
 
 # ---------------------------------------------------------------------------
@@ -198,23 +203,36 @@ class RMSNorm(nn.Module):
 # Rotary Position Embedding  (RoPE)
 # ---------------------------------------------------------------------------
 
-def _build_freqs(head_dim: int, max_len: int, base: float = 10000.0,
-                 device: torch.device = None) -> torch.Tensor:
-    half = head_dim // 2
-    inv_freq = 1.0 / (base ** (torch.arange(0, half, device=device).float() / half))
-    t = torch.arange(max_len, device=device).float()
-    freqs = torch.outer(t, inv_freq)
-    return torch.polar(torch.ones_like(freqs), freqs)
+def _build_sin_cos(
+    rotary_dim: int,
+    max_len: int,
+    base: float = 10000.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if rotary_dim % 2 != 0:
+        raise ValueError(f"rotary_dim must be even, got {rotary_dim}")
+    inv_freq = 1.0 / (
+        base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
+    )
+    positions = torch.arange(max_len, dtype=torch.float32)
+    angles = torch.outer(positions, inv_freq).repeat_interleave(2, dim=-1)
+    return angles.cos(), angles.sin()
 
 
-def apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., ::2]
+    x2 = x[..., 1::2]
+    return torch.stack((-x2, x1), dim=-1).flatten(start_dim=-2)
+
+
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """
-    x     : (B, n_heads, L, head_dim)  [FlexAttention layout]
-    freqs : (L, head_dim//2)            complex
+    x   : (B, n_heads, L, rotary_dim)
+    cos : (L, rotary_dim)
+    sin : (L, rotary_dim)
     """
-    xc = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    rotated = xc * freqs[None, None, :, :]
-    return torch.view_as_real(rotated).reshape(x.shape).to(x.dtype)
+    cos = cos.to(dtype=x.dtype)[None, None, :, :]
+    sin = sin.to(dtype=x.dtype)[None, None, :, :]
+    return x * cos + rotate_half(x) * sin
 
 
 class RoPEEmbedding(nn.Module):
@@ -227,23 +245,36 @@ class RoPEEmbedding(nn.Module):
     def __init__(self, cfg: ARPatchConfig):
         super().__init__()
         self.head_dim = cfg.head_dim
-        self.register_buffer("_dummy", torch.zeros(0), persistent=False)
+        if self.head_dim % 4 != 0:
+            raise ValueError(
+                f"head_dim must be divisible by 4 for 2-D RoPE, got {self.head_dim}"
+            )
 
-    def _freqs(self, t_idx: torch.Tensor, s_idx: torch.Tensor,
-               device: torch.device) -> torch.Tensor:
-        hd = self.head_dim
-        max_t = t_idx.max().item() + 1
-        max_s = max(s_idx.max().item() + 1, 1)
-        t_freqs = _build_freqs(hd // 2, max_t, device=device)
-        s_freqs = _build_freqs(hd // 2, max_s, device=device)
-        return torch.cat([t_freqs[t_idx], s_freqs[s_idx]], dim=-1)
+        rotary_dim = self.head_dim // 2
+        temporal_cos, temporal_sin = _build_sin_cos(
+            rotary_dim, cfg.max_temporal_positions
+        )
+        spatial_cos, spatial_sin = _build_sin_cos(rotary_dim, cfg.n_patches)
+        self.register_buffer("temporal_cos", temporal_cos, persistent=False)
+        self.register_buffer("temporal_sin", temporal_sin, persistent=False)
+        self.register_buffer("spatial_cos", spatial_cos, persistent=False)
+        self.register_buffer("spatial_sin", spatial_sin, persistent=False)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor,
                 t_idx: torch.Tensor, s_idx: torch.Tensor,
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
         """q, k : (B, n_heads, L, head_dim)"""
-        freqs = self._freqs(t_idx, s_idx, q.device)
-        return apply_rope(q, freqs), apply_rope(k, freqs)
+        q_t, q_s = q.chunk(2, dim=-1)
+        k_t, k_s = k.chunk(2, dim=-1)
+
+        t_cos = self.temporal_cos.index_select(0, t_idx)
+        t_sin = self.temporal_sin.index_select(0, t_idx)
+        s_cos = self.spatial_cos.index_select(0, s_idx)
+        s_sin = self.spatial_sin.index_select(0, s_idx)
+
+        q = torch.cat([apply_rope(q_t, t_cos, t_sin), apply_rope(q_s, s_cos, s_sin)], dim=-1)
+        k = torch.cat([apply_rope(k_t, t_cos, t_sin), apply_rope(k_s, s_cos, s_sin)], dim=-1)
+        return q, k
 
 
 # ---------------------------------------------------------------------------
@@ -659,7 +690,7 @@ if __name__ == "__main__":
         resolution=64, num_channels=3, patch_size=8,
         d_model=512, n_heads=8, n_layers=8,
         frames_in=4, frames_out=4,
-        action_dim=7,
+        action_dim=7, max_actions=6,
         qk_norm=True, parallel_attn=False,
     )
 

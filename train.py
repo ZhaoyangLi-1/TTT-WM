@@ -612,6 +612,7 @@ class Trainer:
         if use_cosmos:
             config_kwargs["qk_norm"] = mcfg.get("qk_norm", True)
             config_kwargs["parallel_attn"] = mcfg.get("parallel_attn", False)
+            config_kwargs["max_actions"] = int(cfg.data.get("frame_gap", 0))
             self.model_cfg = _CosmosConfig(**config_kwargs)
             raw_model = _CosmosModel(self.model_cfg).to(self.device)
             arch_name = "Cosmos"
