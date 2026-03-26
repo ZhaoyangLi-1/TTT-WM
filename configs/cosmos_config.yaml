@@ -60,7 +60,7 @@ train:
   ckpt_dir: ${outputs_root}/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
   save_every: 10
   resume: ""
-  log_every: 50
+  test_every: 20
   device: "auto"           # auto → cuda > mps > cpu
 
 wandb:

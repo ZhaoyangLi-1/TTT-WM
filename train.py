@@ -863,7 +863,6 @@ class Trainer:
         self.model.train(train)
         total_loss, n_opt_steps = 0.0, 0
         ema_cfg = self.cfg.train.ema
-        log_every = self.cfg.train.log_every
 
         pbar = tqdm(
             loader,
@@ -938,12 +937,6 @@ class Trainer:
                                     step=self.global_step,
                                 )
                             pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
-
-                            if self.global_step % log_every == 0:
-                                log.info(
-                                    f"step {self.global_step:06d} | "
-                                    f"loss {avg_loss:.6f} | lr {lr:.2e}"
-                                )
 
                         accum_loss = 0.0
                         accum_step = 0
@@ -1085,7 +1078,13 @@ class Trainer:
             train_loss = self._run_epoch(self.train_loader, train=True)
             val_loss = self._val_loss()
             val_loss_raw = self._run_epoch(self.val_loader, train=False)
-            test_loss = self._test_loss()
+            test_every = int(tcfg.get("test_every", 1))
+            run_test = (
+                self.test_loader is not None
+                and test_every > 0
+                and (epoch + 1) % test_every == 0
+            )
+            test_loss = self._test_loss() if run_test else None
 
             elapsed = time.time() - t0
 
