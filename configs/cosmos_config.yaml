@@ -1,4 +1,4 @@
-experiment_name: causal_ar_video
+experiment_name: causal_ar_video_no_goal
 seed: 42
 
 outputs_root: ${oc.env:TTT_WM_OUTPUTS_ROOT,/ariesdv0/zhaoyang/data}
