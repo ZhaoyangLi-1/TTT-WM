@@ -1035,7 +1035,8 @@ class Trainer:
             [T, H, W, C]
         """
         x = (frames.float().clamp(-1, 1) * 0.5 + 0.5) * 255.0
-        return x.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
+        arr = x.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
+        return arr[:, ::-1]  # vertical flip: LIBERO images use OpenGL y-up convention
 
     @torch.no_grad()
     def _log_val_videos(self, n_samples: int = 4):
