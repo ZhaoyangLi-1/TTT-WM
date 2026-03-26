@@ -4,12 +4,12 @@ seed: 42
 outputs_root: ${oc.env:TTT_WM_OUTPUTS_ROOT,/ariesdv0/zhaoyang/data}
 
 model:
-  arch: emu3               # "emu3" (fully causal) or "cosmos" (block-causal)
+  arch: cosmos             # "emu3" (fully causal) or "cosmos" (block-causal)
   resolution: 256
   num_channels: 3
   patch_size: 8            # 8×8 patches → 256 patches/frame
 
-  # Emu3-style causal transformer (fully causal, no block-causal leakage)
+  # Cosmos-style causal transformer
   d_model: 512
   n_heads: 8
   n_layers: 8
