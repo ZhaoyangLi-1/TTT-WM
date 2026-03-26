@@ -1,4 +1,4 @@
-experiment_name: cosmos_stage${train.stage}
+experiment_name: cosmos_stage${train.stage}_no_goal
 seed: 42
 
 outputs_root: ${oc.env:TTT_WM_OUTPUTS_ROOT,/ariesdv0/zhaoyang/data}
