@@ -296,8 +296,8 @@ class VideoFrameDataset(Dataset):
         goal       : (C, H, W)              last frame of the episode (target condition)
 
     Splits:
-        - train / val: in-domain episodes, split at the episode level
-        - test       : held-out tasks, excluded from train / val entirely
+        - train      : all episodes whose task is not held out
+        - val / test : held-out tasks only
     """
 
     def __init__(self, data_cfg: DictConfig, model_cfg: DictConfig, split: str):
@@ -360,7 +360,16 @@ class VideoFrameDataset(Dataset):
                     seen_tasks.add(task_name)
                     task_names.append(task_name)
 
+        test_tasks_meta_path = root / "meta" / "test_tasks.json"
         configured_test_tasks = list(data_cfg.get("test_tasks", []))
+        if not configured_test_tasks and test_tasks_meta_path.exists():
+            with open(test_tasks_meta_path) as f:
+                stored_test_tasks = json.load(f)
+            if isinstance(stored_test_tasks, dict):
+                configured_test_tasks = list(stored_test_tasks.get("tasks", []))
+            else:
+                configured_test_tasks = list(stored_test_tasks)
+
         test_task_count = int(data_cfg.get("test_task_count", 0))
         if configured_test_tasks:
             unknown_tasks = sorted(set(configured_test_tasks) - set(task_names))
@@ -388,19 +397,7 @@ class VideoFrameDataset(Dataset):
         ep_lengths = {rec["episode_index"]: rec["length"] for rec in episode_meta}
         ep_tasks = {rec["episode_index"]: rec["task"] for rec in episode_meta}
 
-        if split == "test":
-            ep_indices = test_eps
-        else:
-            n_train_val = len(in_domain_eps)
-            if n_train_val <= 1:
-                n_val = 0
-            else:
-                n_val = max(1, int(n_train_val * data_cfg.val_split))
-                n_val = min(n_val, n_train_val - 1)
-
-            val_eps = in_domain_eps[:n_val]
-            train_eps = in_domain_eps[n_val:]
-            ep_indices = train_eps if split == "train" else val_eps
+        ep_indices = in_domain_eps if split == "train" else test_eps
 
         self.samples = []
         # span = fin + gap + fout - 1  (consecutive frames, no stride)
@@ -512,7 +509,13 @@ class SyntheticVideoDataset(Dataset):
 
 
 def build_datasets(data_cfg: DictConfig, model_cfg: DictConfig):
-    """Build train / validation / test datasets from config."""
+    """Build train / validation datasets from config.
+
+    For real data:
+        - train uses all non-heldout tasks
+        - val uses held-out tasks
+        - test is unused because val already serves as the held-out set
+    """
     cls = {
         "real": VideoFrameDataset,
         "synthetic": SyntheticVideoDataset,
@@ -523,7 +526,7 @@ def build_datasets(data_cfg: DictConfig, model_cfg: DictConfig):
     dataset_cls = cls[data_cfg.type]
     train_ds = dataset_cls(data_cfg, model_cfg, "train")
     val_ds = dataset_cls(data_cfg, model_cfg, "val")
-    test_ds = dataset_cls(data_cfg, model_cfg, "test") if data_cfg.type == "real" else None
+    test_ds = None
     return train_ds, val_ds, test_ds
 
 
