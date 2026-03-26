@@ -605,6 +605,14 @@ class Trainer:
             self.model_cfg = _CosmosConfig(**config_kwargs)
             raw_model = _CosmosModel(self.model_cfg).to(self.device)
             arch_name = "Cosmos"
+            # FlexAttention mask construction does not compile reliably under
+            # torch.compile / Dynamo, so build the exact training-time masks
+            # once up front and serve them from the model cache afterwards.
+            raw_model.prebuild_mask(
+                device=self.device,
+                n_actions=int(cfg.data.get("frame_gap", 0)),
+                has_goal=bool(cfg.data.get("use_goal", True)),
+            )
         else:
             self.model_cfg = _EmuConfig(**config_kwargs)
             raw_model = _EmuModel(self.model_cfg).to(self.device)
