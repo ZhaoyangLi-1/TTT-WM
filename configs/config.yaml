@@ -1,4 +1,4 @@
-experiment_name: ar_video
+experiment_name: ar_video_no_goal
 seed: 42
 
 outputs_root: ${oc.env:TTT_WM_OUTPUTS_ROOT,/ariesdv0/zhaoyang/data}
@@ -32,7 +32,7 @@ data:
   moving_dot: true
   num_workers: 8
   pin_memory: true
-  use_goal: true                        # condition on episode goal frame (last frame)
+  use_goal: false                        # condition on episode goal frame (last frame)
   frame_gap: 6                         # m: number of action steps between input and target
 
 train:
