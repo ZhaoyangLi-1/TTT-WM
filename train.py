@@ -295,11 +295,15 @@ class VideoFrameDataset(Dataset):
         actions    : (gap, action_dim)       actions between last input and first target
         goal       : (C, H, W)              last frame of the episode (target condition)
 
-    Train / val split is done at the **episode** level (no episode appears
-    in both splits) to prevent data leakage.
+    Splits:
+        - train / val: in-domain episodes, split at the episode level
+        - test       : held-out tasks, excluded from train / val entirely
     """
 
     def __init__(self, data_cfg: DictConfig, model_cfg: DictConfig, split: str):
+        if split not in {"train", "val", "test"}:
+            raise ValueError(f"Unknown split: {split!r}")
+
         self.fin        = model_cfg.frames_in
         self.fout       = model_cfg.frames_out
         self.gap        = int(data_cfg.frame_gap)
@@ -320,21 +324,83 @@ class VideoFrameDataset(Dataset):
         total_episodes = info["total_episodes"]
         chunks_size = info["chunks_size"]
 
+        task_names = []
+        tasks_path = root / "meta" / "tasks.jsonl"
+        if tasks_path.exists():
+            with open(tasks_path) as f:
+                for line in f:
+                    rec = json.loads(line)
+                    if "task" in rec:
+                        task_names.append(rec["task"])
+
         episode_files = [
             root / "data" / f"chunk-{ep_idx // chunks_size:03d}" / f"episode_{ep_idx:06d}.parquet"
             for ep_idx in range(total_episodes)
         ]
 
-        ep_lengths = {}
+        episode_meta = []
         with open(root / "meta" / "episodes.jsonl") as f:
             for line in f:
                 rec = json.loads(line)
-                ep_lengths[rec["episode_index"]] = rec["length"]
+                tasks = rec.get("tasks", [])
+                episode_meta.append(
+                    {
+                        "episode_index": int(rec["episode_index"]),
+                        "length": int(rec["length"]),
+                        "task": tasks[0] if tasks else None,
+                    }
+                )
 
-        # Episode-level split: val gets first n_val episodes, train gets the rest.
-        # No episode appears in both splits → no data leakage.
-        n_val = max(1, int(total_episodes * data_cfg.val_split))
-        ep_indices = list(range(n_val, total_episodes)) if split == "train" else list(range(n_val))
+        if not task_names:
+            task_names = []
+            seen_tasks = set()
+            for rec in episode_meta:
+                task_name = rec["task"]
+                if task_name and task_name not in seen_tasks:
+                    seen_tasks.add(task_name)
+                    task_names.append(task_name)
+
+        configured_test_tasks = list(data_cfg.get("test_tasks", []))
+        test_task_count = int(data_cfg.get("test_task_count", 0))
+        if configured_test_tasks:
+            unknown_tasks = sorted(set(configured_test_tasks) - set(task_names))
+            if unknown_tasks:
+                raise ValueError(
+                    "Configured data.test_tasks are missing from the dataset: "
+                    + ", ".join(unknown_tasks)
+                )
+            selected_test_tasks = configured_test_tasks
+        elif test_task_count > 0:
+            if test_task_count >= len(task_names):
+                raise ValueError(
+                    f"data.test_task_count={test_task_count} must be smaller than the "
+                    f"number of tasks in the dataset ({len(task_names)})."
+                )
+            selected_test_tasks = task_names[:test_task_count]
+        else:
+            selected_test_tasks = []
+
+        self.test_tasks = tuple(selected_test_tasks)
+        test_task_set = set(self.test_tasks)
+
+        in_domain_eps = [rec["episode_index"] for rec in episode_meta if rec["task"] not in test_task_set]
+        test_eps = [rec["episode_index"] for rec in episode_meta if rec["task"] in test_task_set]
+        ep_lengths = {rec["episode_index"]: rec["length"] for rec in episode_meta}
+        ep_tasks = {rec["episode_index"]: rec["task"] for rec in episode_meta}
+
+        if split == "test":
+            ep_indices = test_eps
+        else:
+            n_train_val = len(in_domain_eps)
+            if n_train_val <= 1:
+                n_val = 0
+            else:
+                n_val = max(1, int(n_train_val * data_cfg.val_split))
+                n_val = min(n_val, n_train_val - 1)
+
+            val_eps = in_domain_eps[:n_val]
+            train_eps = in_domain_eps[n_val:]
+            ep_indices = train_eps if split == "train" else val_eps
 
         self.samples = []
         # span = fin + gap + fout - 1  (consecutive frames, no stride)
@@ -350,7 +416,16 @@ class VideoFrameDataset(Dataset):
             for start in range(length - span + 1):
                 self.samples.append((ep_path_str, start, length))
 
-        log.info(f"[{split}] {len(self.samples)} windows / {len(ep_indices)} episodes")
+        split_tasks = sorted({ep_tasks[ep_idx] for ep_idx in ep_indices if ep_tasks[ep_idx] is not None})
+        if self.test_tasks and split == "train":
+            log.info(
+                f"Held-out test tasks ({len(self.test_tasks)}): "
+                + "; ".join(self.test_tasks)
+            )
+        log.info(
+            f"[{split}] {len(self.samples)} windows / {len(ep_indices)} episodes / "
+            f"{len(split_tasks)} tasks"
+        )
 
         self._read_parquet = functools.lru_cache(maxsize=32)(
             lambda path: pd.read_parquet(path, columns=[self.image_key, self.action_key])
@@ -381,7 +456,10 @@ class VideoFrameDataset(Dataset):
         # --- Actions between last input frame and first target frame (m = gap) ---
         act_start = start + self._action_offset
         actions = torch.stack([
-            torch.as_tensor(df.iloc[act_start + i][self.action_key], dtype=torch.float32)
+            torch.tensor(
+                np.array(df.iloc[act_start + i][self.action_key], copy=True),
+                dtype=torch.float32,
+            )
             for i in range(self.gap)
         ])  # (gap, action_dim)
 
@@ -434,7 +512,7 @@ class SyntheticVideoDataset(Dataset):
 
 
 def build_datasets(data_cfg: DictConfig, model_cfg: DictConfig):
-    """Build train and validation datasets from config."""
+    """Build train / validation / test datasets from config."""
     cls = {
         "real": VideoFrameDataset,
         "synthetic": SyntheticVideoDataset,
@@ -443,7 +521,10 @@ def build_datasets(data_cfg: DictConfig, model_cfg: DictConfig):
         raise ValueError(f"Unknown data.type: {data_cfg.type!r}")
 
     dataset_cls = cls[data_cfg.type]
-    return dataset_cls(data_cfg, model_cfg, "train"), dataset_cls(data_cfg, model_cfg, "val")
+    train_ds = dataset_cls(data_cfg, model_cfg, "train")
+    val_ds = dataset_cls(data_cfg, model_cfg, "val")
+    test_ds = dataset_cls(data_cfg, model_cfg, "test") if data_cfg.type == "real" else None
+    return train_ds, val_ds, test_ds
 
 
 # ---------------------------------------------------------------------------
@@ -578,7 +659,8 @@ class Trainer:
         # Data
         # -------------------------------------------------------------------
         self.use_goal = cfg.data.get("use_goal", True)
-        train_ds, val_ds = build_datasets(cfg.data, cfg.model)
+        train_ds, val_ds, test_ds = build_datasets(cfg.data, cfg.model)
+        self.test_task_names = list(getattr(train_ds, "test_tasks", ()))
         n_workers = cfg.data.num_workers
 
         loader_kw = dict(
@@ -601,6 +683,14 @@ class Trainer:
                 rank=self.rank,
                 shuffle=False,
             )
+            test_sampler = None
+            if test_ds is not None and len(test_ds) > 0:
+                test_sampler = DistributedSampler(
+                    test_ds,
+                    num_replicas=self.world_size,
+                    rank=self.rank,
+                    shuffle=False,
+                )
 
             self.train_loader = DataLoader(
                 train_ds,
@@ -614,6 +704,16 @@ class Trainer:
                 batch_size=cfg.train.batch_size * 2,
                 sampler=val_sampler,
                 **loader_kw,
+            )
+            self.test_loader = (
+                DataLoader(
+                    test_ds,
+                    batch_size=cfg.train.batch_size * 2,
+                    sampler=test_sampler,
+                    **loader_kw,
+                )
+                if test_sampler is not None
+                else None
             )
             self._train_sampler = train_sampler
         else:
@@ -630,7 +730,23 @@ class Trainer:
                 shuffle=False,
                 **loader_kw,
             )
+            self.test_loader = (
+                DataLoader(
+                    test_ds,
+                    batch_size=cfg.train.batch_size * 2,
+                    shuffle=False,
+                    **loader_kw,
+                )
+                if test_ds is not None and len(test_ds) > 0
+                else None
+            )
             self._train_sampler = None
+
+        if self.is_main and self.test_task_names:
+            log.info(
+                f"Task-heldout test split enabled ({len(self.test_task_names)} tasks): "
+                + "; ".join(self.test_task_names)
+            )
 
         # -------------------------------------------------------------------
         # Scheduler
@@ -853,11 +969,21 @@ class Trainer:
 
     def _val_loss(self) -> float:
         """Evaluate validation loss using EMA weights when EMA is enabled."""
+        return self._eval_loader_loss(self.val_loader)
+
+    def _test_loss(self) -> float | None:
+        """Evaluate held-out test loss using EMA weights when EMA is enabled."""
+        if self.test_loader is None:
+            return None
+        return self._eval_loader_loss(self.test_loader)
+
+    def _eval_loader_loss(self, loader: DataLoader) -> float:
+        """Evaluate a loader using EMA weights when EMA is enabled."""
         raw = unwrap_model(self.model)
         if self.ema is not None:
             self.ema.apply(raw)
 
-        loss = self._run_epoch(self.val_loader, train=False)
+        loss = self._run_epoch(loader, train=False)
 
         if self.ema is not None:
             self.ema.restore(raw)
@@ -959,30 +1085,40 @@ class Trainer:
             train_loss = self._run_epoch(self.train_loader, train=True)
             val_loss = self._val_loss()
             val_loss_raw = self._run_epoch(self.val_loader, train=False)
+            test_loss = self._test_loss()
 
             elapsed = time.time() - t0
 
             if self.is_main:
                 ema_tag = " [EMA]" if self.ema is not None else ""
-                log.info(
+                summary = (
                     f"epoch {epoch:04d} | "
                     f"train {train_loss:.6f} | "
                     f"val{ema_tag} {val_loss:.6f} | "
                     f"val[raw] {val_loss_raw:.6f} | "
-                    f"{elapsed:.1f}s"
                 )
+                if test_loss is not None:
+                    summary += f"test{ema_tag} {test_loss:.6f} | "
+                summary += f"{elapsed:.1f}s"
+                log.info(summary)
+
+                metrics = {
+                    "epoch": epoch,
+                    "epoch/train_loss": train_loss,
+                    "epoch/val_loss": val_loss,
+                    "epoch/val_loss_raw": val_loss_raw,
+                    "epoch/lr": self.scheduler.get_last_lr()[0],
+                }
+                if test_loss is not None:
+                    metrics["epoch/test_loss"] = test_loss
 
                 if self.use_wandb:
                     wandb.log(
-                        {
-                            "epoch": epoch,
-                            "epoch/train_loss": train_loss,
-                            "epoch/val_loss": val_loss,
-                            "epoch/val_loss_raw": val_loss_raw,
-                            "epoch/lr": self.scheduler.get_last_lr()[0],
-                        },
+                        metrics,
                         step=self.global_step,
                     )
+                    if self.test_task_names:
+                        wandb.run.summary["test_tasks"] = list(self.test_task_names)
 
                 self._log_val_videos(n_samples=4)
                 self._save_checkpoint(epoch, val_loss, tag="last")
