@@ -72,7 +72,11 @@ from torchvision import transforms
 from tqdm import tqdm
 
 from model import ARPatchConfig as _EmuConfig, ARVideoPatchTransformer as _EmuModel
-from cosmos_model import ARPatchConfig as _CosmosConfig, ARVideoPatchTransformer as _CosmosModel
+from cosmos_model import (
+    ARPatchConfig as _CosmosConfig,
+    ARVideoPatchTransformer as _CosmosModel,
+    InverseDynamicsModel as _CosmosIDM,
+)
 
 log = logging.getLogger(__name__)
 
@@ -594,6 +598,8 @@ class Trainer:
         # -------------------------------------------------------------------
         mcfg = cfg.model
         use_cosmos = mcfg.get("arch", "emu3") == "cosmos"
+        self.stage = int(cfg.train.get("stage", 1))
+        has_goal = bool(cfg.data.get("use_goal", True))
 
         config_kwargs = dict(
             resolution=mcfg.resolution,
@@ -612,18 +618,29 @@ class Trainer:
         if use_cosmos:
             config_kwargs["qk_norm"] = mcfg.get("qk_norm", True)
             config_kwargs["parallel_attn"] = mcfg.get("parallel_attn", False)
-            config_kwargs["max_actions"] = int(cfg.data.get("frame_gap", 0))
             self.model_cfg = _CosmosConfig(**config_kwargs)
             raw_model = _CosmosModel(self.model_cfg).to(self.device)
             arch_name = "Cosmos"
-            # FlexAttention mask construction does not compile reliably under
-            # torch.compile / Dynamo, so build the exact training-time masks
-            # once up front and serve them from the model cache afterwards.
-            raw_model.prebuild_mask(
-                device=self.device,
-                n_actions=int(cfg.data.get("frame_gap", 0)),
-                has_goal=bool(cfg.data.get("use_goal", True)),
-            )
+
+            if self.stage == 2:
+                # Load Stage 1 pretrained weights into the backbone
+                stage1_ckpt = str(cfg.train.get("stage1_ckpt", ""))
+                if stage1_ckpt:
+                    self._load_stage1_weights(raw_model, stage1_ckpt)
+
+                n_actions = int(cfg.data.get("frame_gap", 0))
+                freeze = bool(cfg.train.get("freeze_backbone", True))
+                raw_model = _CosmosIDM(
+                    raw_model, n_actions=n_actions, freeze_backbone=freeze,
+                ).to(self.device)
+                raw_model.prebuild_mask(device=self.device, has_goal=has_goal)
+                arch_name = "Cosmos-IDM"
+            else:
+                # Stage 1: video prediction only
+                raw_model.prebuild_mask(
+                    device=self.device,
+                    has_goal=has_goal,
+                )
         else:
             self.model_cfg = _EmuConfig(**config_kwargs)
             raw_model = _EmuModel(self.model_cfg).to(self.device)
@@ -631,7 +648,11 @@ class Trainer:
 
         if self.is_main:
             n_params = sum(p.numel() for p in raw_model.parameters()) / 1e6
-            log.info(f"Arch: {arch_name} | Parameters: {n_params:.2f} M")
+            n_trainable = sum(p.numel() for p in raw_model.parameters() if p.requires_grad) / 1e6
+            log.info(
+                f"Arch: {arch_name} | Stage: {self.stage} | "
+                f"Parameters: {n_params:.2f}M | Trainable: {n_trainable:.2f}M"
+            )
 
         # -------------------------------------------------------------------
         # DDP wrapping
@@ -669,7 +690,20 @@ class Trainer:
         # -------------------------------------------------------------------
         # Optimizer
         # -------------------------------------------------------------------
-        self.optimizer = build_optimizer(unwrap_model(self.model), cfg.train.optimizer)
+        if self.stage == 2 and bool(cfg.train.get("freeze_backbone", True)):
+            # Only optimize the trainable IDM action head
+            trainable = [p for p in unwrap_model(self.model).parameters() if p.requires_grad]
+            self.optimizer = torch.optim.AdamW(
+                trainable,
+                lr=cfg.train.optimizer.lr,
+                weight_decay=cfg.train.optimizer.weight_decay,
+                betas=tuple(cfg.train.optimizer.betas),
+            )
+            if self.is_main:
+                n_t = sum(p.numel() for p in trainable) / 1e6
+                log.info(f"Stage 2 optimizer: {n_t:.2f}M trainable params (backbone frozen)")
+        else:
+            self.optimizer = build_optimizer(unwrap_model(self.model), cfg.train.optimizer)
 
         # -------------------------------------------------------------------
         # AMP
@@ -876,6 +910,21 @@ class Trainer:
         if self.is_main:
             log.info(f"Resumed from {path} | start_epoch={self.start_epoch}")
 
+    def _load_stage1_weights(self, model, path: str):
+        """Load Stage 1 checkpoint into an ARVideoPatchTransformer (before IDM wrapping)."""
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+
+        def _strip(sd, prefix):
+            if any(k.startswith(prefix) for k in sd):
+                return {k.removeprefix(prefix): v for k, v in sd.items()}
+            return sd
+
+        model_sd = _strip(_strip(ckpt["model"], "_orig_mod."), "module.")
+        model.load_state_dict(model_sd)
+
+        if self.is_main:
+            log.info(f"Loaded Stage 1 weights from {path}")
+
     # -----------------------------------------------------------------------
     # Epoch loop
     # -----------------------------------------------------------------------
@@ -931,7 +980,10 @@ class Trainer:
                         enabled=self.use_amp,
                         dtype=self.amp_dtype,
                     ):
-                        _, _, loss = self.model(context, target, actions, goal)
+                        if self.stage == 1:
+                            _, loss = self.model(context, target, goal)
+                        else:
+                            _, _, loss = self.model(context, target, actions, goal)
                         scaled_loss = loss / self.grad_accum_steps
 
                     self.scaler.scale(scaled_loss).backward()
@@ -981,7 +1033,10 @@ class Trainer:
                         enabled=self.use_amp,
                         dtype=self.amp_dtype,
                     ):
-                        _, _, loss = self.model(context, target, actions, goal)
+                        if self.stage == 1:
+                            _, loss = self.model(context, target, goal)
+                        else:
+                            _, _, loss = self.model(context, target, actions, goal)
 
                     if self.is_main:
                         pbar.set_postfix(loss=f"{loss.item():.4f}")
@@ -1064,7 +1119,10 @@ class Trainer:
             enabled=self.use_amp,
             dtype=self.amp_dtype,
         ):
-            pred_frames, _, _ = self.model(context, target, actions, goals)
+            if self.stage == 1:
+                pred_frames, _ = self.model(context, target, goals)
+            else:
+                pred_frames, _, _ = self.model(context, target, actions, goals)
 
         if self.ema is not None:
             self.ema.restore(raw)

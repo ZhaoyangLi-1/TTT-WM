@@ -1,4 +1,4 @@
-experiment_name: causal_ar_video_no_goal
+experiment_name: cosmos_stage${train.stage}
 seed: 42
 
 outputs_root: ${oc.env:TTT_WM_OUTPUTS_ROOT,/ariesdv0/zhaoyang/data}
@@ -60,6 +60,9 @@ train:
   amp_dtype: bf16
   ckpt_dir: ${outputs_root}/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
   save_every: 10
+  stage: 1                # 1 = video prediction, 2 = inverse dynamics
+  stage1_ckpt: ""          # path to Stage 1 checkpoint (required for stage 2)
+  freeze_backbone: true    # freeze Stage 1 backbone in stage 2
   resume: ""
   test_every: 20
   device: "auto"           # auto → cuda > mps > cpu

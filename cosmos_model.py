@@ -1,40 +1,39 @@
 """
-Cosmos-style AR Video Patch Transformer  (FlexAttention + Actions + Goal)
-==========================================================================
-Predicts both **target frames** and **intermediate actions** via teacher forcing.
+Cosmos-style AR Video Patch Transformer  (FlexAttention + Goal)
+================================================================
 
-Sequence layout (training)
----------------------------
-    [goal_patches | ctx_patches | action_tokens | tgt_patches]
-     N_p tokens    fin×N_p       m tokens        fout×N_p
+Stage 1 — Video prediction via teacher forcing (no actions).
+Stage 2 — Inverse dynamics model (InverseDynamicsModel) predicts actions
+           from (input_frames, Stage-1-predicted frames).
 
-    goal  = last frame of the episode (target condition)
+Sequence layout (training, Stage 1)
+-------------------------------------
+    [goal_patches | ctx_patches | tgt_patches]
+     N_p tokens    fin×N_p       fout×N_p
+
+    goal  = last frame of the episode (optional target condition)
     ctx   = frames_in context frames
-    actions = m action vectors between last ctx frame and first target frame
     tgt   = frames_out target frames
 
 Attention mask  (FlexAttention BlockMask)
 ------------------------------------------
     Block-causal: bidirectional within each "block", causal across blocks.
     Blocks:
-        block 0           : goal frame        (N_p tokens)
+        block 0           : goal frame        (N_p tokens)  — optional
         blocks 1..fin     : context frames    (N_p tokens each)
-        blocks fin+1..fin+m : action tokens   (1 token each)
-        blocks fin+m+1..  : target frames     (N_p tokens each)
-
-Prediction heads
------------------
-    action_head : d_model → action_dim   (predict actions)
-    head        : d_model → patch_dim    (predict frame patches)
+        blocks fin+1..    : target frames     (N_p tokens each)
 
 Interface
 ----------
-    Training:   pred_frames, pred_actions, loss = model(ctx, tgt, actions, goal)
-    Generation: gen_frames, gen_actions = model.generate(ctx, goal, n_actions)
+    Stage 1 training:   pred_frames, loss = model(ctx, tgt, goal)
+    Stage 1 inference:  pred_frames       = model(ctx, goal=goal)
+    Stage 2 training:   pred_frames, pred_actions, loss = idm(ctx, tgt, actions, goal)
+    Stage 2 inference:  pred_frames, pred_actions       = idm.generate(ctx, goal)
 """
 
 from __future__ import annotations
 from dataclasses import dataclass
+from contextlib import nullcontext
 from typing import Optional, Tuple
 
 import torch
@@ -71,9 +70,8 @@ class ARPatchConfig:
     frames_in:  int = 4
     frames_out: int = 4
 
-    # actions
+    # actions (used only by InverseDynamicsModel)
     action_dim: int = 7
-    max_actions: int = 0
 
     @property
     def n_patches(self) -> int:
@@ -89,7 +87,7 @@ class ARPatchConfig:
 
     @property
     def max_temporal_positions(self) -> int:
-        return self.frames_in + self.frames_out + self.max_actions + 1
+        return self.frames_in + self.frames_out + 1
 
 
 # ---------------------------------------------------------------------------
@@ -377,17 +375,12 @@ class ARVideoPatchTransformer(nn.Module):
         self.patch_embed = nn.Linear(cfg.patch_dim, cfg.d_model, bias=False)
         self.embed_norm  = RMSNorm(cfg.d_model)
 
-        # Action embeddings
-        self.action_embed = nn.Linear(cfg.action_dim, cfg.d_model, bias=False)
-        self.action_norm  = RMSNorm(cfg.d_model)
-
         # Transformer
         self.blocks   = nn.ModuleList([CosmosBlock(cfg) for _ in range(cfg.n_layers)])
         self.out_norm = RMSNorm(cfg.d_model)
 
-        # Output heads
-        self.head        = nn.Linear(cfg.d_model, cfg.patch_dim, bias=False)   # frames
-        self.action_head = nn.Linear(cfg.d_model, cfg.action_dim, bias=False)  # actions
+        # Output head (frame prediction)
+        self.head = nn.Linear(cfg.d_model, cfg.patch_dim, bias=False)
 
         # Mask cache
         self._mask_cache: dict = {}
@@ -416,10 +409,10 @@ class ARVideoPatchTransformer(nn.Module):
     # ------------------------------------------------------------------
 
     def _build_position_indices(
-        self, n_ctx: int, n_actions: int, n_tgt_frames: int,
+        self, n_ctx: int, n_tgt_frames: int,
         device: torch.device, has_goal: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Build (t_idx, s_idx) for [(goal) | ctx | actions | tgt]."""
+        """Build (t_idx, s_idx) for [(goal) | ctx | tgt]."""
         N_p = self.cfg.n_patches
         t_list, s_list = [], []
         t_off = 0
@@ -435,15 +428,8 @@ class ARVideoPatchTransformer(nn.Module):
             t_list.append(torch.full((N_p,), t_off + i, dtype=torch.long, device=device))
             s_list.append(torch.arange(N_p, dtype=torch.long, device=device))
 
-        # Actions: s=0
-        act_t = t_off + n_ctx
-        if n_actions > 0:
-            t_list.append(torch.arange(act_t, act_t + n_actions,
-                                       dtype=torch.long, device=device))
-            s_list.append(torch.zeros(n_actions, dtype=torch.long, device=device))
-
         # Target frames
-        tgt_t = act_t + n_actions
+        tgt_t = t_off + n_ctx
         for k in range(n_tgt_frames):
             t_list.append(torch.full((N_p,), tgt_t + k, dtype=torch.long, device=device))
             s_list.append(torch.arange(N_p, dtype=torch.long, device=device))
@@ -454,26 +440,25 @@ class ARVideoPatchTransformer(nn.Module):
     # Mask management
     # ------------------------------------------------------------------
 
-    def _ensure_mask(self, n_ctx: int, n_actions: int, n_tgt: int,
+    def _ensure_mask(self, n_ctx: int, n_tgt: int,
                      device: torch.device, has_goal: bool = True) -> BlockMask:
-        key = (n_ctx, n_actions, n_tgt, device, has_goal)
+        key = (n_ctx, n_tgt, device, has_goal)
         if key not in self._mask_cache:
             N_p = self.cfg.n_patches
-            if n_actions == 0 and n_tgt == 0:
-                # Frames only ((goal +) ctx)
+            if n_tgt == 0:
                 T = (1 + n_ctx) if has_goal else n_ctx
                 self._mask_cache[key] = make_frames_only_mask(N_p, T, device)
             else:
                 self._mask_cache[key] = make_sequence_mask(
-                    N_p, n_ctx, n_actions, n_tgt, device, has_goal=has_goal,
+                    N_p, n_ctx, 0, n_tgt, device, has_goal=has_goal,
                 )
         return self._mask_cache[key]
 
-    def prebuild_mask(self, device: torch.device, n_actions: int = 0,
+    def prebuild_mask(self, device: torch.device,
                       has_goal: bool = True) -> None:
         cfg = self.cfg
-        self._ensure_mask(cfg.frames_in, n_actions, cfg.frames_out, device, has_goal)
-        self._ensure_mask(cfg.frames_in, 0, 0, device, has_goal)
+        self._ensure_mask(cfg.frames_in, cfg.frames_out, device, has_goal)
+        self._ensure_mask(cfg.frames_in, 0, device, has_goal)
 
     # ------------------------------------------------------------------
     # Core helpers
@@ -482,9 +467,6 @@ class ARVideoPatchTransformer(nn.Module):
     def _embed_frames(self, frames: torch.Tensor) -> torch.Tensor:
         patches = patchify(frames, self.cfg.patch_size)
         return self.embed_norm(self.patch_embed(patches))
-
-    def _embed_actions(self, actions: torch.Tensor) -> torch.Tensor:
-        return self.action_norm(self.action_embed(actions))
 
     def _run_transformer(self, tokens: torch.Tensor,
                          t_idx: torch.Tensor, s_idx: torch.Tensor,
@@ -505,34 +487,29 @@ class ARVideoPatchTransformer(nn.Module):
         self,
         input_frames:  torch.Tensor,
         target_frames: Optional[torch.Tensor] = None,
-        actions:       Optional[torch.Tensor] = None,
         goal:          Optional[torch.Tensor] = None,
     ):
         """
         Parameters
         ----------
         input_frames  : (B, frames_in,  C, H, W)
-        target_frames : (B, frames_out, C, H, W)   optional
-        actions       : (B, m, action_dim)          optional
+        target_frames : (B, frames_out, C, H, W)   optional (training)
         goal          : (B, C, H, W)                optional
 
         Returns
         -------
         pred_frames   : (B, frames_out, C, H, W)
-        pred_actions  : (B, m, action_dim) or None
         loss          : scalar or None
         """
         cfg = self.cfg
         N_p = cfg.n_patches
 
         if target_frames is not None:
-            # ── Teacher-forcing ────────────────────────────────────────
+            # ── Teacher-forcing: [goal? | ctx | tgt] ──────────────────
             fin  = cfg.frames_in
             fout = cfg.frames_out
-            m    = actions.shape[1]
             has_goal = goal is not None
 
-            # 1) Embed frames: [(goal) | ctx | tgt]
             if has_goal:
                 all_frames = torch.cat([goal.unsqueeze(1), input_frames, target_frames], dim=1)
                 prefix_len = (1 + fin) * N_p
@@ -540,53 +517,35 @@ class ARVideoPatchTransformer(nn.Module):
                 all_frames = torch.cat([input_frames, target_frames], dim=1)
                 prefix_len = fin * N_p
 
-            frame_tokens  = self._embed_frames(all_frames)
-            action_tokens = self._embed_actions(actions)
+            tokens = self._embed_frames(all_frames)
 
-            # Assemble: [(goal_patches) | ctx_patches | action_tokens | tgt_patches]
-            tokens = torch.cat([
-                frame_tokens[:, :prefix_len],     # (goal +) ctx
-                action_tokens,                     # actions
-                frame_tokens[:, prefix_len:],      # tgt
-            ], dim=1)
-
-            # Position indices & mask
             t_idx, s_idx = self._build_position_indices(
-                fin, m, fout, tokens.device, has_goal=has_goal,
+                fin, fout, tokens.device, has_goal=has_goal,
             )
             block_mask = self._ensure_mask(
-                fin, m, fout, tokens.device, has_goal=has_goal,
+                fin, fout, tokens.device, has_goal=has_goal,
             )
 
-            # 5) Transformer
             hidden = self._run_transformer(tokens, t_idx, s_idx, block_mask)
 
-            # 6) Predict actions — hidden right before each action token
-            #    positions: [prefix_len-1 .. prefix_len+m-2]  →  m predictions
-            a_start = prefix_len - 1
-            pred_actions = self.action_head(hidden[:, a_start : a_start + m])
-
-            # 7) Predict target patches — hidden right before each target patch
-            #    positions: [prefix_len+m-1 .. prefix_len+m+fout*N_p-2]
+            # Predict target patches (next-token prediction)
             n_tgt   = fout * N_p
-            t_start = prefix_len + m - 1
+            t_start = prefix_len - 1
             pred_patches = self._decode(hidden[:, t_start : t_start + n_tgt])
 
-            # 8) Loss
-            tgt_patches  = patchify(target_frames, cfg.patch_size)
-            frame_loss   = F.mse_loss(pred_patches, tgt_patches)
-            action_loss  = F.mse_loss(pred_actions, actions)
-            loss = frame_loss + action_loss
+            # Loss
+            tgt_patches = patchify(target_frames, cfg.patch_size)
+            loss = F.mse_loss(pred_patches, tgt_patches)
 
             pred_frames = unpatchify(
                 pred_patches.detach(), cfg.patch_size,
                 cfg.resolution, cfg.num_channels,
             ).clamp(-1, 1)
 
-            return pred_frames, pred_actions.detach(), loss
+            return pred_frames, loss
 
         else:
-            # ── Inference (context + optional goal, no actions) ────────
+            # ── Inference (context + optional goal) ───────────────────
             has_goal = goal is not None
             if has_goal:
                 all_frames = torch.cat([goal.unsqueeze(1), input_frames], dim=1)
@@ -595,17 +554,17 @@ class ARVideoPatchTransformer(nn.Module):
             n_ctx  = input_frames.shape[1]
             tokens = self._embed_frames(all_frames)
             t_idx, s_idx = self._build_position_indices(
-                n_ctx, 0, 0, tokens.device, has_goal=has_goal,
+                n_ctx, 0, tokens.device, has_goal=has_goal,
             )
             block_mask = self._ensure_mask(
-                n_ctx, 0, 0, tokens.device, has_goal=has_goal,
+                n_ctx, 0, tokens.device, has_goal=has_goal,
             )
             hidden = self._run_transformer(tokens, t_idx, s_idx, block_mask)
             pred_patches = self._decode(hidden[:, -N_p:, :])
             pred_frames  = unpatchify(
                 pred_patches, cfg.patch_size, cfg.resolution, cfg.num_channels,
             ).clamp(-1, 1)
-            return pred_frames, None, None
+            return pred_frames, None
 
     # ------------------------------------------------------------------
     # AR Generation
@@ -616,53 +575,30 @@ class ARVideoPatchTransformer(nn.Module):
         self,
         context_frames: torch.Tensor,
         goal: Optional[torch.Tensor] = None,
-        n_actions: int = 0,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
-        Generate actions then target frames autoregressively.
+        Generate target frames autoregressively (no KV-cache).
 
-        Returns (gen_frames, gen_actions).
-        Each step does a full forward pass (no KV-cache).
+        Returns gen_frames : (B, frames_out, C, H, W).
         """
         cfg = self.cfg
         N_p = cfg.n_patches
         fin = cfg.frames_in
         has_goal = goal is not None
 
-        # Initial: [(goal) | ctx]
         ctx = context_frames[:, -fin:]
         if has_goal:
             tokens = self._embed_frames(torch.cat([goal.unsqueeze(1), ctx], dim=1))
         else:
             tokens = self._embed_frames(ctx)
 
-        gen_actions = []
-        n_gen_act = 0
-
-        # Phase 1: generate action tokens
-        for _ in range(n_actions):
-            t_idx, s_idx = self._build_position_indices(
-                fin, n_gen_act, 0, tokens.device, has_goal=has_goal,
-            )
-            mask = self._ensure_mask(fin, n_gen_act, 0, tokens.device, has_goal=has_goal)
-            hidden = self._run_transformer(tokens, t_idx, s_idx, mask)
-            pred_a = self.action_head(hidden[:, -1:])
-            gen_actions.append(pred_a)
-            tokens = torch.cat([tokens, self._embed_actions(pred_a)], dim=1)
-            n_gen_act += 1
-
-        gen_actions = torch.cat(gen_actions, dim=1) if gen_actions else \
-            tokens.new_zeros(tokens.shape[0], 0, cfg.action_dim)
-
-        # Phase 2: generate target frames one frame at a time
         gen_patches = []
         for k in range(cfg.frames_out):
-            n_tgt_so_far = k
             t_idx, s_idx = self._build_position_indices(
-                fin, n_actions, n_tgt_so_far, tokens.device, has_goal=has_goal,
+                fin, k, tokens.device, has_goal=has_goal,
             )
             mask = self._ensure_mask(
-                fin, n_actions, n_tgt_so_far, tokens.device, has_goal=has_goal,
+                fin, k, tokens.device, has_goal=has_goal,
             )
             hidden = self._run_transformer(tokens, t_idx, s_idx, mask)
 
@@ -678,7 +614,165 @@ class ARVideoPatchTransformer(nn.Module):
             gen_patches, cfg.patch_size, cfg.resolution, cfg.num_channels,
         ).clamp(-1, 1)
 
-        return gen_frames, gen_actions
+        return gen_frames
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: Inverse Dynamics Model
+# ---------------------------------------------------------------------------
+
+class InverseDynamicsModel(nn.Module):
+    """
+    Stage 2 — Inverse Dynamics Model.
+
+    Uses a frozen Stage 1 video predictor to generate predicted frames,
+    then predicts intermediate actions from (input_frames, predicted_frames).
+
+    Forward flow
+    -------------
+        1. Frozen Stage 1: input_frames (+ goal) → predicted_frames
+        2. Encode [goal? | input | predicted] through Stage 1 backbone
+        3. Mean-pool per-frame hidden states, concatenate
+        4. Trainable MLP head: (2 × d_model) → (n_actions × action_dim)
+
+    Interface
+    ----------
+        Training:   pred_frames, pred_actions, loss = model(input, target, actions, goal)
+                    (target_frames is ignored; Stage 1 predictions used instead)
+        Inference:  pred_frames, pred_actions = model.generate(input, goal)
+    """
+
+    def __init__(
+        self,
+        stage1_model: ARVideoPatchTransformer,
+        n_actions: int,
+        freeze_backbone: bool = True,
+    ):
+        super().__init__()
+        cfg = stage1_model.cfg
+        self.cfg = cfg
+        self.n_actions = n_actions
+        self.freeze_backbone = freeze_backbone
+
+        # Stage 1 backbone
+        self.stage1 = stage1_model
+        if freeze_backbone:
+            for p in self.stage1.parameters():
+                p.requires_grad_(False)
+            self.stage1.eval()
+
+        # Trainable action prediction head
+        d = cfg.d_model
+        self.action_head = nn.Sequential(
+            nn.Linear(2 * d, d),
+            nn.SiLU(),
+            nn.Linear(d, n_actions * cfg.action_dim),
+        )
+        self._init_action_head()
+
+    def _init_action_head(self):
+        for m in self.action_head.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_backbone:
+            self.stage1.eval()
+        return self
+
+    def prebuild_mask(self, device: torch.device, has_goal: bool = True) -> None:
+        """Pre-build FlexAttention masks needed by IDM."""
+        # Stage 1 inference mask (input frames only)
+        self.stage1._ensure_mask(
+            self.cfg.frames_in, 0, device, has_goal=has_goal,
+        )
+        # IDM encoding mask: [goal? | input | pred] treated as context
+        self.stage1._ensure_mask(2, 0, device, has_goal=has_goal)
+
+    def forward(
+        self,
+        input_frames:  torch.Tensor,
+        target_frames: Optional[torch.Tensor] = None,
+        actions:       Optional[torch.Tensor] = None,
+        goal:          Optional[torch.Tensor] = None,
+    ):
+        """
+        Parameters
+        ----------
+        input_frames  : (B, 1, C, H, W)
+        target_frames : ignored — Stage 1 predictions used instead
+        actions       : (B, n_actions, action_dim)  GT for loss; None at inference
+        goal          : (B, C, H, W)                optional
+
+        Returns
+        -------
+        pred_frames  : (B, 1, C, H, W)            Stage 1 predicted frames
+        pred_actions : (B, n_actions, action_dim)
+        loss         : scalar or None
+        """
+        B = input_frames.shape[0]
+        N_p = self.cfg.n_patches
+        has_goal = goal is not None
+
+        backbone_ctx = torch.no_grad() if self.freeze_backbone else nullcontext()
+
+        with backbone_ctx:
+            # 1) Stage 1 inference → predicted frames
+            pred_frames, _ = self.stage1(input_frames, goal=goal)
+
+            # 2) Encode [goal? | input | pred] through backbone
+            if has_goal:
+                all_frames = torch.cat(
+                    [goal.unsqueeze(1), input_frames, pred_frames], dim=1,
+                )
+            else:
+                all_frames = torch.cat([input_frames, pred_frames], dim=1)
+
+            tokens = self.stage1._embed_frames(all_frames)
+            t_idx, s_idx = self.stage1._build_position_indices(
+                2, 0, tokens.device, has_goal=has_goal,
+            )
+            block_mask = self.stage1._ensure_mask(
+                2, 0, tokens.device, has_goal=has_goal,
+            )
+            hidden = self.stage1._run_transformer(tokens, t_idx, s_idx, block_mask)
+
+        # 3) Pool per-frame features
+        if has_goal:
+            input_feat = hidden[:, N_p : 2 * N_p].mean(dim=1)
+            pred_feat  = hidden[:, 2 * N_p : 3 * N_p].mean(dim=1)
+        else:
+            input_feat = hidden[:, :N_p].mean(dim=1)
+            pred_feat  = hidden[:, N_p : 2 * N_p].mean(dim=1)
+
+        combined = torch.cat([input_feat, pred_feat], dim=-1)  # (B, 2*d_model)
+
+        # 4) Predict actions
+        pred_actions = self.action_head(combined).reshape(
+            B, self.n_actions, self.cfg.action_dim,
+        )
+
+        # 5) Loss
+        loss = None
+        if actions is not None:
+            loss = F.mse_loss(pred_actions, actions)
+
+        return pred_frames, pred_actions, loss
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_frames: torch.Tensor,
+        goal: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Predict next frame and intermediate actions."""
+        pred_frames, pred_actions, _ = self.forward(
+            input_frames, actions=None, goal=goal,
+        )
+        return pred_frames, pred_actions
 
 
 # ---------------------------------------------------------------------------
@@ -689,8 +783,8 @@ if __name__ == "__main__":
     cfg = ARPatchConfig(
         resolution=64, num_channels=3, patch_size=8,
         d_model=512, n_heads=8, n_layers=8,
-        frames_in=4, frames_out=4,
-        action_dim=7, max_actions=6,
+        frames_in=1, frames_out=1,
+        action_dim=7,
         qk_norm=True, parallel_attn=False,
     )
 
@@ -701,26 +795,58 @@ if __name__ == "__main__":
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Patches/frame  : {cfg.n_patches}")
     print(f"Parameters     : {n_params:.2f} M")
-    print(f"Attention      : FlexAttention block-causal (mixed sequence)")
 
-    B, m = 2, 6
-    ctx     = torch.randn(B, cfg.frames_in,  3, cfg.resolution, cfg.resolution,
-                           device=device, dtype=dtype)
-    target  = torch.randn(B, cfg.frames_out, 3, cfg.resolution, cfg.resolution,
-                           device=device, dtype=dtype)
-    actions = torch.randn(B, m, cfg.action_dim, device=device, dtype=dtype)
-    goal_f  = torch.randn(B, 3, cfg.resolution, cfg.resolution,
-                           device=device, dtype=dtype)
+    B = 2
+    ctx    = torch.randn(B, 1, 3, cfg.resolution, cfg.resolution,
+                          device=device, dtype=dtype)
+    target = torch.randn(B, 1, 3, cfg.resolution, cfg.resolution,
+                          device=device, dtype=dtype)
+    goal_f = torch.randn(B, 3, cfg.resolution, cfg.resolution,
+                          device=device, dtype=dtype)
 
-    model.prebuild_mask(device, n_actions=m)
+    # ── Stage 1: video prediction (with goal) ─────────────────────────
+    model.prebuild_mask(device, has_goal=True)
 
-    # Training
-    pred, pred_a, loss = model(ctx, target, actions, goal_f)
-    print(f"\npred shape     : {pred.shape}")
-    print(f"pred_actions   : {pred_a.shape}")
+    pred, loss = model(ctx, target, goal_f)
+    print(f"\n=== Stage 1 (with goal) ===")
+    print(f"pred shape     : {pred.shape}")
     print(f"train loss     : {loss.item():.4f}")
 
-    # Generation
-    gen_f, gen_a = model.generate(ctx, goal_f, n_actions=m)
+    gen_f = model.generate(ctx, goal_f)
     print(f"generated      : {gen_f.shape}")
-    print(f"gen actions    : {gen_a.shape}")
+
+    # ── Stage 1: video prediction (no goal) ───────────────────────────
+    model.prebuild_mask(device, has_goal=False)
+
+    pred_ng, loss_ng = model(ctx, target)
+    print(f"\n=== Stage 1 (no goal) ===")
+    print(f"pred shape     : {pred_ng.shape}")
+    print(f"train loss     : {loss_ng.item():.4f}")
+
+    gen_ng = model.generate(ctx)
+    print(f"generated      : {gen_ng.shape}")
+
+    # ── Stage 2: inverse dynamics ─────────────────────────────────────
+    n_act = 4
+    actions = torch.randn(B, n_act, cfg.action_dim, device=device, dtype=dtype)
+
+    idm = InverseDynamicsModel(model, n_actions=n_act).to(device=device, dtype=dtype)
+    idm.prebuild_mask(device, has_goal=True)
+
+    pred_f, pred_a, loss2 = idm(ctx, target, actions, goal_f)
+    print(f"\n=== Stage 2 (inverse dynamics, with goal) ===")
+    print(f"pred frames    : {pred_f.shape}")
+    print(f"pred actions   : {pred_a.shape}")
+    print(f"action loss    : {loss2.item():.4f}")
+
+    gen_f2, gen_a2 = idm.generate(ctx, goal_f)
+    print(f"gen frames     : {gen_f2.shape}")
+    print(f"gen actions    : {gen_a2.shape}")
+
+    idm_ng = InverseDynamicsModel(model, n_actions=n_act).to(device=device, dtype=dtype)
+    idm_ng.prebuild_mask(device, has_goal=False)
+    pred_f3, pred_a3, loss3 = idm_ng(ctx, target, actions, None)
+    print(f"\n=== Stage 2 (inverse dynamics, no goal) ===")
+    print(f"pred frames    : {pred_f3.shape}")
+    print(f"pred actions   : {pred_a3.shape}")
+    print(f"action loss    : {loss3.item():.4f}")
