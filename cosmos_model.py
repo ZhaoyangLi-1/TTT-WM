@@ -190,7 +190,8 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         rms = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return (x.float() * rms).to(x.dtype) * self.scale
+        y = (x.float() * rms) * self.scale.float()
+        return y.to(x.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +299,10 @@ class BlockCausalAttention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
         q, k = self.rope(q, k, t_idx, s_idx)
+        if q.dtype != v.dtype:
+            q = q.to(v.dtype)
+        if k.dtype != v.dtype:
+            k = k.to(v.dtype)
         out = flex_attention(q, k, v, block_mask=block_mask)
         out = out.transpose(1, 2).reshape(B, L, D)
         return self.out(out)
