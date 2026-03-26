@@ -57,6 +57,7 @@ train:
     update_every: 1
   grad_clip: 1.0
   amp: true
+  amp_dtype: bf16
   ckpt_dir: ${outputs_root}/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
   save_every: 10
   resume: ""

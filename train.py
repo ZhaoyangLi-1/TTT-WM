@@ -113,6 +113,16 @@ def unwrap_model(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
 
 
+def resolve_amp_dtype(amp_dtype: str) -> torch.dtype:
+    """Map config amp dtype string to torch dtype."""
+    amp_dtype = str(amp_dtype).lower()
+    if amp_dtype == "fp16":
+        return torch.float16
+    if amp_dtype == "bf16":
+        return torch.bfloat16
+    raise ValueError(f"Unsupported train.amp_dtype: {amp_dtype!r}. Expected 'fp16' or 'bf16'.")
+
+
 # ---------------------------------------------------------------------------
 # EMA
 # ---------------------------------------------------------------------------
@@ -664,7 +674,16 @@ class Trainer:
         # AMP
         # -------------------------------------------------------------------
         self.use_amp = cfg.train.amp and self.device.type == "cuda"
-        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+        amp_dtype_name = str(cfg.train.get("amp_dtype", "fp16"))
+        self.amp_dtype = resolve_amp_dtype(amp_dtype_name)
+        self.use_grad_scaler = self.use_amp and self.amp_dtype == torch.float16
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_grad_scaler)
+        if self.is_main:
+            log.info(
+                f"AMP {'enabled' if self.use_amp else 'disabled'}"
+                + (f" | dtype={amp_dtype_name}" if self.use_amp else "")
+                + (f" | grad_scaler={'on' if self.use_grad_scaler else 'off'}" if self.use_amp else "")
+            )
 
         # -------------------------------------------------------------------
         # Data
@@ -906,7 +925,11 @@ class Trainer:
                         else self.model.no_sync()
                     )
 
-                    with ddp_sync_ctx, torch.amp.autocast("cuda", enabled=self.use_amp):
+                    with ddp_sync_ctx, torch.amp.autocast(
+                        "cuda",
+                        enabled=self.use_amp,
+                        dtype=self.amp_dtype,
+                    ):
                         _, _, loss = self.model(context, target, actions, goal)
                         scaled_loss = loss / self.grad_accum_steps
 
@@ -952,7 +975,11 @@ class Trainer:
                         accum_loss = 0.0
                         accum_step = 0
                 else:
-                    with torch.amp.autocast("cuda", enabled=self.use_amp):
+                    with torch.amp.autocast(
+                        "cuda",
+                        enabled=self.use_amp,
+                        dtype=self.amp_dtype,
+                    ):
                         _, _, loss = self.model(context, target, actions, goal)
 
                     if self.is_main:
@@ -1030,7 +1057,11 @@ class Trainer:
         actions = torch.stack(act_list).to(self.device)
         goals = torch.stack(goal_list).to(self.device) if self.use_goal else None
 
-        with torch.amp.autocast("cuda", enabled=self.use_amp):
+        with torch.amp.autocast(
+            "cuda",
+            enabled=self.use_amp,
+            dtype=self.amp_dtype,
+        ):
             pred_frames, _, _ = self.model(context, target, actions, goals)
 
         if self.ema is not None:
