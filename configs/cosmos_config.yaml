@@ -22,10 +22,12 @@ model:
 
 data:
   type: real                           # "synthetic" | "real"
-  root: ${oc.env:TTT_WM_DATA_ROOT,/ariesdv0/zhaoyang/data}/libero  # LeRobot v2 dataset root
+  root: ${oc.env:TTT_WM_DATA_ROOT,/scr2/zhaoyang}/libero  # LeRobot v2 dataset root
   image_key: image                     # column name in parquet ("image" or "wrist_image")
-  frame_stride: 3                      # interval between frames within context / within target
-  frame_gap: 8                         # interval between last context frame and first target frame
+  action_key: actions                  # column name for actions in parquet
+  action_dim: 7                        # dimensionality of action vector
+  use_goal: false                        # condition on episode goal frame (last frame)
+  frame_gap: 8                         # m: number of action steps between input and target
   val_split: 0.1
   extensions: [png, jpg, jpeg]         # unused for LeRobot data, kept for compat
   n_train: 2000                        # only used when type=synthetic
@@ -60,6 +62,7 @@ train:
   device: "auto"           # auto → cuda > mps > cpu
 
 wandb:
+  enabled: true
   project: TTT-WM
   name: ${experiment_name}
 

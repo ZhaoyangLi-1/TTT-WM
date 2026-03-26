@@ -1,0 +1,10 @@
+torch
+torchvision
+flash-attn
+numpy
+pandas
+pillow
+hydra-core
+omegaconf
+wandb
+tqdm

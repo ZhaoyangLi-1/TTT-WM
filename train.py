@@ -287,15 +287,27 @@ def build_scheduler(
 # ---------------------------------------------------------------------------
 
 class VideoFrameDataset(Dataset):
-    """LeRobot-v2 parquet video dataset."""
+    """LeRobot-v2 parquet video dataset.
+
+    Each sample returns:
+        context    : (frames_in, C, H, W)   input frames
+        target     : (frames_out, C, H, W)  target frames (after action gap)
+        actions    : (gap, action_dim)       actions between last input and first target
+        goal       : (C, H, W)              last frame of the episode (target condition)
+
+    Train / val split is done at the **episode** level (no episode appears
+    in both splits) to prevent data leakage.
+    """
 
     def __init__(self, data_cfg: DictConfig, model_cfg: DictConfig, split: str):
-        self.T = model_cfg.frames_in + model_cfg.frames_out
-        self.fin = model_cfg.frames_in
-        self.stride = data_cfg.get("frame_stride", 1)
-        self.gap = data_cfg.get("frame_gap", self.stride)
-        self.image_key = data_cfg.get("image_key", "image")
-        self.transform = transforms.Compose([
+        self.fin        = model_cfg.frames_in
+        self.fout       = model_cfg.frames_out
+        self.gap        = int(data_cfg.frame_gap)
+        self.image_key  = data_cfg.get("image_key", "image")
+        self.action_key = data_cfg.get("action_key", "actions")
+        self.use_goal   = data_cfg.get("use_goal", True)
+        self._res       = model_cfg.resolution
+        self.transform  = transforms.Compose([
             transforms.Resize((model_cfg.resolution, model_cfg.resolution)),
             transforms.ToTensor(),
             transforms.Normalize([0.5] * 3, [0.5] * 3),
@@ -319,13 +331,16 @@ class VideoFrameDataset(Dataset):
                 rec = json.loads(line)
                 ep_lengths[rec["episode_index"]] = rec["length"]
 
+        # Episode-level split: val gets first n_val episodes, train gets the rest.
+        # No episode appears in both splits → no data leakage.
         n_val = max(1, int(total_episodes * data_cfg.val_split))
         ep_indices = list(range(n_val, total_episodes)) if split == "train" else list(range(n_val))
 
         self.samples = []
-        fout = self.T - self.fin
-        span = (self.fin - 1) * self.stride + self.gap + (fout - 1) * self.stride + 1
-        self._target_offset = (self.fin - 1) * self.stride + self.gap
+        # span = fin + gap + fout - 1  (consecutive frames, no stride)
+        span = self.fin + self.gap + self.fout - 1
+        self._target_offset = self.fin - 1 + self.gap   # first target frame relative to start
+        self._action_offset = self.fin - 1               # first action relative to start
 
         for ep_idx in ep_indices:
             length = ep_lengths[ep_idx]
@@ -333,33 +348,52 @@ class VideoFrameDataset(Dataset):
                 continue
             ep_path_str = str(episode_files[ep_idx])
             for start in range(length - span + 1):
-                self.samples.append((ep_path_str, start))
+                self.samples.append((ep_path_str, start, length))
 
         log.info(f"[{split}] {len(self.samples)} windows / {len(ep_indices)} episodes")
 
         self._read_parquet = functools.lru_cache(maxsize=32)(
-            lambda path: pd.read_parquet(path, columns=[self.image_key])
+            lambda path: pd.read_parquet(path, columns=[self.image_key, self.action_key])
         )
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        parquet_path, start = self.samples[idx]
+        parquet_path, start, ep_length = self.samples[idx]
         df = self._read_parquet(parquet_path)
 
-        imgs = []
-        for t in range(self.T):
-            frame_idx = (
-                start + t * self.stride if t < self.fin
-                else start + self._target_offset + (t - self.fin) * self.stride
-            )
+        # --- Input frames: [start, start+1, ..., start+fin-1] ---
+        ctx_imgs = []
+        for t in range(self.fin):
+            img_data = df.iloc[start + t][self.image_key]
+            img = Image.open(io.BytesIO(img_data["bytes"])).convert("RGB")
+            ctx_imgs.append(self.transform(img))
+
+        # --- Target frames: [start+fin-1+gap, ..., start+fin-1+gap+fout-1] ---
+        tgt_imgs = []
+        for t in range(self.fout):
+            frame_idx = start + self._target_offset + t
             img_data = df.iloc[frame_idx][self.image_key]
             img = Image.open(io.BytesIO(img_data["bytes"])).convert("RGB")
-            imgs.append(self.transform(img))
+            tgt_imgs.append(self.transform(img))
 
-        frames = torch.stack(imgs)
-        return frames[:self.fin], frames[self.fin:]
+        # --- Actions between last input frame and first target frame (m = gap) ---
+        act_start = start + self._action_offset
+        actions = torch.stack([
+            torch.as_tensor(df.iloc[act_start + i][self.action_key], dtype=torch.float32)
+            for i in range(self.gap)
+        ])  # (gap, action_dim)
+
+        # --- Goal frame: last frame of the episode (optional) ---
+        if self.use_goal:
+            goal_data = df.iloc[ep_length - 1][self.image_key]
+            goal = Image.open(io.BytesIO(goal_data["bytes"])).convert("RGB")
+            goal = self.transform(goal)
+        else:
+            goal = torch.zeros(3, self._res, self._res)  # dummy, ignored by trainer
+
+        return torch.stack(ctx_imgs), torch.stack(tgt_imgs), actions, goal
 
 
 class SyntheticVideoDataset(Dataset):
@@ -371,6 +405,9 @@ class SyntheticVideoDataset(Dataset):
         self.cfg = model_cfg
         self.moving_dot = data_cfg.moving_dot
         self.n = data_cfg.n_train if split == "train" else data_cfg.n_val
+        self.gap = data_cfg.get("frame_gap", 1)
+        self.action_dim = data_cfg.get("action_dim", 7)
+        self.use_goal = data_cfg.get("use_goal", True)
 
     def __len__(self):
         return self.n
@@ -391,7 +428,9 @@ class SyntheticVideoDataset(Dataset):
         else:
             frames = torch.rand(T, C, H, W) * 2 - 1
 
-        return frames[:self.fin], frames[self.fin:]
+        actions = torch.zeros(self.gap, self.action_dim)
+        goal = frames[-1].clone() if self.use_goal else torch.zeros(C, H, W)
+        return frames[:self.fin], frames[self.fin:], actions, goal
 
 
 def build_datasets(data_cfg: DictConfig, model_cfg: DictConfig):
@@ -473,6 +512,7 @@ class Trainer:
             dropout=mcfg.dropout,
             frames_in=mcfg.frames_in,
             frames_out=mcfg.frames_out,
+            action_dim=cfg.data.get("action_dim", 7),
         )
 
         if use_cosmos:
@@ -537,6 +577,7 @@ class Trainer:
         # -------------------------------------------------------------------
         # Data
         # -------------------------------------------------------------------
+        self.use_goal = cfg.data.get("use_goal", True)
         train_ds, val_ds = build_datasets(cfg.data, cfg.model)
         n_workers = cfg.data.num_workers
 
@@ -624,8 +665,9 @@ class Trainer:
         # -------------------------------------------------------------------
         # wandb
         # -------------------------------------------------------------------
-        if self.is_main:
-            wandb_cfg = cfg.get("wandb", {})
+        wandb_cfg = cfg.get("wandb", {})
+        self.use_wandb = self.is_main and wandb_cfg.get("enabled", True)
+        if self.use_wandb:
             wandb.init(
                 project=wandb_cfg.get("project", "TTT-WM"),
                 name=wandb_cfg.get("name", cfg.experiment_name),
@@ -720,9 +762,11 @@ class Trainer:
         accum_step = 0
 
         with grad_ctx:
-            for batch_idx, (context, target) in enumerate(pbar):
+            for batch_idx, (context, target, actions, goal) in enumerate(pbar):
                 context = context.to(self.device, non_blocking=True)
                 target = target.to(self.device, non_blocking=True)
+                actions = actions.to(self.device, non_blocking=True)
+                goal = goal.to(self.device, non_blocking=True) if self.use_goal else None
 
                 if train:
                     is_last_accum = (
@@ -737,7 +781,7 @@ class Trainer:
                     )
 
                     with ddp_sync_ctx, torch.amp.autocast("cuda", enabled=self.use_amp):
-                        _, loss = self.model(context, target)
+                        _, _, loss = self.model(context, target, actions, goal)
                         scaled_loss = loss / self.grad_accum_steps
 
                     self.scaler.scale(scaled_loss).backward()
@@ -768,14 +812,15 @@ class Trainer:
 
                         if self.is_main:
                             lr = self.scheduler.get_last_lr()[0]
-                            wandb.log(
-                                {
-                                    "train/loss": avg_loss,
-                                    "train/lr": lr,
-                                    "global_step": self.global_step,
-                                },
-                                step=self.global_step,
-                            )
+                            if self.use_wandb:
+                                wandb.log(
+                                    {
+                                        "train/loss": avg_loss,
+                                        "train/lr": lr,
+                                        "global_step": self.global_step,
+                                    },
+                                    step=self.global_step,
+                                )
                             pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
 
                             if self.global_step % log_every == 0:
@@ -788,7 +833,7 @@ class Trainer:
                         accum_step = 0
                 else:
                     with torch.amp.autocast("cuda", enabled=self.use_amp):
-                        _, loss = self.model(context, target)
+                        _, _, loss = self.model(context, target, actions, goal)
 
                     if self.is_main:
                         pbar.set_postfix(loss=f"{loss.item():.4f}")
@@ -837,7 +882,7 @@ class Trainer:
     @torch.no_grad()
     def _log_val_videos(self, n_samples: int = 4):
         """Log validation targets and predictions to wandb. Rank 0 only."""
-        if not self.is_main:
+        if not self.use_wandb:
             return
 
         self.model.eval()
@@ -848,13 +893,15 @@ class Trainer:
 
         ds = self.val_loader.dataset
         indices = torch.randperm(len(ds))[:n_samples].tolist()
-        ctx_list, tgt_list = zip(*[ds[i] for i in indices])
+        ctx_list, tgt_list, act_list, goal_list = zip(*[ds[i] for i in indices])
 
         context = torch.stack(ctx_list).to(self.device)
         target = torch.stack(tgt_list).to(self.device)
+        actions = torch.stack(act_list).to(self.device)
+        goals = torch.stack(goal_list).to(self.device) if self.use_goal else None
 
         with torch.amp.autocast("cuda", enabled=self.use_amp):
-            pred_frames, _ = self.model(context, target)
+            pred_frames, _, _ = self.model(context, target, actions, goals)
 
         if self.ema is not None:
             self.ema.restore(raw)
@@ -925,16 +972,17 @@ class Trainer:
                     f"{elapsed:.1f}s"
                 )
 
-                wandb.log(
-                    {
-                        "epoch": epoch,
-                        "epoch/train_loss": train_loss,
-                        "epoch/val_loss": val_loss,
-                        "epoch/val_loss_raw": val_loss_raw,
-                        "epoch/lr": self.scheduler.get_last_lr()[0],
-                    },
-                    step=self.global_step,
-                )
+                if self.use_wandb:
+                    wandb.log(
+                        {
+                            "epoch": epoch,
+                            "epoch/train_loss": train_loss,
+                            "epoch/val_loss": val_loss,
+                            "epoch/val_loss_raw": val_loss_raw,
+                            "epoch/lr": self.scheduler.get_last_lr()[0],
+                        },
+                        step=self.global_step,
+                    )
 
                 self._log_val_videos(n_samples=4)
                 self._save_checkpoint(epoch, val_loss, tag="last")
@@ -948,13 +996,14 @@ class Trainer:
                     self._save_checkpoint(epoch, val_loss, tag=best_tag)
                     self.best_ckpt_path = self.ckpt_dir / f"{best_tag}.pt"
 
-                    wandb.run.summary["best_val_loss"] = val_loss
-                    wandb.run.summary["best_epoch"] = epoch
+                    if self.use_wandb:
+                        wandb.run.summary["best_val_loss"] = val_loss
+                        wandb.run.summary["best_epoch"] = epoch
 
                 if (epoch + 1) % tcfg.save_every == 0:
                     self._save_checkpoint(epoch, val_loss, tag=f"epoch_{epoch:04d}")
 
-        if self.is_main:
+        if self.use_wandb:
             wandb.finish()
 
         cleanup_ddp()
