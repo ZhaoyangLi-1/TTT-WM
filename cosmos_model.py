@@ -27,8 +27,8 @@ Interface
 ----------
     Stage 1 training:   pred_frames, loss = model(ctx, tgt, goal)
     Stage 1 inference:  pred_frames       = model(ctx, goal=goal)
-    Stage 2 training:   pred_frames, pred_actions, loss = idm(ctx, tgt, actions, goal)
-    Stage 2 inference:  pred_frames, pred_actions       = idm.generate(ctx, goal)
+    Stage 2 training:   pred_frames, pred_actions, loss = idm(ctx, tgt, actions)
+    Stage 2 inference:  pred_frames, pred_actions       = idm.generate(ctx)
 """
 
 from __future__ import annotations
@@ -630,16 +630,16 @@ class InverseDynamicsModel(nn.Module):
 
     Forward flow
     -------------
-        1. Frozen Stage 1: input_frames (+ goal) → predicted_frames
-        2. Encode [goal? | input | predicted] through Stage 1 backbone
+        1. Frozen Stage 1: input_frames → predicted_frames
+        2. Encode [input | predicted] through Stage 1 backbone
         3. Mean-pool per-frame hidden states, concatenate
         4. Trainable MLP head: (2 × d_model) → (n_actions × action_dim)
 
     Interface
     ----------
-        Training:   pred_frames, pred_actions, loss = model(input, target, actions, goal)
+        Training:   pred_frames, pred_actions, loss = model(input, target, actions)
                     (target_frames is ignored; Stage 1 predictions used instead)
-        Inference:  pred_frames, pred_actions = model.generate(input, goal)
+        Inference:  pred_frames, pred_actions = model.generate(input)
     """
 
     def __init__(
@@ -683,14 +683,14 @@ class InverseDynamicsModel(nn.Module):
             self.stage1.eval()
         return self
 
-    def prebuild_mask(self, device: torch.device, has_goal: bool = True) -> None:
+    def prebuild_mask(self, device: torch.device, has_goal: bool = False) -> None:
         """Pre-build FlexAttention masks needed by IDM."""
-        # Stage 1 inference mask (input frames only)
+        # Stage 1 inference mask (input frames only, no goal)
         self.stage1._ensure_mask(
-            self.cfg.frames_in, 0, device, has_goal=has_goal,
+            self.cfg.frames_in, 0, device, has_goal=False,
         )
-        # IDM encoding mask: [goal? | input | pred] treated as context
-        self.stage1._ensure_mask(2, 0, device, has_goal=has_goal)
+        # IDM encoding mask: [input | pred] treated as context
+        self.stage1._ensure_mask(2, 0, device, has_goal=False)
 
     def forward(
         self,
@@ -705,7 +705,7 @@ class InverseDynamicsModel(nn.Module):
         input_frames  : (B, 1, C, H, W)
         target_frames : ignored — Stage 1 predictions used instead
         actions       : (B, n_actions, action_dim)  GT for loss; None at inference
-        goal          : (B, C, H, W)                optional
+        goal          : ignored — IDM does not use goal
 
         Returns
         -------
@@ -715,38 +715,28 @@ class InverseDynamicsModel(nn.Module):
         """
         B = input_frames.shape[0]
         N_p = self.cfg.n_patches
-        has_goal = goal is not None
 
         backbone_ctx = torch.no_grad() if self.freeze_backbone else nullcontext()
 
         with backbone_ctx:
-            # 1) Stage 1 inference → predicted frames
-            pred_frames, _ = self.stage1(input_frames, goal=goal)
+            # 1) Stage 1 inference → predicted frames (no goal)
+            pred_frames, _ = self.stage1(input_frames)
 
-            # 2) Encode [goal? | input | pred] through backbone
-            if has_goal:
-                all_frames = torch.cat(
-                    [goal.unsqueeze(1), input_frames, pred_frames], dim=1,
-                )
-            else:
-                all_frames = torch.cat([input_frames, pred_frames], dim=1)
+            # 2) Encode [input | pred] through backbone
+            all_frames = torch.cat([input_frames, pred_frames], dim=1)
 
             tokens = self.stage1._embed_frames(all_frames)
             t_idx, s_idx = self.stage1._build_position_indices(
-                2, 0, tokens.device, has_goal=has_goal,
+                2, 0, tokens.device, has_goal=False,
             )
             block_mask = self.stage1._ensure_mask(
-                2, 0, tokens.device, has_goal=has_goal,
+                2, 0, tokens.device, has_goal=False,
             )
             hidden = self.stage1._run_transformer(tokens, t_idx, s_idx, block_mask)
 
         # 3) Pool per-frame features
-        if has_goal:
-            input_feat = hidden[:, N_p : 2 * N_p].mean(dim=1)
-            pred_feat  = hidden[:, 2 * N_p : 3 * N_p].mean(dim=1)
-        else:
-            input_feat = hidden[:, :N_p].mean(dim=1)
-            pred_feat  = hidden[:, N_p : 2 * N_p].mean(dim=1)
+        input_feat = hidden[:, :N_p].mean(dim=1)
+        pred_feat  = hidden[:, N_p : 2 * N_p].mean(dim=1)
 
         combined = torch.cat([input_feat, pred_feat], dim=-1)  # (B, 2*d_model)
 
@@ -768,9 +758,9 @@ class InverseDynamicsModel(nn.Module):
         input_frames: torch.Tensor,
         goal: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Predict next frame and intermediate actions."""
+        """Predict next frame and intermediate actions (goal is ignored)."""
         pred_frames, pred_actions, _ = self.forward(
-            input_frames, actions=None, goal=goal,
+            input_frames, actions=None,
         )
         return pred_frames, pred_actions
 
@@ -831,22 +821,14 @@ if __name__ == "__main__":
     actions = torch.randn(B, n_act, cfg.action_dim, device=device, dtype=dtype)
 
     idm = InverseDynamicsModel(model, n_actions=n_act).to(device=device, dtype=dtype)
-    idm.prebuild_mask(device, has_goal=True)
+    idm.prebuild_mask(device)
 
-    pred_f, pred_a, loss2 = idm(ctx, target, actions, goal_f)
-    print(f"\n=== Stage 2 (inverse dynamics, with goal) ===")
+    pred_f, pred_a, loss2 = idm(ctx, target, actions)
+    print(f"\n=== Stage 2 (inverse dynamics, no goal) ===")
     print(f"pred frames    : {pred_f.shape}")
     print(f"pred actions   : {pred_a.shape}")
     print(f"action loss    : {loss2.item():.4f}")
 
-    gen_f2, gen_a2 = idm.generate(ctx, goal_f)
+    gen_f2, gen_a2 = idm.generate(ctx)
     print(f"gen frames     : {gen_f2.shape}")
     print(f"gen actions    : {gen_a2.shape}")
-
-    idm_ng = InverseDynamicsModel(model, n_actions=n_act).to(device=device, dtype=dtype)
-    idm_ng.prebuild_mask(device, has_goal=False)
-    pred_f3, pred_a3, loss3 = idm_ng(ctx, target, actions, None)
-    print(f"\n=== Stage 2 (inverse dynamics, no goal) ===")
-    print(f"pred frames    : {pred_f3.shape}")
-    print(f"pred actions   : {pred_a3.shape}")
-    print(f"action loss    : {loss3.item():.4f}")

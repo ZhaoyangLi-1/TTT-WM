@@ -633,7 +633,7 @@ class Trainer:
                 raw_model = _CosmosIDM(
                     raw_model, n_actions=n_actions, freeze_backbone=freeze,
                 ).to(self.device)
-                raw_model.prebuild_mask(device=self.device, has_goal=has_goal)
+                raw_model.prebuild_mask(device=self.device)
                 arch_name = "Cosmos-IDM"
             else:
                 # Stage 1: video prediction only
@@ -983,7 +983,7 @@ class Trainer:
                         if self.stage == 1:
                             _, loss = self.model(context, target, goal)
                         else:
-                            _, _, loss = self.model(context, target, actions, goal)
+                            _, _, loss = self.model(context, target, actions)
                         scaled_loss = loss / self.grad_accum_steps
 
                     self.scaler.scale(scaled_loss).backward()
@@ -1036,7 +1036,7 @@ class Trainer:
                         if self.stage == 1:
                             _, loss = self.model(context, target, goal)
                         else:
-                            _, _, loss = self.model(context, target, actions, goal)
+                            _, _, loss = self.model(context, target, actions)
 
                     if self.is_main:
                         pbar.set_postfix(loss=f"{loss.item():.4f}")
@@ -1122,7 +1122,7 @@ class Trainer:
             if self.stage == 1:
                 pred_frames, _ = self.model(context, target, goals)
             else:
-                pred_frames, _, _ = self.model(context, target, actions, goals)
+                pred_frames, _, _ = self.model(context, target, actions)
 
         if self.ema is not None:
             self.ema.restore(raw)
