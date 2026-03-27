@@ -1,4 +1,4 @@
-experiment_name: cosmos_stage${train.stage}_${data.goal_tag}
+experiment_name: cosmos_stage${train.stage}_${data.goal_tag}_gap_${data.frame_gap}
 seed: 42
 
 outputs_root: ${oc.env:TTT_WM_OUTPUTS_ROOT,/ariesdv0/zhaoyang/data}
