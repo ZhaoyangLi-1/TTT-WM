@@ -1,17 +1,36 @@
 # TTT-WM
 
 ## 1. Setup
+
+Install dependencies:
+
 ```bash
 uv pip install -r requirements.txt
-# Replace TTT_WM_OUTPUTS_ROOT to the folder that stores outputs
-export TTT_WM_OUTPUTS_ROOT=/ariesdv0/zhaoyang/data
-# Replace TTT_WM_DATA_ROOT to the folder that stores training and testing data
-export TTT_WM_DATA_ROOT=/ariesdv0/zhaoyang/libero_combined 
 ```
 
+Set environment variables for outputs and dataset paths:
+
+```bash
+# Directory for saving outputs (logs, checkpoints, etc.)
+export TTT_WM_OUTPUTS_ROOT=/ariesdv0/zhaoyang/data
+
+# Directory containing training and testing data
+export TTT_WM_DATA_ROOT=/ariesdv0/zhaoyang/libero_combined
+```
+
+---
+
 ## 2. Training
-Use data.root if you don't set TTT_WM_DATA_ROOT.
-use_goal means whetehr we use last frame as input condition, and goal_tag
+
+If `TTT_WM_DATA_ROOT` is not set, you can specify the dataset path using `data.root`.
+
+### Key Arguments
+
+- `data.use_goal`: Whether to use the last frame as the goal (conditioning input)
+- `data.goal_tag`: Tag used to distinguish goal settings
+- `data.frame_gap`: Temporal gap between sampled frames
+
+### Run Training
 
 ```bash
 torchrun \
@@ -24,3 +43,11 @@ torchrun \
   data.goal_tag=no_goal \
   data.frame_gap=8
 ```
+
+---
+
+## Notes
+
+- Ensure the dataset path is correctly set via `TTT_WM_DATA_ROOT` or `data.root`.
+- Adjust `--nproc_per_node` based on the number of available GPUs.
+- Change `--master_port` if there are conflicts with other distributed jobs.
