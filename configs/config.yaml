@@ -67,6 +67,7 @@ train:
   resume: ""
   test_every: 20
   device: "auto"           # auto → cuda > mps > cpu
+  find_unused_parameters: false
 
 wandb:
   enabled: true

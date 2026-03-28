@@ -13,3 +13,4 @@ wandb
 tqdm
 imageio
 h5py
+pyarrow

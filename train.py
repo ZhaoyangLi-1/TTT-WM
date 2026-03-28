@@ -592,7 +592,7 @@ class Trainer:
 
         # --- DDP ---
         if self.world_size > 1:
-            self.model = DDP(raw_model, device_ids=[self.local_rank], output_device=self.local_rank, find_unused_parameters=bool(cfg.train.get("find_unused_parameters", True)))
+            self.model = DDP(raw_model, device_ids=[self.local_rank], output_device=self.local_rank, find_unused_parameters=bool(cfg.train.get("find_unused_parameters", False)))
             if self.is_main:
                 log.info(f"DDP enabled ({self.world_size} GPUs)")
         else:
