@@ -27,7 +27,7 @@ If `TTT_WM_DATA_ROOT` is not set, you can specify the dataset path using `data.r
 ### Key Arguments
 
 - `data.use_goal`: Whether to use the last frame as the goal (conditioning input)
-- `data.frame_gap`: Temporal gap between sampled frames
+- `data.frame_gap`: Temporal gap between sampled frames (also means how many action gaps)
 
 ### Run Training
 
