@@ -4,7 +4,6 @@ seed: 42
 outputs_root: ${oc.env:TTT_WM_OUTPUTS_ROOT,/ariesdv0/zhaoyang/data}
 
 model:
-  arch: cosmos             # "emu3" (fully causal) or "cosmos" (block-causal)
   resolution: 256
   num_channels: 3
   patch_size: 8            # 8×8 patches → 256 patches/frame

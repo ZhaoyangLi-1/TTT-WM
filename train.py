@@ -90,7 +90,6 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from torchvision import transforms
 from tqdm import tqdm
 
-from model import ARPatchConfig as _EmuConfig, ARVideoPatchTransformer as _EmuModel
 from cosmos_model import (
     ARPatchConfig as _CosmosConfig,
     ARVideoPatchTransformer as _CosmosModel,
@@ -524,7 +523,6 @@ class Trainer:
 
         # --- Model ---
         mcfg = cfg.model
-        use_cosmos = mcfg.get("arch", "emu3") == "cosmos"
         self.stage = int(cfg.train.get("stage", 1))
         has_goal = bool(cfg.data.get("use_goal", True))
 
@@ -537,33 +535,26 @@ class Trainer:
             action_dim=cfg.data.get("action_dim", 7),
         )
 
-        if use_cosmos:
-            config_kwargs["qk_norm"] = mcfg.get("qk_norm", True)
-            config_kwargs["parallel_attn"] = mcfg.get("parallel_attn", False)
-            self.model_cfg = _CosmosConfig(**config_kwargs)
-            raw_model = _CosmosModel(self.model_cfg).to(self.device)
-            arch_name = "Cosmos"
-            if self.stage == 2:
-                s1 = str(cfg.train.get("stage1_ckpt", ""))
-                if s1:
-                    self._load_stage1_weights(raw_model, s1)
-                raw_model = _CosmosIDM(
-                    raw_model, n_actions=int(cfg.data.get("frame_gap", 0)),
-                    freeze_backbone=bool(cfg.train.get("freeze_backbone", True)),
-                ).to(self.device)
-                raw_model.prebuild_mask(device=self.device)
-                arch_name = "Cosmos-IDM"
-            else:
-                raw_model.prebuild_mask(device=self.device, has_goal=has_goal)
+        config_kwargs["qk_norm"] = mcfg.get("qk_norm", True)
+        config_kwargs["parallel_attn"] = mcfg.get("parallel_attn", False)
+        self.model_cfg = _CosmosConfig(**config_kwargs)
+        raw_model = _CosmosModel(self.model_cfg).to(self.device)
+        if self.stage == 2:
+            s1 = str(cfg.train.get("stage1_ckpt", ""))
+            if s1:
+                self._load_stage1_weights(raw_model, s1)
+            raw_model = _CosmosIDM(
+                raw_model, n_actions=int(cfg.data.get("frame_gap", 0)),
+                freeze_backbone=bool(cfg.train.get("freeze_backbone", True)),
+            ).to(self.device)
+            raw_model.prebuild_mask(device=self.device)
         else:
-            self.model_cfg = _EmuConfig(**config_kwargs)
-            raw_model = _EmuModel(self.model_cfg).to(self.device)
-            arch_name = "Emu3"
+            raw_model.prebuild_mask(device=self.device, has_goal=has_goal)
 
         if self.is_main:
             np_ = sum(p.numel() for p in raw_model.parameters()) / 1e6
             nt_ = sum(p.numel() for p in raw_model.parameters() if p.requires_grad) / 1e6
-            log.info(f"Arch: {arch_name} | Stage: {self.stage} | Params: {np_:.2f}M | Trainable: {nt_:.2f}M")
+            log.info(f"Stage: {self.stage} | Params: {np_:.2f}M | Trainable: {nt_:.2f}M")
 
         # --- DDP ---
         if self.world_size > 1:
@@ -837,10 +828,61 @@ class Trainer:
             ctx_np, tgt_np, pred_np = self._frames_to_uint8(context[i]), self._frames_to_uint8(target[i]), self._frames_to_uint8(pred_frames[i])
             if total_frames <= 2:
                 parts = [ctx_np[f] for f in range(ctx_np.shape[0])] + [tgt_np[f] for f in range(tgt_np.shape[0])] + [pred_np[f] for f in range(pred_np.shape[0])]
-                media[f"val/sample_{i}"] = wandb.Image(np.concatenate(parts, axis=1), caption="ctx|tgt|pred")
+                caption = "ctx|tgt|pred"
+                if self.use_goal and goals is not None:
+                    goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
+                    parts.append(goal_np[0])
+                    caption = "ctx|tgt|pred|goal"
+                media[f"val/sample_{i}"] = wandb.Image(np.concatenate(parts, axis=1), caption=caption)
             else:
                 media[f"val/sample_{i}_target"] = wandb.Video(np.concatenate([ctx_np, tgt_np], axis=0).transpose(0,3,1,2), fps=4, format="mp4")
                 media[f"val/sample_{i}_pred"] = wandb.Video(np.concatenate([ctx_np, pred_np], axis=0).transpose(0,3,1,2), fps=4, format="mp4")
+                if self.use_goal and goals is not None:
+                    goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
+                    media[f"val/sample_{i}_goal"] = wandb.Image(goal_np[0], caption="goal")
+        wandb.log(media, step=self.global_step)
+
+    @torch.no_grad()
+    def _log_train_samples(self, n_samples=4):
+        if not self.use_wandb: return
+        self.model.eval()
+        raw = unwrap_model(self.model)
+        if self.ema: self.ema.apply(raw)
+
+        ds = self.train_loader.dataset
+        indices = torch.randperm(len(ds))[:n_samples].tolist()
+        ctx_list, tgt_list, act_list, goal_list = zip(*[ds[i] for i in indices])
+        context = torch.stack(ctx_list).to(self.device)
+        target = torch.stack(tgt_list).to(self.device)
+        actions = torch.stack(act_list).to(self.device)
+        goals = torch.stack(goal_list).to(self.device) if self.use_goal else None
+
+        with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
+            if self.stage == 1:
+                pred_frames, _ = self.model(context, target, goals)
+            else:
+                pred_frames, _, _ = self.model(context, target, actions)
+        if self.ema: self.ema.restore(raw)
+
+        n = min(n_samples, context.shape[0])
+        total_frames = context.shape[1] + target.shape[1]
+        media = {}
+        for i in range(n):
+            ctx_np, tgt_np, pred_np = self._frames_to_uint8(context[i]), self._frames_to_uint8(target[i]), self._frames_to_uint8(pred_frames[i])
+            if total_frames <= 2:
+                parts = [ctx_np[f] for f in range(ctx_np.shape[0])] + [tgt_np[f] for f in range(tgt_np.shape[0])] + [pred_np[f] for f in range(pred_np.shape[0])]
+                caption = "ctx|tgt|pred"
+                if self.use_goal and goals is not None:
+                    goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
+                    parts.append(goal_np[0])
+                    caption = "ctx|tgt|pred|goal"
+                media[f"train/sample_{i}"] = wandb.Image(np.concatenate(parts, axis=1), caption=caption)
+            else:
+                media[f"train/sample_{i}_target"] = wandb.Video(np.concatenate([ctx_np, tgt_np], axis=0).transpose(0,3,1,2), fps=4, format="mp4")
+                media[f"train/sample_{i}_pred"] = wandb.Video(np.concatenate([ctx_np, pred_np], axis=0).transpose(0,3,1,2), fps=4, format="mp4")
+                if self.use_goal and goals is not None:
+                    goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
+                    media[f"train/sample_{i}_goal"] = wandb.Image(goal_np[0], caption="goal")
         wandb.log(media, step=self.global_step)
 
     # --- Main loop (with DataLoader timeout retry) ---
@@ -912,6 +954,7 @@ class Trainer:
                     if self.test_task_names: wandb.run.summary["test_tasks"] = list(self.test_task_names)
 
                 self._log_val_videos(n_samples=4)
+                self._log_train_samples(n_samples=4)
                 self._save_checkpoint(epoch, val_loss, tag="last")
 
                 if val_loss < self.best_val_loss:
