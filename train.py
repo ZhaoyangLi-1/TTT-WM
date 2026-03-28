@@ -164,6 +164,36 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 
+def ddp_enabled() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def ddp_barrier() -> None:
+    if ddp_enabled():
+        dist.barrier()
+
+
+def ddp_all_reduce_bool(flag: bool, op: str = "or") -> bool:
+    if not ddp_enabled():
+        return flag
+    t = torch.tensor(1 if flag else 0, device=torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu"), dtype=torch.int32)
+    if op == "or":
+        dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    elif op == "and":
+        dist.all_reduce(t, op=dist.ReduceOp.MIN)
+    else:
+        raise ValueError(f"Unsupported reduce op for bool sync: {op}")
+    return bool(t.item())
+
+
+def ddp_all_reduce_scalar(value: float, op=dist.ReduceOp.AVG) -> float:
+    if not ddp_enabled():
+        return float(value)
+    t = torch.tensor(float(value), device=torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu"), dtype=torch.float32)
+    dist.all_reduce(t, op=op)
+    return float(t.item())
+
+
 def unwrap_model(model: nn.Module) -> nn.Module:
     """Remove DDP / torch.compile wrappers."""
     if hasattr(model, "_orig_mod"):
@@ -562,7 +592,7 @@ class Trainer:
 
         # --- DDP ---
         if self.world_size > 1:
-            self.model = DDP(raw_model, device_ids=[self.local_rank], output_device=self.local_rank, find_unused_parameters=False)
+            self.model = DDP(raw_model, device_ids=[self.local_rank], output_device=self.local_rank, find_unused_parameters=bool(cfg.train.get("find_unused_parameters", True)))
             if self.is_main:
                 log.info(f"DDP enabled ({self.world_size} GPUs)")
         else:
@@ -700,6 +730,37 @@ class Trainer:
 
     # --- Epoch loop ---
 
+    @staticmethod
+    def _is_dataloader_timeout_error(exc: BaseException) -> bool:
+        s = str(exc).lower()
+        return ("timed out" in s and "dataloader" in s) or "dataloader timed out" in s
+
+    @staticmethod
+    def _is_fatal_dist_error(exc: BaseException) -> bool:
+        s = str(exc)
+        return any(kw in s for kw in ("NCCL", "CUDA error", "SIGABRT", "DistBackendError"))
+
+    def _sync_fatal_flag(self, fatal: bool) -> bool:
+        return ddp_all_reduce_bool(fatal, op="or")
+
+    def _maybe_finish_wandb(self, exit_code: int | None = None):
+        if self.use_wandb:
+            if exit_code is None:
+                wandb.finish()
+            else:
+                wandb.finish(exit_code=exit_code)
+
+    def _abort_all_ranks(self, message: str, epoch: int | None = None):
+        log.error(f"[Rank {self.rank}] {message}")
+        if self.is_main:
+            try:
+                self._save_checkpoint(-1 if epoch is None else epoch, float("inf"), "emergency")
+            except Exception:
+                pass
+        self._maybe_finish_wandb(exit_code=1)
+        cleanup_ddp()
+        raise RuntimeError(message)
+
     def _run_epoch(self, loader, train):
         self.model.train(train)
         total_loss, n_opt_steps = 0.0, 0
@@ -728,12 +789,8 @@ class Trainer:
                             scaled = loss / self.grad_accum_steps
                         self.scaler.scale(scaled).backward()
                     except RuntimeError as e:
-                        if any(kw in str(e) for kw in ("NCCL", "CUDA error", "SIGABRT")):
+                        if self._is_fatal_dist_error(e):
                             log.error(f"[Rank {self.rank}] Fatal @ step {self.global_step}: {e}")
-                            if self.is_main:
-                                try: self._save_checkpoint(-1, float("inf"), "emergency")
-                                except: pass
-                            cleanup_ddp(); raise
                         raise
 
                     accum_loss += loss.detach().item()
@@ -752,7 +809,8 @@ class Trainer:
                             self.ema.update(unwrap_model(self.model))
 
                         avg = accum_loss / self.grad_accum_steps
-                        total_loss += avg; n_opt_steps += 1
+                        total_loss += avg
+                        n_opt_steps += 1
                         if self.is_main:
                             lr = self.scheduler.get_last_lr()[0]
                             if self.use_wandb:
@@ -767,19 +825,17 @@ class Trainer:
                             else:
                                 _, _, loss = self.model(context, target, actions)
                     except RuntimeError as e:
-                        if any(kw in str(e) for kw in ("NCCL", "CUDA error")):
+                        if self._is_fatal_dist_error(e):
                             log.error(f"[Rank {self.rank}] Eval error: {e}")
-                            cleanup_ddp(); raise
                         raise
                     if self.is_main:
                         pbar.set_postfix(loss=f"{loss.item():.4f}")
-                    total_loss += loss.item(); n_opt_steps += 1
+                    total_loss += loss.item()
+                    n_opt_steps += 1
 
         avg = total_loss / max(n_opt_steps, 1)
         if self.world_size > 1 and not train:
-            t = torch.tensor(avg, device=self.device)
-            dist.all_reduce(t, op=dist.ReduceOp.AVG)
-            avg = t.item()
+            avg = ddp_all_reduce_scalar(avg, op=dist.ReduceOp.AVG)
         return avg
 
     def _val_loss(self):
@@ -820,9 +876,9 @@ class Trainer:
 
         with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
             if self.stage == 1:
-                pred_frames, _ = self.model(context, target, goals)
+                pred_frames, _ = raw(context, target, goals)
             else:
-                pred_frames, _, _ = self.model(context, target, actions)
+                pred_frames, _, _ = raw(context, target, actions)
         if self.ema: self.ema.restore(raw)
 
         n = min(n_samples, context.shape[0])
@@ -863,9 +919,9 @@ class Trainer:
 
         with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
             if self.stage == 1:
-                pred_frames, _ = self.model(context, target, goals)
+                pred_frames, _ = raw(context, target, goals)
             else:
-                pred_frames, _, _ = self.model(context, target, actions)
+                pred_frames, _, _ = raw(context, target, actions)
         if self.ema: self.ema.restore(raw)
 
         n = min(n_samples, context.shape[0])
@@ -898,88 +954,112 @@ class Trainer:
         if self.is_main:
             log.info(f"Training {tcfg.epochs} epochs | batch={tcfg.batch_size} | accum={self.grad_accum_steps} | world={self.world_size}")
 
-        for epoch in range(self.start_epoch, tcfg.epochs):
-            if self._train_sampler:
-                self._train_sampler.set_epoch(epoch)
-            t0 = time.time()
+        try:
+            for epoch in range(self.start_epoch, tcfg.epochs):
+                if self._train_sampler:
+                    self._train_sampler.set_epoch(epoch)
+                t0 = time.time()
 
-            # --- Train with retry ---
-            train_loss = None
-            for attempt in range(1, max_dl_timeouts + 1):
-                try:
-                    train_loss = self._run_epoch(self.train_loader, train=True)
-                    break
-                except RuntimeError as e:
-                    es = str(e)
-                    if "timed out" in es.lower() or "DataLoader" in es:
-                        log.warning(f"[Rank {self.rank}] DL timeout epoch {epoch} attempt {attempt}/{max_dl_timeouts}")
-                        self.optimizer.zero_grad(set_to_none=True)
+                train_loss = float("inf")
+                train_ok = False
+                for attempt in range(1, max_dl_timeouts + 1):
+                    local_dl_timeout = False
+                    local_fatal = False
+                    try:
+                        train_loss = self._run_epoch(self.train_loader, train=True)
+                        train_ok = True
+                    except RuntimeError as e:
+                        if self._is_dataloader_timeout_error(e):
+                            local_dl_timeout = True
+                            log.warning(f"[Rank {self.rank}] DL timeout epoch {epoch} attempt {attempt}/{max_dl_timeouts}: {e}")
+                            self.optimizer.zero_grad(set_to_none=True)
+                        elif self._is_fatal_dist_error(e):
+                            local_fatal = True
+                            log.error(f"[Rank {self.rank}] Fatal at epoch {epoch}: {e}")
+                        else:
+                            raise
+
+                    if self._sync_fatal_flag(local_fatal):
+                        self._abort_all_ranks("Synchronized fatal distributed/CUDA failure during training.", epoch=epoch)
+
+                    any_timeout = ddp_all_reduce_bool(local_dl_timeout, op="or")
+                    all_ok = ddp_all_reduce_bool(train_ok, op="and")
+
+                    if all_ok:
+                        break
+
+                    if any_timeout:
                         if attempt >= max_dl_timeouts:
-                            log.error(f"Max timeouts reached at epoch {epoch}, skipping.")
+                            if self.is_main:
+                                log.error(f"Max DataLoader timeouts reached at epoch {epoch}; marking train loss as inf and continuing.")
                             train_loss = float("inf")
+                            break
+                        ddp_barrier()
                         continue
-                    if any(kw in es for kw in ("NCCL", "CUDA error")):
-                        log.error(f"[Rank {self.rank}] Fatal at epoch {epoch}: {e}")
-                        if self.is_main:
-                            try: self._save_checkpoint(epoch, float("inf"), "emergency")
-                            except: pass
-                        if self.use_wandb: wandb.finish(exit_code=1)
-                        cleanup_ddp(); sys.exit(1)
-                    raise
 
-            # --- Val with timeout tolerance ---
-            try:
-                val_loss = self._val_loss()
-                val_loss_raw = self._run_epoch(self.val_loader, train=False)
-            except RuntimeError as e:
-                if "timed out" in str(e).lower():
-                    log.warning(f"DL timeout during val, using inf.")
-                    val_loss = val_loss_raw = float("inf")
-                elif any(kw in str(e) for kw in ("NCCL", "CUDA error")):
-                    if self.use_wandb: wandb.finish(exit_code=1)
-                    cleanup_ddp(); sys.exit(1)
-                else:
-                    raise
+                    self._abort_all_ranks("Ranks diverged during training without a recognized synchronized timeout.", epoch=epoch)
 
-            test_every = int(tcfg.get("test_every", 1))
-            test_loss = self._test_loss() if (self.test_loader and test_every > 0 and (epoch+1) % test_every == 0) else None
-            elapsed = time.time() - t0
+                val_loss = float("inf")
+                val_loss_raw = float("inf")
+                try:
+                    val_loss = self._val_loss()
+                    val_loss_raw = val_loss
+                except RuntimeError as e:
+                    if self._is_dataloader_timeout_error(e):
+                        log.warning(f"[Rank {self.rank}] DL timeout during val, using inf: {e}")
+                    elif self._is_fatal_dist_error(e):
+                        self._abort_all_ranks("Fatal distributed/CUDA failure during validation.", epoch=epoch)
+                    else:
+                        raise
 
-            if self.is_main:
-                ema_tag = " [EMA]" if self.ema else ""
-                s = f"epoch {epoch:04d} | train {train_loss:.6f} | val{ema_tag} {val_loss:.6f} | val[raw] {val_loss_raw:.6f} | "
-                if test_loss is not None: s += f"test{ema_tag} {test_loss:.6f} | "
-                log.info(s + f"{elapsed:.1f}s")
+                test_every = int(tcfg.get("test_every", 1))
+                test_loss = self._test_loss() if (self.test_loader and test_every > 0 and (epoch + 1) % test_every == 0) else None
+                elapsed = time.time() - t0
 
-                metrics = {"epoch": epoch, "epoch/train_loss": train_loss, "epoch/val_loss": val_loss, "epoch/val_loss_raw": val_loss_raw, "epoch/lr": self.scheduler.get_last_lr()[0]}
-                if test_loss is not None: metrics["epoch/test_loss"] = test_loss
-                if self.use_wandb:
-                    wandb.log(metrics, step=self.global_step)
-                    if self.test_task_names: wandb.run.summary["test_tasks"] = list(self.test_task_names)
+                ddp_barrier()
+                if self.is_main:
+                    ema_tag = " [EMA]" if self.ema else ""
+                    s = f"epoch {epoch:04d} | train {train_loss:.6f} | val{ema_tag} {val_loss:.6f} | val[raw] {val_loss_raw:.6f} | "
+                    if test_loss is not None:
+                        s += f"test{ema_tag} {test_loss:.6f} | "
+                    log.info(s + f"{elapsed:.1f}s")
 
-                self._log_val_videos(n_samples=4)
-                self._log_train_samples(n_samples=4)
-                self._save_checkpoint(epoch, val_loss, tag="last")
-
-                if val_loss < self.best_val_loss:
-                    if self.best_ckpt_path and self.best_ckpt_path.exists():
-                        self.best_ckpt_path.unlink()
-                    self.best_val_loss = val_loss
-                    tag = f"best_epoch{epoch:04d}_loss{val_loss:.6f}"
-                    self._save_checkpoint(epoch, val_loss, tag=tag)
-                    self.best_ckpt_path = self.ckpt_dir / f"{tag}.pt"
+                    metrics = {
+                        "epoch": epoch,
+                        "epoch/train_loss": train_loss,
+                        "epoch/val_loss": val_loss,
+                        "epoch/val_loss_raw": val_loss_raw,
+                        "epoch/lr": self.scheduler.get_last_lr()[0],
+                    }
+                    if test_loss is not None:
+                        metrics["epoch/test_loss"] = test_loss
                     if self.use_wandb:
-                        wandb.run.summary["best_val_loss"] = val_loss
-                        wandb.run.summary["best_epoch"] = epoch
+                        wandb.log(metrics, step=self.global_step)
+                        if self.test_task_names:
+                            wandb.run.summary["test_tasks"] = list(self.test_task_names)
 
-                if (epoch + 1) % tcfg.save_every == 0:
-                    self._save_checkpoint(epoch, val_loss, tag=f"epoch_{epoch:04d}")
+                    self._log_val_videos(n_samples=4)
+                    self._log_train_samples(n_samples=4)
+                    self._save_checkpoint(epoch, val_loss, tag="last")
 
-            if self.world_size > 1:
-                dist.barrier()
+                    if val_loss < self.best_val_loss:
+                        if self.best_ckpt_path and self.best_ckpt_path.exists():
+                            self.best_ckpt_path.unlink()
+                        self.best_val_loss = val_loss
+                        tag = f"best_epoch{epoch:04d}_loss{val_loss:.6f}"
+                        self._save_checkpoint(epoch, val_loss, tag=tag)
+                        self.best_ckpt_path = self.ckpt_dir / f"{tag}.pt"
+                        if self.use_wandb:
+                            wandb.run.summary["best_val_loss"] = val_loss
+                            wandb.run.summary["best_epoch"] = epoch
 
-        if self.use_wandb: wandb.finish()
-        cleanup_ddp()
+                    if (epoch + 1) % tcfg.save_every == 0:
+                        self._save_checkpoint(epoch, val_loss, tag=f"epoch_{epoch:04d}")
+
+                ddp_barrier()
+        finally:
+            self._maybe_finish_wandb()
+            cleanup_ddp()
 
 
 @hydra.main(config_path="configs", config_name="config", version_base="1.3")
