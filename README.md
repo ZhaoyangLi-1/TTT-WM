@@ -39,7 +39,7 @@ torchrun \
   --config-name config \
   data.root=/ariesdv0/zhaoyang/libero_combined \
   data.use_goal=true \
-  data.frame_gap=8
+  data.frame_gap=4
 ```
 
 ---
