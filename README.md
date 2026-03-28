@@ -38,7 +38,7 @@ torchrun \
   train.py \
   --config-name config \
   data.root=/ariesdv0/zhaoyang/libero_combined \
-  data.use_goal=false \
+  data.use_goal=true \
   data.frame_gap=8
 ```
 
