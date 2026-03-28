@@ -41,19 +41,38 @@ Always saves the unwrapped module state dict:
 _load_checkpoint strips both:
 - "_orig_mod."  (torch.compile prefix)
 - "module."     (DDP prefix)
+
+NCCL Robustness (v3)
+---------------------
+- TORCH_NCCL_ASYNC_ERROR_HANDLING=1 — prevents uninterruptible D-state hangs
+- Configurable init_process_group timeout (train.nccl_timeout_min, default 30)
+- persistent_workers=True — avoids worker re-fork jitter
+- DataLoader timeout (data.loader_timeout, default 600s) with retry logic
+- Up to train.max_dl_timeouts retries per epoch before skipping
+- Emergency checkpoint on fatal NCCL/CUDA errors
+- Per-epoch dist.barrier() for early rank-divergence detection
+- Fork-safe dict cache replaces functools.lru_cache for parquet reads
+
+Recommended launch:
+    export NCCL_IB_TIMEOUT=23
+    export NCCL_IB_RETRY_CNT=7
+    export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+    export NCCL_DEBUG=WARN
+    torchrun --nproc_per_node=4 train.py ...
 """
 
 from __future__ import annotations
 
 import copy
-import functools
 import io
 import json
 import logging
 import math
 import os
+import sys
 import time
 from contextlib import nullcontext
+from datetime import timedelta
 from pathlib import Path
 
 import hydra
@@ -82,23 +101,54 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint state_dict helpers
+# ---------------------------------------------------------------------------
+
+def _strip_prefix(sd: dict, prefix: str) -> dict:
+    """Strip a key prefix from a state dict if any key starts with it."""
+    if any(k.startswith(prefix) for k in sd):
+        return {k.removeprefix(prefix): v for k, v in sd.items()}
+    return sd
+
+
+def _clean_state_dict(sd: dict) -> dict:
+    """Remove all wrapper prefixes (_orig_mod., module.) from a state dict."""
+    sd = _strip_prefix(sd, "_orig_mod.")
+    sd = _strip_prefix(sd, "module.")
+    sd = _strip_prefix(sd, "_orig_mod.")
+    return sd
+
+
+# ---------------------------------------------------------------------------
+# NCCL environment hardening
+# ---------------------------------------------------------------------------
+
+def _set_nccl_env_defaults():
+    defaults = {
+        "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
+        "NCCL_IB_TIMEOUT": "23",
+        "NCCL_IB_RETRY_CNT": "7",
+    }
+    for key, value in defaults.items():
+        if key not in os.environ:
+            os.environ[key] = value
+            log.info(f"Set {key}={value} (default)")
+
+
+# ---------------------------------------------------------------------------
 # DDP helpers
 # ---------------------------------------------------------------------------
 
-def setup_ddp():
-    """
-    Initialize the distributed process group when launched via torchrun.
-
-    Returns:
-        (rank, local_rank, world_size)
-
-    For plain python launch:
-        rank=0, local_rank=0, world_size=1
-    """
+def setup_ddp(nccl_timeout_min: int = 30):
     if "RANK" not in os.environ:
         return 0, 0, 1
 
-    dist.init_process_group(backend="nccl")
+    _set_nccl_env_defaults()
+
+    dist.init_process_group(
+        backend="nccl",
+        timeout=timedelta(minutes=nccl_timeout_min),
+    )
     rank = dist.get_rank()
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = dist.get_world_size()
@@ -107,24 +157,28 @@ def setup_ddp():
 
 
 def cleanup_ddp():
-    """Destroy the process group if DDP is initialized."""
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
 
 
 def unwrap_model(model: nn.Module) -> nn.Module:
-    """Return the underlying model by removing the DDP wrapper if present."""
-    return model.module if isinstance(model, DDP) else model
+    """Remove DDP / torch.compile wrappers."""
+    if hasattr(model, "_orig_mod"):
+        model = model._orig_mod
+    if isinstance(model, DDP):
+        model = model.module
+    if hasattr(model, "_orig_mod"):
+        model = model._orig_mod
+    return model
 
 
 def resolve_amp_dtype(amp_dtype: str) -> torch.dtype:
-    """Map config amp dtype string to torch dtype."""
     amp_dtype = str(amp_dtype).lower()
     if amp_dtype == "fp16":
         return torch.float16
     if amp_dtype == "bf16":
         return torch.bfloat16
-    raise ValueError(f"Unsupported train.amp_dtype: {amp_dtype!r}. Expected 'fp16' or 'bf16'.")
+    raise ValueError(f"Unsupported train.amp_dtype: {amp_dtype!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -132,12 +186,6 @@ def resolve_amp_dtype(amp_dtype: str) -> torch.dtype:
 # ---------------------------------------------------------------------------
 
 class EMA:
-    """
-    Exponential Moving Average of model weights.
-
-    EMA is always applied to the unwrapped model, never to the DDP wrapper.
-    """
-
     def __init__(self, model: nn.Module, decay: float):
         self.decay = decay
         self.num_updates = 0
@@ -148,28 +196,19 @@ class EMA:
 
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
-        """
-        Update EMA weights.
-
-        A short adaptive ramp is used at the beginning to avoid overly stale EMA.
-        """
         d = min(self.decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
         self.num_updates += 1
-
         for s, m in zip(self.shadow.parameters(), model.parameters()):
             s.data.mul_(d).add_(m.data, alpha=1.0 - d)
-
         for s_buf, m_buf in zip(self.shadow.buffers(), model.buffers()):
             s_buf.data.copy_(m_buf.data)
 
     def apply(self, model: nn.Module) -> None:
-        """Temporarily copy EMA weights into the live model."""
         self._backup = [p.data.clone() for p in model.parameters()]
         for m, s in zip(model.parameters(), self.shadow.parameters()):
             m.data.copy_(s.data)
 
     def restore(self, model: nn.Module) -> None:
-        """Restore original live model weights after apply()."""
         for m, b in zip(model.parameters(), self._backup):
             m.data.copy_(b)
         del self._backup
@@ -182,27 +221,18 @@ class EMA:
 
 
 # ---------------------------------------------------------------------------
-# Optimizer
+# Optimizer & Scheduler
 # ---------------------------------------------------------------------------
 
 def build_optimizer(model: nn.Module, opt_cfg: DictConfig) -> torch.optim.Optimizer:
-    """
-    Build AdamW optimizer.
-
-    If no_decay_norm=True, LayerNorm / GroupNorm / Embedding / bias parameters
-    are excluded from weight decay.
-    """
     if not opt_cfg.no_decay_norm:
         return torch.optim.AdamW(
-            model.parameters(),
-            lr=opt_cfg.lr,
-            weight_decay=opt_cfg.weight_decay,
-            betas=tuple(opt_cfg.betas),
+            model.parameters(), lr=opt_cfg.lr,
+            weight_decay=opt_cfg.weight_decay, betas=tuple(opt_cfg.betas),
         )
 
     no_decay_types = (nn.LayerNorm, nn.GroupNorm, nn.Embedding)
     decay_params, no_decay_params = [], []
-
     for module in model.modules():
         for param_name, param in module.named_parameters(recurse=False):
             if not param.requires_grad:
@@ -212,45 +242,17 @@ def build_optimizer(model: nn.Module, opt_cfg: DictConfig) -> torch.optim.Optimi
             else:
                 decay_params.append(param)
 
-    log.info(
-        f"Optimizer groups — decay: {len(decay_params)} params | "
-        f"no_decay: {len(no_decay_params)} params"
-    )
-
+    log.info(f"Optimizer groups — decay: {len(decay_params)} | no_decay: {len(no_decay_params)}")
     return torch.optim.AdamW(
         [
             {"params": decay_params, "weight_decay": opt_cfg.weight_decay},
             {"params": no_decay_params, "weight_decay": 0.0},
         ],
-        lr=opt_cfg.lr,
-        betas=tuple(opt_cfg.betas),
+        lr=opt_cfg.lr, betas=tuple(opt_cfg.betas),
     )
 
 
-# ---------------------------------------------------------------------------
-# Scheduler
-# ---------------------------------------------------------------------------
-
-def build_scheduler(
-    optimizer: torch.optim.Optimizer,
-    sched_cfg: DictConfig,
-    base_lr: float,
-    total_steps: int,
-):
-    """
-    Build training scheduler.
-
-    Supported scheduler types:
-        - cosine: linear warmup + cosine decay to min_lr
-
-    The LambdaLR multiplier is defined relative to base_lr.
-
-    Args:
-        optimizer: optimizer instance
-        sched_cfg: scheduler config
-        base_lr: optimizer base learning rate
-        total_steps: total optimizer update steps across all epochs
-    """
+def build_scheduler(optimizer, sched_cfg, base_lr, total_steps):
     sched_type = sched_cfg.get("type", "cosine").lower()
     warmup_fraction = float(sched_cfg.get("warmup_fraction", 0.0))
     min_lr = float(sched_cfg.get("min_lr", 0.0))
@@ -260,39 +262,20 @@ def build_scheduler(
     min_lr_ratio = min_lr / base_lr if base_lr > 0 else 0.0
 
     if sched_type != "cosine":
-        raise ValueError(f"Unsupported scheduler type: {sched_type!r}. Expected 'cosine'.")
+        raise ValueError(f"Unsupported scheduler type: {sched_type!r}")
 
-    def lr_lambda(current_step: int) -> float:
-        """
-        Return LR multiplier for LambdaLR.
-
-        Behavior:
-        - Warmup: linearly increase from a very small value to 1.0
-        - Decay: cosine decay from 1.0 to min_lr/base_lr
-        """
-        # Warmup phase
-        if warmup_steps > 0 and current_step < warmup_steps:
-            return float(current_step + 1) / float(warmup_steps)
-
-        # No decay region if total_steps is too small
+    def lr_lambda(step):
+        if warmup_steps > 0 and step < warmup_steps:
+            return float(step + 1) / float(warmup_steps)
         if total_steps <= warmup_steps + 1:
             return 1.0
-
-        # Cosine decay phase
-        decay_steps = total_steps - warmup_steps
-        progress = (current_step - warmup_steps) / max(1, decay_steps - 1)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps - 1)
         progress = min(max(progress, 0.0), 1.0)
-
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
         return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
-    scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
-
-    log.info(
-        f"Scheduler — type={sched_type}, total_steps={total_steps}, "
-        f"warmup_steps={warmup_steps}, min_lr={min_lr:.3e}"
-    )
-
+    scheduler = LambdaLR(optimizer, lr_lambda)
+    log.info(f"Scheduler — type={sched_type}, total={total_steps}, warmup={warmup_steps}, min_lr={min_lr:.3e}")
     return scheduler
 
 
@@ -301,18 +284,9 @@ def build_scheduler(
 # ---------------------------------------------------------------------------
 
 class VideoFrameDataset(Dataset):
-    """LeRobot-v2 parquet video dataset.
+    """LeRobot-v2 parquet video dataset with fork-safe dict cache."""
 
-    Each sample returns:
-        context    : (frames_in, C, H, W)   input frames
-        target     : (frames_out, C, H, W)  target frames (after action gap)
-        actions    : (gap, action_dim)       actions between last input and first target
-        goal       : (C, H, W)              last frame of the episode (target condition)
-
-    Splits:
-        - train      : all episodes whose task is not held out
-        - val / test : held-out tasks only
-    """
+    _CACHE_MAX = 64  # per-worker parquet DataFrame cache size
 
     def __init__(self, data_cfg: DictConfig, model_cfg: DictConfig, split: str):
         if split not in {"train", "val", "test"}:
@@ -357,48 +331,36 @@ class VideoFrameDataset(Dataset):
             for line in f:
                 rec = json.loads(line)
                 tasks = rec.get("tasks", [])
-                episode_meta.append(
-                    {
-                        "episode_index": int(rec["episode_index"]),
-                        "length": int(rec["length"]),
-                        "task": tasks[0] if tasks else None,
-                    }
-                )
+                episode_meta.append({
+                    "episode_index": int(rec["episode_index"]),
+                    "length": int(rec["length"]),
+                    "task": tasks[0] if tasks else None,
+                })
 
         if not task_names:
-            task_names = []
-            seen_tasks = set()
+            seen = set()
             for rec in episode_meta:
-                task_name = rec["task"]
-                if task_name and task_name not in seen_tasks:
-                    seen_tasks.add(task_name)
-                    task_names.append(task_name)
+                t = rec["task"]
+                if t and t not in seen:
+                    seen.add(t)
+                    task_names.append(t)
 
         test_tasks_meta_path = root / "meta" / "test_tasks.json"
         configured_test_tasks = list(data_cfg.get("test_tasks", []))
         if not configured_test_tasks and test_tasks_meta_path.exists():
             with open(test_tasks_meta_path) as f:
-                stored_test_tasks = json.load(f)
-            if isinstance(stored_test_tasks, dict):
-                configured_test_tasks = list(stored_test_tasks.get("tasks", []))
-            else:
-                configured_test_tasks = list(stored_test_tasks)
+                stored = json.load(f)
+            configured_test_tasks = list(stored.get("tasks", []) if isinstance(stored, dict) else stored)
 
         test_task_count = int(data_cfg.get("test_task_count", 0))
         if configured_test_tasks:
-            unknown_tasks = sorted(set(configured_test_tasks) - set(task_names))
-            if unknown_tasks:
-                raise ValueError(
-                    "Configured data.test_tasks are missing from the dataset: "
-                    + ", ".join(unknown_tasks)
-                )
+            unknown = sorted(set(configured_test_tasks) - set(task_names))
+            if unknown:
+                raise ValueError("Missing test tasks: " + ", ".join(unknown))
             selected_test_tasks = configured_test_tasks
         elif test_task_count > 0:
             if test_task_count >= len(task_names):
-                raise ValueError(
-                    f"data.test_task_count={test_task_count} must be smaller than the "
-                    f"number of tasks in the dataset ({len(task_names)})."
-                )
+                raise ValueError(f"test_task_count={test_task_count} >= total tasks ({len(task_names)})")
             selected_test_tasks = task_names[:test_task_count]
         else:
             selected_test_tasks = []
@@ -406,18 +368,17 @@ class VideoFrameDataset(Dataset):
         self.test_tasks = tuple(selected_test_tasks)
         test_task_set = set(self.test_tasks)
 
-        in_domain_eps = [rec["episode_index"] for rec in episode_meta if rec["task"] not in test_task_set]
-        test_eps = [rec["episode_index"] for rec in episode_meta if rec["task"] in test_task_set]
-        ep_lengths = {rec["episode_index"]: rec["length"] for rec in episode_meta}
-        ep_tasks = {rec["episode_index"]: rec["task"] for rec in episode_meta}
+        in_domain_eps = [r["episode_index"] for r in episode_meta if r["task"] not in test_task_set]
+        test_eps = [r["episode_index"] for r in episode_meta if r["task"] in test_task_set]
+        ep_lengths = {r["episode_index"]: r["length"] for r in episode_meta}
+        ep_tasks = {r["episode_index"]: r["task"] for r in episode_meta}
 
         ep_indices = in_domain_eps if split == "train" else test_eps
 
         self.samples = []
-        # span = fin + gap + fout - 1  (consecutive frames, no stride)
         span = self.fin + self.gap + self.fout - 1
-        self._target_offset = self.fin - 1 + self.gap   # first target frame relative to start
-        self._action_offset = self.fin - 1               # first action relative to start
+        self._target_offset = self.fin - 1 + self.gap
+        self._action_offset = self.fin - 1
 
         for ep_idx in ep_indices:
             length = ep_lengths[ep_idx]
@@ -427,20 +388,22 @@ class VideoFrameDataset(Dataset):
             for start in range(length - span + 1):
                 self.samples.append((ep_path_str, start, length))
 
-        split_tasks = sorted({ep_tasks[ep_idx] for ep_idx in ep_indices if ep_tasks[ep_idx] is not None})
+        split_tasks = sorted({ep_tasks[i] for i in ep_indices if ep_tasks[i] is not None})
         if self.test_tasks and split == "train":
-            log.info(
-                f"Held-out test tasks ({len(self.test_tasks)}): "
-                + "; ".join(self.test_tasks)
-            )
-        log.info(
-            f"[{split}] {len(self.samples)} windows / {len(ep_indices)} episodes / "
-            f"{len(split_tasks)} tasks"
-        )
+            log.info(f"Held-out test tasks ({len(self.test_tasks)}): " + "; ".join(self.test_tasks))
+        log.info(f"[{split}] {len(self.samples)} windows / {len(ep_indices)} episodes / {len(split_tasks)} tasks")
 
-        self._read_parquet = functools.lru_cache(maxsize=32)(
-            lambda path: pd.read_parquet(path, columns=[self.image_key, self.action_key])
-        )
+        self._parquet_cache: dict[str, pd.DataFrame] = {}
+
+    def _read_parquet(self, path: str) -> pd.DataFrame:
+        if path in self._parquet_cache:
+            return self._parquet_cache[path]
+        if len(self._parquet_cache) >= self._CACHE_MAX:
+            oldest = next(iter(self._parquet_cache))
+            del self._parquet_cache[oldest]
+        df = pd.read_parquet(path, columns=[self.image_key, self.action_key])
+        self._parquet_cache[path] = df
+        return df
 
     def __len__(self):
         return len(self.samples)
@@ -449,14 +412,12 @@ class VideoFrameDataset(Dataset):
         parquet_path, start, ep_length = self.samples[idx]
         df = self._read_parquet(parquet_path)
 
-        # --- Input frames: [start, start+1, ..., start+fin-1] ---
         ctx_imgs = []
         for t in range(self.fin):
             img_data = df.iloc[start + t][self.image_key]
             img = Image.open(io.BytesIO(img_data["bytes"])).convert("RGB")
             ctx_imgs.append(self.transform(img))
 
-        # --- Target frames: [start+fin-1+gap, ..., start+fin-1+gap+fout-1] ---
         tgt_imgs = []
         for t in range(self.fout):
             frame_idx = start + self._target_offset + t
@@ -464,31 +425,24 @@ class VideoFrameDataset(Dataset):
             img = Image.open(io.BytesIO(img_data["bytes"])).convert("RGB")
             tgt_imgs.append(self.transform(img))
 
-        # --- Actions between last input frame and first target frame (m = gap) ---
         act_start = start + self._action_offset
         actions = torch.stack([
-            torch.tensor(
-                np.array(df.iloc[act_start + i][self.action_key], copy=True),
-                dtype=torch.float32,
-            )
+            torch.tensor(np.array(df.iloc[act_start + i][self.action_key], copy=True), dtype=torch.float32)
             for i in range(self.gap)
-        ])  # (gap, action_dim)
+        ])
 
-        # --- Goal frame: last frame of the episode (optional) ---
         if self.use_goal:
             goal_data = df.iloc[ep_length - 1][self.image_key]
             goal = Image.open(io.BytesIO(goal_data["bytes"])).convert("RGB")
             goal = self.transform(goal)
         else:
-            goal = torch.zeros(3, self._res, self._res)  # dummy, ignored by trainer
+            goal = torch.zeros(3, self._res, self._res)
 
         return torch.stack(ctx_imgs), torch.stack(tgt_imgs), actions, goal
 
 
 class SyntheticVideoDataset(Dataset):
-    """Synthetic moving-dot dataset for debugging and smoke tests."""
-
-    def __init__(self, data_cfg: DictConfig, model_cfg: DictConfig, split: str):
+    def __init__(self, data_cfg, model_cfg, split):
         self.T = model_cfg.frames_in + model_cfg.frames_out
         self.fin = model_cfg.frames_in
         self.cfg = model_cfg
@@ -503,45 +457,29 @@ class SyntheticVideoDataset(Dataset):
 
     def __getitem__(self, idx):
         C, H, W, T = self.cfg.num_channels, self.cfg.resolution, self.cfg.resolution, self.T
-
         if self.moving_dot:
             frames = torch.full((T, C, H, W), -0.9)
             speed = torch.randint(2, 6, (1,)).item()
             x0 = torch.randint(0, W // 2, (1,)).item()
             y0 = torch.randint(0, H // 2, (1,)).item()
-
             for t in range(T):
                 cx = min(x0 + t * speed, W - 5)
                 cy = min(y0 + t * speed, H - 5)
                 frames[t, :, cy:cy + 5, cx:cx + 5] = 0.9
         else:
             frames = torch.rand(T, C, H, W) * 2 - 1
-
         actions = torch.zeros(self.gap, self.action_dim)
         goal = frames[-1].clone() if self.use_goal else torch.zeros(C, H, W)
         return frames[:self.fin], frames[self.fin:], actions, goal
 
 
-def build_datasets(data_cfg: DictConfig, model_cfg: DictConfig):
-    """Build train / validation datasets from config.
-
-    For real data:
-        - train uses all non-heldout tasks
-        - val uses held-out tasks
-        - test is unused because val already serves as the held-out set
-    """
-    cls = {
-        "real": VideoFrameDataset,
-        "synthetic": SyntheticVideoDataset,
-    }
+def build_datasets(data_cfg, model_cfg):
+    cls = {"real": VideoFrameDataset, "synthetic": SyntheticVideoDataset}
     if data_cfg.type not in cls:
         raise ValueError(f"Unknown data.type: {data_cfg.type!r}")
-
-    dataset_cls = cls[data_cfg.type]
-    train_ds = dataset_cls(data_cfg, model_cfg, "train")
-    val_ds = dataset_cls(data_cfg, model_cfg, "val")
-    test_ds = None
-    return train_ds, val_ds, test_ds
+    train_ds = cls[data_cfg.type](data_cfg, model_cfg, "train")
+    val_ds = cls[data_cfg.type](data_cfg, model_cfg, "val")
+    return train_ds, val_ds, None
 
 
 # ---------------------------------------------------------------------------
@@ -552,15 +490,10 @@ class Trainer:
     def __init__(self, cfg: DictConfig):
         self.cfg = cfg
 
-        # -------------------------------------------------------------------
-        # DDP setup
-        # -------------------------------------------------------------------
-        self.rank, self.local_rank, self.world_size = setup_ddp()
+        nccl_timeout_min = int(cfg.train.get("nccl_timeout_min", 30))
+        self.rank, self.local_rank, self.world_size = setup_ddp(nccl_timeout_min=nccl_timeout_min)
         self.is_main = (self.rank == 0)
 
-        # -------------------------------------------------------------------
-        # Device setup
-        # -------------------------------------------------------------------
         if torch.cuda.is_available():
             self.device = torch.device(f"cuda:{self.local_rank}")
         elif torch.backends.mps.is_available():
@@ -570,48 +503,37 @@ class Trainer:
 
         if self.is_main:
             log.info(f"Device: {self.device} | world_size: {self.world_size}")
+            log.info(
+                f"NCCL env: ASYNC_ERROR_HANDLING="
+                f"{os.environ.get('TORCH_NCCL_ASYNC_ERROR_HANDLING', 'unset')}, "
+                f"IB_TIMEOUT={os.environ.get('NCCL_IB_TIMEOUT', 'unset')}, "
+                f"IB_RETRY_CNT={os.environ.get('NCCL_IB_RETRY_CNT', 'unset')}"
+            )
 
-        # Enable TF32 for faster training on modern NVIDIA GPUs
         if self.device.type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
 
-        # Use different seeds across ranks so stochastic ops differ per GPU
         torch.manual_seed(cfg.seed + self.rank)
 
-        # -------------------------------------------------------------------
-        # Gradient accumulation
-        # -------------------------------------------------------------------
         self.grad_accum_steps = int(cfg.train.get("grad_accum_steps", 1))
         if self.is_main:
-            effective_batch = cfg.train.batch_size * self.grad_accum_steps * self.world_size
-            log.info(
-                f"micro_batch={cfg.train.batch_size} | "
-                f"accum_steps={self.grad_accum_steps} | "
-                f"world_size={self.world_size} | "
-                f"effective_batch={effective_batch}"
-            )
+            eff = cfg.train.batch_size * self.grad_accum_steps * self.world_size
+            log.info(f"micro_batch={cfg.train.batch_size} | accum={self.grad_accum_steps} | world={self.world_size} | eff_batch={eff}")
 
-        # -------------------------------------------------------------------
-        # Model
-        # -------------------------------------------------------------------
+        # --- Model ---
         mcfg = cfg.model
         use_cosmos = mcfg.get("arch", "emu3") == "cosmos"
         self.stage = int(cfg.train.get("stage", 1))
         has_goal = bool(cfg.data.get("use_goal", True))
 
         config_kwargs = dict(
-            resolution=mcfg.resolution,
-            num_channels=mcfg.num_channels,
-            patch_size=mcfg.patch_size,
-            d_model=mcfg.d_model,
-            n_heads=mcfg.n_heads,
-            n_layers=mcfg.n_layers,
-            mlp_ratio=mcfg.mlp_ratio,
-            dropout=mcfg.dropout,
-            frames_in=mcfg.frames_in,
-            frames_out=mcfg.frames_out,
+            resolution=mcfg.resolution, num_channels=mcfg.num_channels,
+            patch_size=mcfg.patch_size, d_model=mcfg.d_model,
+            n_heads=mcfg.n_heads, n_layers=mcfg.n_layers,
+            mlp_ratio=mcfg.mlp_ratio, dropout=mcfg.dropout,
+            frames_in=mcfg.frames_in, frames_out=mcfg.frames_out,
             action_dim=cfg.data.get("action_dim", 7),
         )
 
@@ -621,216 +543,105 @@ class Trainer:
             self.model_cfg = _CosmosConfig(**config_kwargs)
             raw_model = _CosmosModel(self.model_cfg).to(self.device)
             arch_name = "Cosmos"
-
             if self.stage == 2:
-                # Load Stage 1 pretrained weights into the backbone
-                stage1_ckpt = str(cfg.train.get("stage1_ckpt", ""))
-                if stage1_ckpt:
-                    self._load_stage1_weights(raw_model, stage1_ckpt)
-
-                n_actions = int(cfg.data.get("frame_gap", 0))
-                freeze = bool(cfg.train.get("freeze_backbone", True))
+                s1 = str(cfg.train.get("stage1_ckpt", ""))
+                if s1:
+                    self._load_stage1_weights(raw_model, s1)
                 raw_model = _CosmosIDM(
-                    raw_model, n_actions=n_actions, freeze_backbone=freeze,
+                    raw_model, n_actions=int(cfg.data.get("frame_gap", 0)),
+                    freeze_backbone=bool(cfg.train.get("freeze_backbone", True)),
                 ).to(self.device)
                 raw_model.prebuild_mask(device=self.device)
                 arch_name = "Cosmos-IDM"
             else:
-                # Stage 1: video prediction only
-                raw_model.prebuild_mask(
-                    device=self.device,
-                    has_goal=has_goal,
-                )
+                raw_model.prebuild_mask(device=self.device, has_goal=has_goal)
         else:
             self.model_cfg = _EmuConfig(**config_kwargs)
             raw_model = _EmuModel(self.model_cfg).to(self.device)
             arch_name = "Emu3"
 
         if self.is_main:
-            n_params = sum(p.numel() for p in raw_model.parameters()) / 1e6
-            n_trainable = sum(p.numel() for p in raw_model.parameters() if p.requires_grad) / 1e6
-            log.info(
-                f"Arch: {arch_name} | Stage: {self.stage} | "
-                f"Parameters: {n_params:.2f}M | Trainable: {n_trainable:.2f}M"
-            )
+            np_ = sum(p.numel() for p in raw_model.parameters()) / 1e6
+            nt_ = sum(p.numel() for p in raw_model.parameters() if p.requires_grad) / 1e6
+            log.info(f"Arch: {arch_name} | Stage: {self.stage} | Params: {np_:.2f}M | Trainable: {nt_:.2f}M")
 
-        # -------------------------------------------------------------------
-        # DDP wrapping
-        # -------------------------------------------------------------------
+        # --- DDP ---
         if self.world_size > 1:
-            self.model = DDP(
-                raw_model,
-                device_ids=[self.local_rank],
-                output_device=self.local_rank,
-                find_unused_parameters=False,
-            )
+            self.model = DDP(raw_model, device_ids=[self.local_rank], output_device=self.local_rank, find_unused_parameters=False)
             if self.is_main:
                 log.info(f"DDP enabled ({self.world_size} GPUs)")
         else:
             self.model = raw_model
 
-        # -------------------------------------------------------------------
-        # torch.compile
-        # -------------------------------------------------------------------
+        # --- torch.compile ---
         if cfg.train.get("compile", False) and hasattr(torch, "compile"):
             torch._dynamo.config.optimize_ddp = False
             self.model = torch.compile(self.model)
             if self.is_main:
-                log.info("torch.compile enabled (optimize_ddp=False)")
+                log.info("torch.compile enabled")
 
-        # -------------------------------------------------------------------
-        # EMA
-        # -------------------------------------------------------------------
+        # --- EMA ---
         ema_cfg = cfg.train.ema
         raw = unwrap_model(self.model)
         self.ema = EMA(raw, decay=ema_cfg.decay) if (ema_cfg.enabled and self.is_main) else None
-        if self.ema is not None and self.is_main:
-            log.info(f"EMA enabled | decay={ema_cfg.decay} | update_every={ema_cfg.update_every}")
+        if self.ema and self.is_main:
+            log.info(f"EMA decay={ema_cfg.decay} update_every={ema_cfg.update_every}")
 
-        # -------------------------------------------------------------------
-        # Optimizer
-        # -------------------------------------------------------------------
+        # --- Optimizer ---
         if self.stage == 2 and bool(cfg.train.get("freeze_backbone", True)):
-            # Only optimize the trainable IDM action head
             trainable = [p for p in unwrap_model(self.model).parameters() if p.requires_grad]
-            self.optimizer = torch.optim.AdamW(
-                trainable,
-                lr=cfg.train.optimizer.lr,
-                weight_decay=cfg.train.optimizer.weight_decay,
-                betas=tuple(cfg.train.optimizer.betas),
-            )
-            if self.is_main:
-                n_t = sum(p.numel() for p in trainable) / 1e6
-                log.info(f"Stage 2 optimizer: {n_t:.2f}M trainable params (backbone frozen)")
+            self.optimizer = torch.optim.AdamW(trainable, lr=cfg.train.optimizer.lr, weight_decay=cfg.train.optimizer.weight_decay, betas=tuple(cfg.train.optimizer.betas))
         else:
             self.optimizer = build_optimizer(unwrap_model(self.model), cfg.train.optimizer)
 
-        # -------------------------------------------------------------------
-        # AMP
-        # -------------------------------------------------------------------
+        # --- AMP ---
         self.use_amp = cfg.train.amp and self.device.type == "cuda"
         amp_dtype_name = str(cfg.train.get("amp_dtype", "fp16"))
         self.amp_dtype = resolve_amp_dtype(amp_dtype_name)
         self.use_grad_scaler = self.use_amp and self.amp_dtype == torch.float16
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_grad_scaler)
         if self.is_main:
-            log.info(
-                f"AMP {'enabled' if self.use_amp else 'disabled'}"
-                + (f" | dtype={amp_dtype_name}" if self.use_amp else "")
-                + (f" | grad_scaler={'on' if self.use_grad_scaler else 'off'}" if self.use_amp else "")
-            )
+            log.info(f"AMP {'on' if self.use_amp else 'off'}" + (f" dtype={amp_dtype_name} scaler={'on' if self.use_grad_scaler else 'off'}" if self.use_amp else ""))
 
-        # -------------------------------------------------------------------
-        # Data
-        # -------------------------------------------------------------------
+        # --- Data ---
         self.use_goal = cfg.data.get("use_goal", True)
         train_ds, val_ds, test_ds = build_datasets(cfg.data, cfg.model)
         self.test_task_names = list(getattr(train_ds, "test_tasks", ()))
         n_workers = cfg.data.num_workers
+        dl_timeout = int(cfg.data.get("loader_timeout", 600))
 
         loader_kw = dict(
             num_workers=n_workers,
             pin_memory=cfg.data.pin_memory and self.device.type == "cuda",
-            persistent_workers=cfg.data.get("persistent_workers", False) and n_workers > 0,
-            prefetch_factor=cfg.data.get("prefetch_factor", 2) if n_workers > 0 else None,
+            persistent_workers=n_workers > 0,
+            prefetch_factor=cfg.data.get("prefetch_factor", 4) if n_workers > 0 else None,
+            timeout=dl_timeout if n_workers > 0 else 0,
         )
+        if self.is_main:
+            log.info(f"DataLoader: workers={n_workers}, persistent=True, prefetch={loader_kw.get('prefetch_factor','N/A')}, timeout={dl_timeout}s")
 
         if self.world_size > 1:
-            train_sampler = DistributedSampler(
-                train_ds,
-                num_replicas=self.world_size,
-                rank=self.rank,
-                shuffle=True,
-            )
-            val_sampler = DistributedSampler(
-                val_ds,
-                num_replicas=self.world_size,
-                rank=self.rank,
-                shuffle=False,
-            )
-            test_sampler = None
-            if test_ds is not None and len(test_ds) > 0:
-                test_sampler = DistributedSampler(
-                    test_ds,
-                    num_replicas=self.world_size,
-                    rank=self.rank,
-                    shuffle=False,
-                )
-
-            self.train_loader = DataLoader(
-                train_ds,
-                batch_size=cfg.train.batch_size,
-                sampler=train_sampler,
-                drop_last=True,
-                **loader_kw,
-            )
-            self.val_loader = DataLoader(
-                val_ds,
-                batch_size=cfg.train.batch_size * 2,
-                sampler=val_sampler,
-                **loader_kw,
-            )
-            self.test_loader = (
-                DataLoader(
-                    test_ds,
-                    batch_size=cfg.train.batch_size * 2,
-                    sampler=test_sampler,
-                    **loader_kw,
-                )
-                if test_sampler is not None
-                else None
-            )
+            train_sampler = DistributedSampler(train_ds, num_replicas=self.world_size, rank=self.rank, shuffle=True)
+            val_sampler = DistributedSampler(val_ds, num_replicas=self.world_size, rank=self.rank, shuffle=False)
+            self.train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, sampler=train_sampler, drop_last=True, **loader_kw)
+            self.val_loader = DataLoader(val_ds, batch_size=cfg.train.batch_size * 2, sampler=val_sampler, **loader_kw)
+            self.test_loader = None
             self._train_sampler = train_sampler
         else:
-            self.train_loader = DataLoader(
-                train_ds,
-                batch_size=cfg.train.batch_size,
-                shuffle=True,
-                drop_last=True,
-                **loader_kw,
-            )
-            self.val_loader = DataLoader(
-                val_ds,
-                batch_size=cfg.train.batch_size * 2,
-                shuffle=False,
-                **loader_kw,
-            )
-            self.test_loader = (
-                DataLoader(
-                    test_ds,
-                    batch_size=cfg.train.batch_size * 2,
-                    shuffle=False,
-                    **loader_kw,
-                )
-                if test_ds is not None and len(test_ds) > 0
-                else None
-            )
+            self.train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, shuffle=True, drop_last=True, **loader_kw)
+            self.val_loader = DataLoader(val_ds, batch_size=cfg.train.batch_size * 2, shuffle=False, **loader_kw)
+            self.test_loader = None
             self._train_sampler = None
 
         if self.is_main and self.test_task_names:
-            log.info(
-                f"Task-heldout test split enabled ({len(self.test_task_names)} tasks): "
-                + "; ".join(self.test_task_names)
-            )
+            log.info(f"Test tasks ({len(self.test_task_names)}): " + "; ".join(self.test_task_names))
 
-        # -------------------------------------------------------------------
-        # Scheduler
-        # -------------------------------------------------------------------
-        # Steps per epoch are computed per-rank. DistributedSampler already
-        # partitions the dataset, so this is correct for all world sizes.
+        # --- Scheduler ---
         steps_per_epoch = max(1, len(self.train_loader) // self.grad_accum_steps)
         total_steps = cfg.train.epochs * steps_per_epoch
+        self.scheduler = build_scheduler(self.optimizer, cfg.train.scheduler, cfg.train.optimizer.lr, total_steps)
 
-        self.scheduler = build_scheduler(
-            optimizer=self.optimizer,
-            sched_cfg=cfg.train.scheduler,
-            base_lr=cfg.train.optimizer.lr,
-            total_steps=total_steps,
-        )
-
-        # -------------------------------------------------------------------
-        # State
-        # -------------------------------------------------------------------
+        # --- State ---
         self.ckpt_dir = Path(cfg.train.ckpt_dir)
         if self.is_main:
             self.ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -843,9 +654,7 @@ class Trainer:
         if cfg.train.resume:
             self._load_checkpoint(cfg.train.resume)
 
-        # -------------------------------------------------------------------
-        # wandb
-        # -------------------------------------------------------------------
+        # --- wandb ---
         wandb_cfg = cfg.get("wandb", {})
         self.use_wandb = self.is_main and wandb_cfg.get("enabled", True)
         if self.use_wandb:
@@ -858,103 +667,51 @@ class Trainer:
             wandb.define_metric("epoch")
             wandb.define_metric("epoch/*", step_metric="epoch")
 
-    # -----------------------------------------------------------------------
-    # Checkpointing
-    # -----------------------------------------------------------------------
+    # --- Checkpointing ---
 
-    def _save_checkpoint(self, epoch: int, val_loss: float, tag: str = "last"):
-        """Save the unwrapped model state dict without DDP or compile prefixes."""
+    def _save_checkpoint(self, epoch, val_loss, tag="last"):
         raw = unwrap_model(self.model)
-
         payload = {
-            "epoch": epoch,
-            "global_step": self.global_step,
-            "model": raw.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "scheduler": self.scheduler.state_dict(),
-            "scaler": self.scaler.state_dict(),
-            "val_loss": val_loss,
-            "cfg": OmegaConf.to_container(self.cfg, resolve=True),
+            "epoch": epoch, "global_step": self.global_step,
+            "model": raw.state_dict(), "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict(), "scaler": self.scaler.state_dict(),
+            "val_loss": val_loss, "cfg": OmegaConf.to_container(self.cfg, resolve=True),
         }
-
         if self.ema is not None:
             payload["ema"] = self.ema.state_dict()
-
         path = self.ckpt_dir / f"{tag}.pt"
         torch.save(payload, path)
-        log.info(f"Saved checkpoint: {path} | val_loss={val_loss:.6f}")
+        log.info(f"Saved: {path} | val_loss={val_loss:.6f}")
 
-    def _load_checkpoint(self, path: str):
-        """Load checkpoint and strip optional compile / DDP prefixes."""
+    def _load_checkpoint(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-
-        def _strip(sd, prefix):
-            if any(k.startswith(prefix) for k in sd):
-                return {k.removeprefix(prefix): v for k, v in sd.items()}
-            return sd
-
-        model_sd = _strip(_strip(ckpt["model"], "_orig_mod."), "module.")
-        unwrap_model(self.model).load_state_dict(model_sd)
-
+        unwrap_model(self.model).load_state_dict(_clean_state_dict(ckpt["model"]))
         self.optimizer.load_state_dict(ckpt["optimizer"])
         self.scheduler.load_state_dict(ckpt["scheduler"])
         self.scaler.load_state_dict(ckpt["scaler"])
-
         if self.ema is not None and "ema" in ckpt:
-            self.ema.load_state_dict(ckpt["ema"])
-
+            self.ema.load_state_dict(_clean_state_dict(ckpt["ema"]))
         self.start_epoch = ckpt["epoch"] + 1
         self.global_step = ckpt.get("global_step", 0)
         self.best_val_loss = ckpt.get("val_loss", float("inf"))
-
         if self.is_main:
             log.info(f"Resumed from {path} | start_epoch={self.start_epoch}")
 
-    def _load_stage1_weights(self, model, path: str):
-        """Load Stage 1 checkpoint into an ARVideoPatchTransformer (before IDM wrapping)."""
+    def _load_stage1_weights(self, model, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-
-        def _strip(sd, prefix):
-            if any(k.startswith(prefix) for k in sd):
-                return {k.removeprefix(prefix): v for k, v in sd.items()}
-            return sd
-
-        model_sd = _strip(_strip(ckpt["model"], "_orig_mod."), "module.")
-        model.load_state_dict(model_sd)
-
+        model.load_state_dict(_clean_state_dict(ckpt["model"]))
         if self.is_main:
-            log.info(f"Loaded Stage 1 weights from {path}")
+            log.info(f"Loaded Stage 1 from {path}")
 
-    # -----------------------------------------------------------------------
-    # Epoch loop
-    # -----------------------------------------------------------------------
+    # --- Epoch loop ---
 
-    def _run_epoch(self, loader: DataLoader, train: bool) -> float:
-        """
-        Run one epoch.
-
-        Training logic:
-        - Zero gradients only at the start of an accumulation window
-        - Divide loss by grad_accum_steps before backward()
-        - Under DDP, suppress all-reduce on non-final micro-steps with no_sync()
-        - Perform optimizer step, scheduler step, and EMA update only on the
-          final micro-step of each accumulation window
-        """
+    def _run_epoch(self, loader, train):
         self.model.train(train)
         total_loss, n_opt_steps = 0.0, 0
         ema_cfg = self.cfg.train.ema
-
-        pbar = tqdm(
-            loader,
-            desc="train" if train else "val",
-            leave=False,
-            disable=not self.is_main,
-        )
-
+        pbar = tqdm(loader, desc="train" if train else "val", leave=False, disable=not self.is_main)
         grad_ctx = torch.enable_grad() if train else torch.no_grad()
-
-        accum_loss = 0.0
-        accum_step = 0
+        accum_loss, accum_step = 0.0, 0
 
         with grad_ctx:
             for batch_idx, (context, target, actions, goal) in enumerate(pbar):
@@ -964,275 +721,206 @@ class Trainer:
                 goal = goal.to(self.device, non_blocking=True) if self.use_goal else None
 
                 if train:
-                    is_last_accum = (
-                        (accum_step == self.grad_accum_steps - 1)
-                        or (batch_idx == len(loader) - 1)
-                    )
+                    is_last = (accum_step == self.grad_accum_steps - 1) or (batch_idx == len(loader) - 1)
+                    sync_ctx = nullcontext() if (not isinstance(self.model, DDP) or is_last) else self.model.no_sync()
 
-                    ddp_sync_ctx = (
-                        nullcontext()
-                        if (not isinstance(self.model, DDP) or is_last_accum)
-                        else self.model.no_sync()
-                    )
-
-                    with ddp_sync_ctx, torch.amp.autocast(
-                        "cuda",
-                        enabled=self.use_amp,
-                        dtype=self.amp_dtype,
-                    ):
-                        if self.stage == 1:
-                            _, loss = self.model(context, target, goal)
-                        else:
-                            _, _, loss = self.model(context, target, actions)
-                        scaled_loss = loss / self.grad_accum_steps
-
-                    self.scaler.scale(scaled_loss).backward()
+                    try:
+                        with sync_ctx, torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
+                            if self.stage == 1:
+                                _, loss = self.model(context, target, goal)
+                            else:
+                                _, _, loss = self.model(context, target, actions)
+                            scaled = loss / self.grad_accum_steps
+                        self.scaler.scale(scaled).backward()
+                    except RuntimeError as e:
+                        if any(kw in str(e) for kw in ("NCCL", "CUDA error", "SIGABRT")):
+                            log.error(f"[Rank {self.rank}] Fatal @ step {self.global_step}: {e}")
+                            if self.is_main:
+                                try: self._save_checkpoint(-1, float("inf"), "emergency")
+                                except: pass
+                            cleanup_ddp(); raise
+                        raise
 
                     accum_loss += loss.detach().item()
                     accum_step += 1
 
-                    if is_last_accum:
+                    if is_last:
                         if self.cfg.train.grad_clip > 0:
                             self.scaler.unscale_(self.optimizer)
-                            nn.utils.clip_grad_norm_(
-                                unwrap_model(self.model).parameters(),
-                                self.cfg.train.grad_clip,
-                            )
-
+                            nn.utils.clip_grad_norm_(unwrap_model(self.model).parameters(), self.cfg.train.grad_clip)
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
                         self.optimizer.zero_grad(set_to_none=True)
                         self.scheduler.step()
                         self.global_step += 1
-
-                        if self.ema is not None and self.global_step % ema_cfg.update_every == 0:
+                        if self.ema and self.global_step % ema_cfg.update_every == 0:
                             self.ema.update(unwrap_model(self.model))
 
-                        avg_loss = accum_loss / self.grad_accum_steps
-                        total_loss += avg_loss
-                        n_opt_steps += 1
-
+                        avg = accum_loss / self.grad_accum_steps
+                        total_loss += avg; n_opt_steps += 1
                         if self.is_main:
                             lr = self.scheduler.get_last_lr()[0]
                             if self.use_wandb:
-                                wandb.log(
-                                    {
-                                        "train/loss": avg_loss,
-                                        "train/lr": lr,
-                                        "global_step": self.global_step,
-                                    },
-                                    step=self.global_step,
-                                )
-                            pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
-
-                        accum_loss = 0.0
-                        accum_step = 0
+                                wandb.log({"train/loss": avg, "train/lr": lr, "global_step": self.global_step}, step=self.global_step)
+                            pbar.set_postfix(loss=f"{avg:.4f}", lr=f"{lr:.2e}")
+                        accum_loss, accum_step = 0.0, 0
                 else:
-                    with torch.amp.autocast(
-                        "cuda",
-                        enabled=self.use_amp,
-                        dtype=self.amp_dtype,
-                    ):
-                        if self.stage == 1:
-                            _, loss = self.model(context, target, goal)
-                        else:
-                            _, _, loss = self.model(context, target, actions)
-
+                    try:
+                        with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
+                            if self.stage == 1:
+                                _, loss = self.model(context, target, goal)
+                            else:
+                                _, _, loss = self.model(context, target, actions)
+                    except RuntimeError as e:
+                        if any(kw in str(e) for kw in ("NCCL", "CUDA error")):
+                            log.error(f"[Rank {self.rank}] Eval error: {e}")
+                            cleanup_ddp(); raise
+                        raise
                     if self.is_main:
                         pbar.set_postfix(loss=f"{loss.item():.4f}")
-
-                    total_loss += loss.item()
-                    n_opt_steps += 1
+                    total_loss += loss.item(); n_opt_steps += 1
 
         avg = total_loss / max(n_opt_steps, 1)
-
-        # Aggregate validation loss across all ranks
         if self.world_size > 1 and not train:
             t = torch.tensor(avg, device=self.device)
             dist.all_reduce(t, op=dist.ReduceOp.AVG)
             avg = t.item()
-
         return avg
 
-    def _val_loss(self) -> float:
-        """Evaluate validation loss using EMA weights when EMA is enabled."""
+    def _val_loss(self):
         return self._eval_loader_loss(self.val_loader)
 
-    def _test_loss(self) -> float | None:
-        """Evaluate held-out test loss using EMA weights when EMA is enabled."""
-        if self.test_loader is None:
-            return None
-        return self._eval_loader_loss(self.test_loader)
+    def _test_loss(self):
+        return self._eval_loader_loss(self.test_loader) if self.test_loader else None
 
-    def _eval_loader_loss(self, loader: DataLoader) -> float:
-        """Evaluate a loader using EMA weights when EMA is enabled."""
+    def _eval_loader_loss(self, loader):
         raw = unwrap_model(self.model)
-        if self.ema is not None:
-            self.ema.apply(raw)
-
+        if self.ema: self.ema.apply(raw)
         loss = self._run_epoch(loader, train=False)
-
-        if self.ema is not None:
-            self.ema.restore(raw)
-
+        if self.ema: self.ema.restore(raw)
         return loss
 
-    # -----------------------------------------------------------------------
-    # Video logging helpers
-    # -----------------------------------------------------------------------
+    # --- Video logging ---
 
     @staticmethod
-    def _frames_to_uint8(frames: torch.Tensor) -> np.ndarray:
-        """
-        Convert normalized float tensor in [-1, 1] to uint8 HWC frames.
-
-        Output shape:
-            [T, H, W, C]
-        """
+    def _frames_to_uint8(frames):
         x = (frames.float().clamp(-1, 1) * 0.5 + 0.5) * 255.0
         arr = x.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
-        return arr[:, ::-1]  # vertical flip: LIBERO images use OpenGL y-up convention
+        return arr[:, ::-1]
 
     @torch.no_grad()
-    def _log_val_videos(self, n_samples: int = 4):
-        """Log validation targets and predictions to wandb. Rank 0 only."""
-        if not self.use_wandb:
-            return
-
+    def _log_val_videos(self, n_samples=4):
+        if not self.use_wandb: return
         self.model.eval()
         raw = unwrap_model(self.model)
-
-        if self.ema is not None:
-            self.ema.apply(raw)
+        if self.ema: self.ema.apply(raw)
 
         ds = self.val_loader.dataset
         indices = torch.randperm(len(ds))[:n_samples].tolist()
         ctx_list, tgt_list, act_list, goal_list = zip(*[ds[i] for i in indices])
-
         context = torch.stack(ctx_list).to(self.device)
         target = torch.stack(tgt_list).to(self.device)
         actions = torch.stack(act_list).to(self.device)
         goals = torch.stack(goal_list).to(self.device) if self.use_goal else None
 
-        with torch.amp.autocast(
-            "cuda",
-            enabled=self.use_amp,
-            dtype=self.amp_dtype,
-        ):
+        with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
             if self.stage == 1:
                 pred_frames, _ = self.model(context, target, goals)
             else:
                 pred_frames, _, _ = self.model(context, target, actions)
-
-        if self.ema is not None:
-            self.ema.restore(raw)
+        if self.ema: self.ema.restore(raw)
 
         n = min(n_samples, context.shape[0])
         total_frames = context.shape[1] + target.shape[1]
         media = {}
-
         for i in range(n):
-            ctx_np = self._frames_to_uint8(context[i])
-            tgt_np = self._frames_to_uint8(target[i])
-            pred_np = self._frames_to_uint8(pred_frames[i])
-
+            ctx_np, tgt_np, pred_np = self._frames_to_uint8(context[i]), self._frames_to_uint8(target[i]), self._frames_to_uint8(pred_frames[i])
             if total_frames <= 2:
-                parts = [ctx_np[f] for f in range(ctx_np.shape[0])]
-                parts += [tgt_np[f] for f in range(tgt_np.shape[0])]
-                parts += [pred_np[f] for f in range(pred_np.shape[0])]
-                composite = np.concatenate(parts, axis=1)
-
-                media[f"val/sample_{i}"] = wandb.Image(
-                    composite,
-                    caption="context | target | prediction",
-                )
+                parts = [ctx_np[f] for f in range(ctx_np.shape[0])] + [tgt_np[f] for f in range(tgt_np.shape[0])] + [pred_np[f] for f in range(pred_np.shape[0])]
+                media[f"val/sample_{i}"] = wandb.Image(np.concatenate(parts, axis=1), caption="ctx|tgt|pred")
             else:
-                gt_vid = np.concatenate([ctx_np, tgt_np], axis=0).transpose(0, 3, 1, 2)
-                pred_vid = np.concatenate([ctx_np, pred_np], axis=0).transpose(0, 3, 1, 2)
-
-                media[f"val/sample_{i}_target"] = wandb.Video(gt_vid, fps=4, format="mp4")
-                media[f"val/sample_{i}_pred"] = wandb.Video(pred_vid, fps=4, format="mp4")
-
+                media[f"val/sample_{i}_target"] = wandb.Video(np.concatenate([ctx_np, tgt_np], axis=0).transpose(0,3,1,2), fps=4, format="mp4")
+                media[f"val/sample_{i}_pred"] = wandb.Video(np.concatenate([ctx_np, pred_np], axis=0).transpose(0,3,1,2), fps=4, format="mp4")
         wandb.log(media, step=self.global_step)
 
-    # -----------------------------------------------------------------------
-    # Main training loop
-    # -----------------------------------------------------------------------
+    # --- Main loop (with DataLoader timeout retry) ---
 
     def train(self):
         tcfg = self.cfg.train
+        max_dl_timeouts = int(tcfg.get("max_dl_timeouts", 3))
 
         if self.is_main:
-            log.info(
-                f"Training {tcfg.epochs} epochs | "
-                f"micro_batch={tcfg.batch_size} | "
-                f"accum={self.grad_accum_steps} | "
-                f"world_size={self.world_size}"
-            )
+            log.info(f"Training {tcfg.epochs} epochs | batch={tcfg.batch_size} | accum={self.grad_accum_steps} | world={self.world_size}")
 
         for epoch in range(self.start_epoch, tcfg.epochs):
-            if self._train_sampler is not None:
-                # Required so DistributedSampler reshuffles differently each epoch
+            if self._train_sampler:
                 self._train_sampler.set_epoch(epoch)
-
             t0 = time.time()
 
-            train_loss = self._run_epoch(self.train_loader, train=True)
-            val_loss = self._val_loss()
-            val_loss_raw = self._run_epoch(self.val_loader, train=False)
-            test_every = int(tcfg.get("test_every", 1))
-            run_test = (
-                self.test_loader is not None
-                and test_every > 0
-                and (epoch + 1) % test_every == 0
-            )
-            test_loss = self._test_loss() if run_test else None
+            # --- Train with retry ---
+            train_loss = None
+            for attempt in range(1, max_dl_timeouts + 1):
+                try:
+                    train_loss = self._run_epoch(self.train_loader, train=True)
+                    break
+                except RuntimeError as e:
+                    es = str(e)
+                    if "timed out" in es.lower() or "DataLoader" in es:
+                        log.warning(f"[Rank {self.rank}] DL timeout epoch {epoch} attempt {attempt}/{max_dl_timeouts}")
+                        self.optimizer.zero_grad(set_to_none=True)
+                        if attempt >= max_dl_timeouts:
+                            log.error(f"Max timeouts reached at epoch {epoch}, skipping.")
+                            train_loss = float("inf")
+                        continue
+                    if any(kw in es for kw in ("NCCL", "CUDA error")):
+                        log.error(f"[Rank {self.rank}] Fatal at epoch {epoch}: {e}")
+                        if self.is_main:
+                            try: self._save_checkpoint(epoch, float("inf"), "emergency")
+                            except: pass
+                        if self.use_wandb: wandb.finish(exit_code=1)
+                        cleanup_ddp(); sys.exit(1)
+                    raise
 
+            # --- Val with timeout tolerance ---
+            try:
+                val_loss = self._val_loss()
+                val_loss_raw = self._run_epoch(self.val_loader, train=False)
+            except RuntimeError as e:
+                if "timed out" in str(e).lower():
+                    log.warning(f"DL timeout during val, using inf.")
+                    val_loss = val_loss_raw = float("inf")
+                elif any(kw in str(e) for kw in ("NCCL", "CUDA error")):
+                    if self.use_wandb: wandb.finish(exit_code=1)
+                    cleanup_ddp(); sys.exit(1)
+                else:
+                    raise
+
+            test_every = int(tcfg.get("test_every", 1))
+            test_loss = self._test_loss() if (self.test_loader and test_every > 0 and (epoch+1) % test_every == 0) else None
             elapsed = time.time() - t0
 
             if self.is_main:
-                ema_tag = " [EMA]" if self.ema is not None else ""
-                summary = (
-                    f"epoch {epoch:04d} | "
-                    f"train {train_loss:.6f} | "
-                    f"val{ema_tag} {val_loss:.6f} | "
-                    f"val[raw] {val_loss_raw:.6f} | "
-                )
-                if test_loss is not None:
-                    summary += f"test{ema_tag} {test_loss:.6f} | "
-                summary += f"{elapsed:.1f}s"
-                log.info(summary)
+                ema_tag = " [EMA]" if self.ema else ""
+                s = f"epoch {epoch:04d} | train {train_loss:.6f} | val{ema_tag} {val_loss:.6f} | val[raw] {val_loss_raw:.6f} | "
+                if test_loss is not None: s += f"test{ema_tag} {test_loss:.6f} | "
+                log.info(s + f"{elapsed:.1f}s")
 
-                metrics = {
-                    "epoch": epoch,
-                    "epoch/train_loss": train_loss,
-                    "epoch/val_loss": val_loss,
-                    "epoch/val_loss_raw": val_loss_raw,
-                    "epoch/lr": self.scheduler.get_last_lr()[0],
-                }
-                if test_loss is not None:
-                    metrics["epoch/test_loss"] = test_loss
-
+                metrics = {"epoch": epoch, "epoch/train_loss": train_loss, "epoch/val_loss": val_loss, "epoch/val_loss_raw": val_loss_raw, "epoch/lr": self.scheduler.get_last_lr()[0]}
+                if test_loss is not None: metrics["epoch/test_loss"] = test_loss
                 if self.use_wandb:
-                    wandb.log(
-                        metrics,
-                        step=self.global_step,
-                    )
-                    if self.test_task_names:
-                        wandb.run.summary["test_tasks"] = list(self.test_task_names)
+                    wandb.log(metrics, step=self.global_step)
+                    if self.test_task_names: wandb.run.summary["test_tasks"] = list(self.test_task_names)
 
                 self._log_val_videos(n_samples=4)
                 self._save_checkpoint(epoch, val_loss, tag="last")
 
                 if val_loss < self.best_val_loss:
-                    if self.best_ckpt_path is not None and self.best_ckpt_path.exists():
+                    if self.best_ckpt_path and self.best_ckpt_path.exists():
                         self.best_ckpt_path.unlink()
-
                     self.best_val_loss = val_loss
-                    best_tag = f"best_epoch{epoch:04d}_loss{val_loss:.6f}"
-                    self._save_checkpoint(epoch, val_loss, tag=best_tag)
-                    self.best_ckpt_path = self.ckpt_dir / f"{best_tag}.pt"
-
+                    tag = f"best_epoch{epoch:04d}_loss{val_loss:.6f}"
+                    self._save_checkpoint(epoch, val_loss, tag=tag)
+                    self.best_ckpt_path = self.ckpt_dir / f"{tag}.pt"
                     if self.use_wandb:
                         wandb.run.summary["best_val_loss"] = val_loss
                         wandb.run.summary["best_epoch"] = epoch
@@ -1240,15 +928,12 @@ class Trainer:
                 if (epoch + 1) % tcfg.save_every == 0:
                     self._save_checkpoint(epoch, val_loss, tag=f"epoch_{epoch:04d}")
 
-        if self.use_wandb:
-            wandb.finish()
+            if self.world_size > 1:
+                dist.barrier()
 
+        if self.use_wandb: wandb.finish()
         cleanup_ddp()
 
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 @hydra.main(config_path="configs", config_name="config", version_base="1.3")
 def main(cfg: DictConfig) -> None:
