@@ -39,7 +39,6 @@ torchrun \
   --config-name cosmos_config \
   data.root=/ariesdv0/zhaoyang/libero_combined \
   data.use_goal=false \
-  data.goal_tag=no_goal \
   data.frame_gap=8
 ```
 
