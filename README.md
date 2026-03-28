@@ -36,7 +36,7 @@ torchrun \
   --nproc_per_node=4 \
   --master_port=29501 \
   train.py \
-  --config-name cosmos_config \
+  --config-name config \
   data.root=/ariesdv0/zhaoyang/libero_combined \
   data.use_goal=false \
   data.frame_gap=8
