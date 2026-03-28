@@ -96,6 +96,10 @@ from cosmos_model import (
     InverseDynamicsModel as _CosmosIDM,
 )
 
+OmegaConf.register_new_resolver(
+    "if", lambda cond, t, f: t if cond else f, replace=True
+)
+
 log = logging.getLogger(__name__)
 
 
