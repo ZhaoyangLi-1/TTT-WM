@@ -52,7 +52,7 @@ torchrun \
   --master_port=29501 \
   train.py \
   --config-name config \
-  data.root=/ariesdv0/zhaoyang/libero_combined \
+  data.root=/ariesdv0/zhaoyang/libero_wm \
   data.use_goal=true \
   data.frame_gap=4
 ```

@@ -645,7 +645,7 @@ class Trainer:
         # --- EMA ---
         ema_cfg = cfg.train.ema
         raw = unwrap_model(self.model)
-        self.ema = EMA(raw, decay=ema_cfg.decay) if (ema_cfg.enabled and self.is_main) else None
+        self.ema = EMA(raw, decay=ema_cfg.decay) if ema_cfg.enabled else None
         if self.ema and self.is_main:
             log.info(f"EMA decay={ema_cfg.decay} update_every={ema_cfg.update_every}")
 
@@ -953,20 +953,53 @@ class Trainer:
     def _frames_to_uint8(frames):
         x = (frames.float().clamp(-1, 1) * 0.5 + 0.5) * 255.0
         arr = x.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
-        return arr[:, ::-1]
+        return arr
+
+    def _sync_model_before_logging(self):
+        if self.world_size <= 1:
+            return
+        raw = unwrap_model(self.model)
+        for p in raw.parameters():
+            dist.broadcast(p.data, src=0)
+        for b in raw.buffers():
+            dist.broadcast(b.data, src=0)
+
+    def _sample_indices_for_logging(self, ds, n_samples: int):
+        n = min(n_samples, len(ds))
+        if n <= 0:
+            return []
+        if self.world_size > 1:
+            if self.is_main:
+                idx = torch.randperm(len(ds), device=self.device)[:n]
+            else:
+                idx = torch.empty(n, dtype=torch.long, device=self.device)
+            dist.broadcast(idx, src=0)
+            return idx.cpu().tolist()
+        return torch.randperm(len(ds))[:n].tolist()
 
     @torch.no_grad()
     def _log_val_videos(self, n_samples=4):
-        if not self.use_wandb:
+        if not self.cfg.get("wandb", {}).get("enabled", True):
             return
 
+        ddp_barrier()
+        self._sync_model_before_logging()
+
+        prev_mode = self.model.training
         self.model.eval()
         raw = unwrap_model(self.model)
         if self.ema:
             self.ema.apply(raw)
 
         ds = self.val_loader.dataset
-        indices = torch.randperm(len(ds))[:n_samples].tolist()
+        indices = self._sample_indices_for_logging(ds, n_samples)
+        if not indices:
+            if self.ema:
+                self.ema.restore(raw)
+            self.model.train(prev_mode)
+            ddp_barrier()
+            return
+
         ctx_list, tgt_list, act_list, goal_list = zip(*[ds[i] for i in indices])
         context = torch.stack(ctx_list).to(self.device)
         target = torch.stack(tgt_list).to(self.device)
@@ -982,54 +1015,68 @@ class Trainer:
         if self.ema:
             self.ema.restore(raw)
 
-        n = min(n_samples, context.shape[0])
-        total_frames = context.shape[1] + target.shape[1]
-        media = {}
+        self.model.train(prev_mode)
 
-        for i in range(n):
-            ctx_np = self._frames_to_uint8(context[i])
-            tgt_np = self._frames_to_uint8(target[i])
-            pred_np = self._frames_to_uint8(pred_frames[i])
+        if self.is_main:
+            n = min(n_samples, context.shape[0])
+            total_frames = context.shape[1] + target.shape[1]
+            media = {}
 
-            if total_frames <= 2:
-                parts = [ctx_np[f] for f in range(ctx_np.shape[0])] + \
-                        [tgt_np[f] for f in range(tgt_np.shape[0])] + \
-                        [pred_np[f] for f in range(pred_np.shape[0])]
-                caption = "ctx|tgt|pred"
-                if self.use_goal and goals is not None:
-                    goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
-                    parts.append(goal_np[0])
-                    caption = "ctx|tgt|pred|goal"
-                media[f"val/sample_{i}"] = wandb.Image(np.concatenate(parts, axis=1), caption=caption)
-            else:
-                media[f"val/sample_{i}_target"] = wandb.Video(
-                    np.concatenate([ctx_np, tgt_np], axis=0).transpose(0, 3, 1, 2),
-                    fps=4,
-                    format="mp4",
-                )
-                media[f"val/sample_{i}_pred"] = wandb.Video(
-                    np.concatenate([ctx_np, pred_np], axis=0).transpose(0, 3, 1, 2),
-                    fps=4,
-                    format="mp4",
-                )
-                if self.use_goal and goals is not None:
-                    goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
-                    media[f"val/sample_{i}_goal"] = wandb.Image(goal_np[0], caption="goal")
+            for i in range(n):
+                ctx_np = self._frames_to_uint8(context[i])
+                tgt_np = self._frames_to_uint8(target[i])
+                pred_np = self._frames_to_uint8(pred_frames[i])
 
-        wandb.log(media, step=self.global_step)
+                if total_frames <= 2:
+                    parts = [ctx_np[f] for f in range(ctx_np.shape[0])] +                             [tgt_np[f] for f in range(tgt_np.shape[0])] +                             [pred_np[f] for f in range(pred_np.shape[0])]
+                    caption = "ctx|tgt|pred"
+                    if self.use_goal and goals is not None:
+                        goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
+                        parts.append(goal_np[0])
+                        caption = "ctx|tgt|pred|goal"
+                    media[f"val/sample_{i}"] = wandb.Image(np.concatenate(parts, axis=1), caption=caption)
+                else:
+                    media[f"val/sample_{i}_target"] = wandb.Video(
+                        np.concatenate([ctx_np, tgt_np], axis=0).transpose(0, 3, 1, 2),
+                        fps=4,
+                        format="mp4",
+                    )
+                    media[f"val/sample_{i}_pred"] = wandb.Video(
+                        np.concatenate([ctx_np, pred_np], axis=0).transpose(0, 3, 1, 2),
+                        fps=4,
+                        format="mp4",
+                    )
+                    if self.use_goal and goals is not None:
+                        goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
+                        media[f"val/sample_{i}_goal"] = wandb.Image(goal_np[0], caption="goal")
+
+            wandb.log(media, step=self.global_step)
+
+        ddp_barrier()
 
     @torch.no_grad()
     def _log_train_samples(self, n_samples=4):
-        if not self.use_wandb:
+        if not self.cfg.get("wandb", {}).get("enabled", True):
             return
 
+        ddp_barrier()
+        self._sync_model_before_logging()
+
+        prev_mode = self.model.training
         self.model.eval()
         raw = unwrap_model(self.model)
         if self.ema:
             self.ema.apply(raw)
 
         ds = self.train_loader.dataset
-        indices = torch.randperm(len(ds))[:n_samples].tolist()
+        indices = self._sample_indices_for_logging(ds, n_samples)
+        if not indices:
+            if self.ema:
+                self.ema.restore(raw)
+            self.model.train(prev_mode)
+            ddp_barrier()
+            return
+
         ctx_list, tgt_list, act_list, goal_list = zip(*[ds[i] for i in indices])
         context = torch.stack(ctx_list).to(self.device)
         target = torch.stack(tgt_list).to(self.device)
@@ -1045,43 +1092,47 @@ class Trainer:
         if self.ema:
             self.ema.restore(raw)
 
-        n = min(n_samples, context.shape[0])
-        total_frames = context.shape[1] + target.shape[1]
-        media = {}
+        self.model.train(prev_mode)
 
-        for i in range(n):
-            ctx_np = self._frames_to_uint8(context[i])
-            tgt_np = self._frames_to_uint8(target[i])
-            pred_np = self._frames_to_uint8(pred_frames[i])
+        if self.is_main:
+            n = min(n_samples, context.shape[0])
+            total_frames = context.shape[1] + target.shape[1]
+            media = {}
 
-            if total_frames <= 2:
-                parts = [ctx_np[f] for f in range(ctx_np.shape[0])] + \
-                        [tgt_np[f] for f in range(tgt_np.shape[0])] + \
-                        [pred_np[f] for f in range(pred_np.shape[0])]
-                caption = "ctx|tgt|pred"
-                if self.use_goal and goals is not None:
-                    goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
-                    parts.append(goal_np[0])
-                    caption = "ctx|tgt|pred|goal"
-                media[f"train/sample_{i}"] = wandb.Image(np.concatenate(parts, axis=1), caption=caption)
-            else:
-                media[f"train/sample_{i}_target"] = wandb.Video(
-                    np.concatenate([ctx_np, tgt_np], axis=0).transpose(0, 3, 1, 2),
-                    fps=4,
-                    format="mp4",
-                )
-                media[f"train/sample_{i}_pred"] = wandb.Video(
-                    np.concatenate([ctx_np, pred_np], axis=0).transpose(0, 3, 1, 2),
-                    fps=4,
-                    format="mp4",
-                )
-                if self.use_goal and goals is not None:
-                    goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
-                    media[f"train/sample_{i}_goal"] = wandb.Image(goal_np[0], caption="goal")
+            for i in range(n):
+                ctx_np = self._frames_to_uint8(context[i])
+                tgt_np = self._frames_to_uint8(target[i])
+                pred_np = self._frames_to_uint8(pred_frames[i])
 
-        wandb.log(media, step=self.global_step)
+                if total_frames <= 2:
+                    parts = [ctx_np[f] for f in range(ctx_np.shape[0])] +                             [tgt_np[f] for f in range(tgt_np.shape[0])] +                             [pred_np[f] for f in range(pred_np.shape[0])]
+                    caption = "ctx|tgt|pred"
+                    if self.use_goal and goals is not None:
+                        goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
+                        parts.append(goal_np[0])
+                        caption = "ctx|tgt|pred|goal"
+                    media[f"train/sample_{i}"] = wandb.Image(np.concatenate(parts, axis=1), caption=caption)
+                else:
+                    media[f"train/sample_{i}_target"] = wandb.Video(
+                        np.concatenate([ctx_np, tgt_np], axis=0).transpose(0, 3, 1, 2),
+                        fps=4,
+                        format="mp4",
+                    )
+                    media[f"train/sample_{i}_pred"] = wandb.Video(
+                        np.concatenate([ctx_np, pred_np], axis=0).transpose(0, 3, 1, 2),
+                        fps=4,
+                        format="mp4",
+                    )
+                    if self.use_goal and goals is not None:
+                        goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
+                        media[f"train/sample_{i}_goal"] = wandb.Image(goal_np[0], caption="goal")
+
+            wandb.log(media, step=self.global_step)
+
+        ddp_barrier()
 
     # --- Main loop ---
+
 
     def train(self):
         tcfg = self.cfg.train
@@ -1183,8 +1234,10 @@ class Trainer:
                         if self.test_task_names:
                             wandb.run.summary["test_tasks"] = list(self.test_task_names)
 
-                    self._log_val_videos(n_samples=4)
-                    self._log_train_samples(n_samples=4)
+                self._log_val_videos(n_samples=4)
+                self._log_train_samples(n_samples=4)
+
+                if self.is_main:
                     self._save_checkpoint(epoch, val_loss, tag="last")
 
                     if val_loss < self.best_val_loss:
