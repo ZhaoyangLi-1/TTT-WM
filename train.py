@@ -34,9 +34,7 @@ from cosmos_model import (
     InverseDynamicsModel as _CosmosIDM,
 )
 
-OmegaConf.register_new_resolver(
-    "if", lambda cond, t, f: t if cond else f, replace=True
-)
+OmegaConf.register_new_resolver("if", lambda cond, t, f: t if cond else f, replace=True)
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +42,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Logging / warning / wandb silence helpers
 # ---------------------------------------------------------------------------
+
 
 def _is_rank0() -> bool:
     if dist.is_available() and dist.is_initialized():
@@ -81,7 +80,9 @@ def configure_logging_for_ddp(is_main: bool) -> None:
 
         handler = logging.StreamHandler(sys.stderr)
         handler.setLevel(logging.ERROR)
-        handler.setFormatter(logging.Formatter("[%(asctime)s][%(name)s][%(levelname)s] - %(message)s"))
+        handler.setFormatter(
+            logging.Formatter("[%(asctime)s][%(name)s][%(levelname)s] - %(message)s")
+        )
         root.addHandler(handler)
         root.setLevel(logging.ERROR)
 
@@ -106,6 +107,7 @@ def configure_logging_for_ddp(is_main: bool) -> None:
 # Checkpoint state_dict helpers
 # ---------------------------------------------------------------------------
 
+
 def _strip_prefix(sd: dict, prefix: str) -> dict:
     if any(k.startswith(prefix) for k in sd):
         return {k.removeprefix(prefix): v for k, v in sd.items()}
@@ -123,6 +125,7 @@ def _clean_state_dict(sd: dict) -> dict:
 # NCCL environment hardening
 # ---------------------------------------------------------------------------
 
+
 def _set_nccl_env_defaults():
     defaults = {
         "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
@@ -137,6 +140,7 @@ def _set_nccl_env_defaults():
 # ---------------------------------------------------------------------------
 # DDP helpers
 # ---------------------------------------------------------------------------
+
 
 def setup_ddp(nccl_timeout_min: int = 30):
     if "RANK" not in os.environ:
@@ -174,7 +178,11 @@ def ddp_all_reduce_bool(flag: bool, op: str = "or") -> bool:
         return flag
     t = torch.tensor(
         1 if flag else 0,
-        device=torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu"),
+        device=(
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        ),
         dtype=torch.int32,
     )
     if op == "or":
@@ -191,7 +199,11 @@ def ddp_all_reduce_scalar(value: float, op=dist.ReduceOp.AVG) -> float:
         return float(value)
     t = torch.tensor(
         float(value),
-        device=torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu"),
+        device=(
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        ),
         dtype=torch.float32,
     )
     dist.all_reduce(t, op=op)
@@ -220,6 +232,7 @@ def resolve_amp_dtype(amp_dtype: str) -> torch.dtype:
 # ---------------------------------------------------------------------------
 # EMA
 # ---------------------------------------------------------------------------
+
 
 class EMA:
     def __init__(self, model: nn.Module, decay: float):
@@ -260,7 +273,10 @@ class EMA:
 # Optimizer & Scheduler
 # ---------------------------------------------------------------------------
 
-def build_optimizer(model: nn.Module, opt_cfg: DictConfig, is_main: bool) -> torch.optim.Optimizer:
+
+def build_optimizer(
+    model: nn.Module, opt_cfg: DictConfig, is_main: bool
+) -> torch.optim.Optimizer:
     if not opt_cfg.no_decay_norm:
         return torch.optim.AdamW(
             model.parameters(),
@@ -281,7 +297,9 @@ def build_optimizer(model: nn.Module, opt_cfg: DictConfig, is_main: bool) -> tor
                 decay_params.append(param)
 
     if is_main:
-        log.info(f"Optimizer groups — decay: {len(decay_params)} | no_decay: {len(no_decay_params)}")
+        log.info(
+            f"Optimizer groups — decay: {len(decay_params)} | no_decay: {len(no_decay_params)}"
+        )
 
     return torch.optim.AdamW(
         [
@@ -299,7 +317,11 @@ def build_scheduler(optimizer, sched_cfg, base_lr, total_steps, is_main: bool):
     min_lr = float(sched_cfg.get("min_lr", 0.0))
 
     total_steps = max(1, int(total_steps))
-    warmup_steps = min(total_steps - 1, int(total_steps * warmup_fraction)) if total_steps > 1 else 0
+    warmup_steps = (
+        min(total_steps - 1, int(total_steps * warmup_fraction))
+        if total_steps > 1
+        else 0
+    )
     min_lr_ratio = min_lr / base_lr if base_lr > 0 else 0.0
 
     if sched_type != "cosine":
@@ -328,10 +350,17 @@ def build_scheduler(optimizer, sched_cfg, base_lr, total_steps, is_main: bool):
 # Datasets
 # ---------------------------------------------------------------------------
 
+
 class VideoFrameDataset(Dataset):
     _CACHE_MAX = 64
 
-    def __init__(self, data_cfg: DictConfig, model_cfg: DictConfig, split: str, is_main: bool = True):
+    def __init__(
+        self,
+        data_cfg: DictConfig,
+        model_cfg: DictConfig,
+        split: str,
+        is_main: bool = True,
+    ):
         if split not in {"train", "val", "test"}:
             raise ValueError(f"Unknown split: {split!r}")
 
@@ -343,11 +372,13 @@ class VideoFrameDataset(Dataset):
         self.action_key = data_cfg.get("action_key", "actions")
         self.use_goal = data_cfg.get("use_goal", True)
         self._res = model_cfg.resolution
-        self.transform = transforms.Compose([
-            transforms.Resize((model_cfg.resolution, model_cfg.resolution)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5] * 3, [0.5] * 3),
-        ])
+        self.transform = transforms.Compose(
+            [
+                transforms.Resize((model_cfg.resolution, model_cfg.resolution)),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5] * 3, [0.5] * 3),
+            ]
+        )
 
         root = Path(data_cfg.root)
 
@@ -366,7 +397,10 @@ class VideoFrameDataset(Dataset):
                         task_names.append(rec["task"])
 
         episode_files = [
-            root / "data" / f"chunk-{ep_idx // chunks_size:03d}" / f"episode_{ep_idx:06d}.parquet"
+            root
+            / "data"
+            / f"chunk-{ep_idx // chunks_size:03d}"
+            / f"episode_{ep_idx:06d}.parquet"
             for ep_idx in range(total_episodes)
         ]
 
@@ -375,11 +409,13 @@ class VideoFrameDataset(Dataset):
             for line in f:
                 rec = json.loads(line)
                 tasks = rec.get("tasks", [])
-                episode_meta.append({
-                    "episode_index": int(rec["episode_index"]),
-                    "length": int(rec["length"]),
-                    "task": tasks[0] if tasks else None,
-                })
+                episode_meta.append(
+                    {
+                        "episode_index": int(rec["episode_index"]),
+                        "length": int(rec["length"]),
+                        "task": tasks[0] if tasks else None,
+                    }
+                )
 
         if not task_names:
             seen = set()
@@ -394,7 +430,9 @@ class VideoFrameDataset(Dataset):
         if not configured_test_tasks and test_tasks_meta_path.exists():
             with open(test_tasks_meta_path) as f:
                 stored = json.load(f)
-            configured_test_tasks = list(stored.get("tasks", []) if isinstance(stored, dict) else stored)
+            configured_test_tasks = list(
+                stored.get("tasks", []) if isinstance(stored, dict) else stored
+            )
 
         test_task_count = int(data_cfg.get("test_task_count", 0))
         if configured_test_tasks:
@@ -404,7 +442,9 @@ class VideoFrameDataset(Dataset):
             selected_test_tasks = configured_test_tasks
         elif test_task_count > 0:
             if test_task_count >= len(task_names):
-                raise ValueError(f"test_task_count={test_task_count} >= total tasks ({len(task_names)})")
+                raise ValueError(
+                    f"test_task_count={test_task_count} >= total tasks ({len(task_names)})"
+                )
             selected_test_tasks = task_names[:test_task_count]
         else:
             selected_test_tasks = []
@@ -412,8 +452,12 @@ class VideoFrameDataset(Dataset):
         self.test_tasks = tuple(selected_test_tasks)
         test_task_set = set(self.test_tasks)
 
-        in_domain_eps = [r["episode_index"] for r in episode_meta if r["task"] not in test_task_set]
-        test_eps = [r["episode_index"] for r in episode_meta if r["task"] in test_task_set]
+        in_domain_eps = [
+            r["episode_index"] for r in episode_meta if r["task"] not in test_task_set
+        ]
+        test_eps = [
+            r["episode_index"] for r in episode_meta if r["task"] in test_task_set
+        ]
         ep_lengths = {r["episode_index"]: r["length"] for r in episode_meta}
         ep_tasks = {r["episode_index"]: r["task"] for r in episode_meta}
 
@@ -432,11 +476,18 @@ class VideoFrameDataset(Dataset):
             for start in range(length - span + 1):
                 self.samples.append((ep_path_str, start, length))
 
-        split_tasks = sorted({ep_tasks[i] for i in ep_indices if ep_tasks[i] is not None})
+        split_tasks = sorted(
+            {ep_tasks[i] for i in ep_indices if ep_tasks[i] is not None}
+        )
         if self.test_tasks and split == "train" and self.is_main:
-            log.info(f"Held-out test tasks ({len(self.test_tasks)}): " + "; ".join(self.test_tasks))
+            log.info(
+                f"Held-out test tasks ({len(self.test_tasks)}): "
+                + "; ".join(self.test_tasks)
+            )
         if self.is_main:
-            log.info(f"[{split}] {len(self.samples)} windows / {len(ep_indices)} episodes / {len(split_tasks)} tasks")
+            log.info(
+                f"[{split}] {len(self.samples)} windows / {len(ep_indices)} episodes / {len(split_tasks)} tasks"
+            )
 
         self._parquet_cache: dict[str, pd.DataFrame] = {}
 
@@ -471,10 +522,15 @@ class VideoFrameDataset(Dataset):
             tgt_imgs.append(self.transform(img))
 
         act_start = start + self._action_offset
-        actions = torch.stack([
-            torch.tensor(np.array(df.iloc[act_start + i][self.action_key], copy=True), dtype=torch.float32)
-            for i in range(self.gap)
-        ])
+        actions = torch.stack(
+            [
+                torch.tensor(
+                    np.array(df.iloc[act_start + i][self.action_key], copy=True),
+                    dtype=torch.float32,
+                )
+                for i in range(self.gap)
+            ]
+        )
 
         if self.use_goal:
             goal_data = df.iloc[ep_length - 1][self.image_key]
@@ -501,7 +557,12 @@ class SyntheticVideoDataset(Dataset):
         return self.n
 
     def __getitem__(self, idx):
-        C, H, W, T = self.cfg.num_channels, self.cfg.resolution, self.cfg.resolution, self.T
+        C, H, W, T = (
+            self.cfg.num_channels,
+            self.cfg.resolution,
+            self.cfg.resolution,
+            self.T,
+        )
         if self.moving_dot:
             frames = torch.full((T, C, H, W), -0.9)
             speed = torch.randint(2, 6, (1,)).item()
@@ -510,12 +571,12 @@ class SyntheticVideoDataset(Dataset):
             for t in range(T):
                 cx = min(x0 + t * speed, W - 5)
                 cy = min(y0 + t * speed, H - 5)
-                frames[t, :, cy:cy + 5, cx:cx + 5] = 0.9
+                frames[t, :, cy : cy + 5, cx : cx + 5] = 0.9
         else:
             frames = torch.rand(T, C, H, W) * 2 - 1
         actions = torch.zeros(self.gap, self.action_dim)
         goal = frames[-1].clone() if self.use_goal else torch.zeros(C, H, W)
-        return frames[:self.fin], frames[self.fin:], actions, goal
+        return frames[: self.fin], frames[self.fin :], actions, goal
 
 
 def build_datasets(data_cfg, model_cfg, is_main: bool):
@@ -537,13 +598,16 @@ def build_datasets(data_cfg, model_cfg, is_main: bool):
 # Trainer
 # ---------------------------------------------------------------------------
 
+
 class Trainer:
     def __init__(self, cfg: DictConfig):
         self.cfg = cfg
 
         nccl_timeout_min = int(cfg.train.get("nccl_timeout_min", 30))
-        self.rank, self.local_rank, self.world_size = setup_ddp(nccl_timeout_min=nccl_timeout_min)
-        self.is_main = (self.rank == 0)
+        self.rank, self.local_rank, self.world_size = setup_ddp(
+            nccl_timeout_min=nccl_timeout_min
+        )
+        self.is_main = self.rank == 0
 
         configure_logging_for_ddp(self.is_main)
 
@@ -619,8 +683,12 @@ class Trainer:
 
         if self.is_main:
             np_ = sum(p.numel() for p in raw_model.parameters()) / 1e6
-            nt_ = sum(p.numel() for p in raw_model.parameters() if p.requires_grad) / 1e6
-            log.info(f"Stage: {self.stage} | Params: {np_:.2f}M | Trainable: {nt_:.2f}M")
+            nt_ = (
+                sum(p.numel() for p in raw_model.parameters() if p.requires_grad) / 1e6
+            )
+            log.info(
+                f"Stage: {self.stage} | Params: {np_:.2f}M | Trainable: {nt_:.2f}M"
+            )
 
         # --- DDP ---
         if self.world_size > 1:
@@ -628,7 +696,9 @@ class Trainer:
                 raw_model,
                 device_ids=[self.local_rank],
                 output_device=self.local_rank,
-                find_unused_parameters=bool(cfg.train.get("find_unused_parameters", False)),
+                find_unused_parameters=bool(
+                    cfg.train.get("find_unused_parameters", False)
+                ),
             )
             if self.is_main:
                 log.info(f"DDP enabled ({self.world_size} GPUs)")
@@ -651,7 +721,9 @@ class Trainer:
 
         # --- Optimizer ---
         if self.stage == 2 and bool(cfg.train.get("freeze_backbone", True)):
-            trainable = [p for p in unwrap_model(self.model).parameters() if p.requires_grad]
+            trainable = [
+                p for p in unwrap_model(self.model).parameters() if p.requires_grad
+            ]
             self.optimizer = torch.optim.AdamW(
                 trainable,
                 lr=cfg.train.optimizer.lr,
@@ -659,7 +731,9 @@ class Trainer:
                 betas=tuple(cfg.train.optimizer.betas),
             )
         else:
-            self.optimizer = build_optimizer(unwrap_model(self.model), cfg.train.optimizer, self.is_main)
+            self.optimizer = build_optimizer(
+                unwrap_model(self.model), cfg.train.optimizer, self.is_main
+            )
 
         # --- AMP ---
         self.use_amp = cfg.train.amp and self.device.type == "cuda"
@@ -670,7 +744,11 @@ class Trainer:
         if self.is_main:
             log.info(
                 f"AMP {'on' if self.use_amp else 'off'}"
-                + (f" dtype={amp_dtype_name} scaler={'on' if self.use_grad_scaler else 'off'}" if self.use_amp else "")
+                + (
+                    f" dtype={amp_dtype_name} scaler={'on' if self.use_grad_scaler else 'off'}"
+                    if self.use_amp
+                    else ""
+                )
             )
 
         # --- Data ---
@@ -684,7 +762,9 @@ class Trainer:
             num_workers=n_workers,
             pin_memory=cfg.data.pin_memory and self.device.type == "cuda",
             persistent_workers=n_workers > 0,
-            prefetch_factor=cfg.data.get("prefetch_factor", 4) if n_workers > 0 else None,
+            prefetch_factor=(
+                cfg.data.get("prefetch_factor", 4) if n_workers > 0 else None
+            ),
             timeout=dl_timeout if n_workers > 0 else 0,
         )
         if self.is_main:
@@ -696,20 +776,46 @@ class Trainer:
             )
 
         if self.world_size > 1:
-            train_sampler = DistributedSampler(train_ds, num_replicas=self.world_size, rank=self.rank, shuffle=True)
-            val_sampler = DistributedSampler(val_ds, num_replicas=self.world_size, rank=self.rank, shuffle=False)
-            self.train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, sampler=train_sampler, drop_last=True, **loader_kw)
-            self.val_loader = DataLoader(val_ds, batch_size=cfg.train.batch_size * 2, sampler=val_sampler, **loader_kw)
+            train_sampler = DistributedSampler(
+                train_ds, num_replicas=self.world_size, rank=self.rank, shuffle=True
+            )
+            val_sampler = DistributedSampler(
+                val_ds, num_replicas=self.world_size, rank=self.rank, shuffle=False
+            )
+            self.train_loader = DataLoader(
+                train_ds,
+                batch_size=cfg.train.batch_size,
+                sampler=train_sampler,
+                drop_last=True,
+                **loader_kw,
+            )
+            self.val_loader = DataLoader(
+                val_ds,
+                batch_size=cfg.train.batch_size * 2,
+                sampler=val_sampler,
+                **loader_kw,
+            )
             self.test_loader = None
             self._train_sampler = train_sampler
         else:
-            self.train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, shuffle=True, drop_last=True, **loader_kw)
-            self.val_loader = DataLoader(val_ds, batch_size=cfg.train.batch_size * 2, shuffle=False, **loader_kw)
+            self.train_loader = DataLoader(
+                train_ds,
+                batch_size=cfg.train.batch_size,
+                shuffle=True,
+                drop_last=True,
+                **loader_kw,
+            )
+            self.val_loader = DataLoader(
+                val_ds, batch_size=cfg.train.batch_size * 2, shuffle=False, **loader_kw
+            )
             self.test_loader = None
             self._train_sampler = None
 
         if self.is_main and self.test_task_names:
-            log.info(f"Test tasks ({len(self.test_task_names)}): " + "; ".join(self.test_task_names))
+            log.info(
+                f"Test tasks ({len(self.test_task_names)}): "
+                + "; ".join(self.test_task_names)
+            )
 
         # --- Scheduler ---
         steps_per_epoch = max(1, len(self.train_loader) // self.grad_accum_steps)
@@ -807,7 +913,9 @@ class Trainer:
     @staticmethod
     def _is_fatal_dist_error(exc: BaseException) -> bool:
         s = str(exc)
-        return any(kw in s for kw in ("NCCL", "CUDA error", "SIGABRT", "DistBackendError"))
+        return any(
+            kw in s for kw in ("NCCL", "CUDA error", "SIGABRT", "DistBackendError")
+        )
 
     def _sync_fatal_flag(self, fatal: bool) -> bool:
         return ddp_all_reduce_bool(fatal, op="or")
@@ -823,7 +931,9 @@ class Trainer:
         log.error(f"[Rank {self.rank}] {message}")
         if self.is_main:
             try:
-                self._save_checkpoint(-1 if epoch is None else epoch, float("inf"), "emergency")
+                self._save_checkpoint(
+                    -1 if epoch is None else epoch, float("inf"), "emergency"
+                )
             except Exception:
                 pass
         self._maybe_finish_wandb(exit_code=1)
@@ -851,14 +961,24 @@ class Trainer:
                 context = context.to(self.device, non_blocking=True)
                 target = target.to(self.device, non_blocking=True)
                 actions = actions.to(self.device, non_blocking=True)
-                goal = goal.to(self.device, non_blocking=True) if self.use_goal else None
+                goal = (
+                    goal.to(self.device, non_blocking=True) if self.use_goal else None
+                )
 
                 if train:
-                    is_last = (accum_step == self.grad_accum_steps - 1) or (batch_idx == len(loader) - 1)
-                    sync_ctx = nullcontext() if (not isinstance(self.model, DDP) or is_last) else self.model.no_sync()
+                    is_last = (accum_step == self.grad_accum_steps - 1) or (
+                        batch_idx == len(loader) - 1
+                    )
+                    sync_ctx = (
+                        nullcontext()
+                        if (not isinstance(self.model, DDP) or is_last)
+                        else self.model.no_sync()
+                    )
 
                     try:
-                        with sync_ctx, torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
+                        with sync_ctx, torch.amp.autocast(
+                            "cuda", enabled=self.use_amp, dtype=self.amp_dtype
+                        ):
                             if self.stage == 1:
                                 _, loss = self.model(context, target, goal)
                             else:
@@ -867,7 +987,9 @@ class Trainer:
                         self.scaler.scale(scaled).backward()
                     except RuntimeError as e:
                         if self._is_fatal_dist_error(e):
-                            log.error(f"[Rank {self.rank}] Fatal @ step {self.global_step}: {e}")
+                            log.error(
+                                f"[Rank {self.rank}] Fatal @ step {self.global_step}: {e}"
+                            )
                         raise
 
                     accum_loss += loss.detach().item()
@@ -876,7 +998,10 @@ class Trainer:
                     if is_last:
                         if self.cfg.train.grad_clip > 0:
                             self.scaler.unscale_(self.optimizer)
-                            nn.utils.clip_grad_norm_(unwrap_model(self.model).parameters(), self.cfg.train.grad_clip)
+                            nn.utils.clip_grad_norm_(
+                                unwrap_model(self.model).parameters(),
+                                self.cfg.train.grad_clip,
+                            )
 
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
@@ -905,13 +1030,19 @@ class Trainer:
                                     step=self.global_step,
                                 )
 
-                            pbar.set_postfix(loss=f"{avg:.4f}", lr=f"{lr:.2e}", epoch=self.current_epoch)
+                            pbar.set_postfix(
+                                loss=f"{avg:.4f}",
+                                lr=f"{lr:.2e}",
+                                epoch=self.current_epoch,
+                            )
 
                         accum_loss, accum_step = 0.0, 0
 
                 else:
                     try:
-                        with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
+                        with torch.amp.autocast(
+                            "cuda", enabled=self.use_amp, dtype=self.amp_dtype
+                        ):
                             if self.stage == 1:
                                 _, loss = self.model(context, target, goal)
                             else:
@@ -922,7 +1053,9 @@ class Trainer:
                         raise
 
                     if self.is_main:
-                        pbar.set_postfix(loss=f"{loss.item():.4f}", epoch=self.current_epoch)
+                        pbar.set_postfix(
+                            loss=f"{loss.item():.4f}", epoch=self.current_epoch
+                        )
 
                     total_loss += loss.item()
                     n_opt_steps += 1
@@ -953,6 +1086,7 @@ class Trainer:
     def _frames_to_uint8(frames):
         x = (frames.float().clamp(-1, 1) * 0.5 + 0.5) * 255.0
         arr = x.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
+        arr = np.rot90(arr, 2, axes=(1, 2)).copy()   # rotate 180 degrees
         return arr
 
     def _sync_model_before_logging(self):
@@ -1028,13 +1162,19 @@ class Trainer:
                 pred_np = self._frames_to_uint8(pred_frames[i])
 
                 if total_frames <= 2:
-                    parts = [ctx_np[f] for f in range(ctx_np.shape[0])] +                             [tgt_np[f] for f in range(tgt_np.shape[0])] +                             [pred_np[f] for f in range(pred_np.shape[0])]
+                    parts = (
+                        [ctx_np[f] for f in range(ctx_np.shape[0])]
+                        + [tgt_np[f] for f in range(tgt_np.shape[0])]
+                        + [pred_np[f] for f in range(pred_np.shape[0])]
+                    )
                     caption = "ctx|tgt|pred"
                     if self.use_goal and goals is not None:
                         goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
                         parts.append(goal_np[0])
                         caption = "ctx|tgt|pred|goal"
-                    media[f"val/sample_{i}"] = wandb.Image(np.concatenate(parts, axis=1), caption=caption)
+                    media[f"val/sample_{i}"] = wandb.Image(
+                        np.concatenate(parts, axis=1), caption=caption
+                    )
                 else:
                     media[f"val/sample_{i}_target"] = wandb.Video(
                         np.concatenate([ctx_np, tgt_np], axis=0).transpose(0, 3, 1, 2),
@@ -1048,7 +1188,9 @@ class Trainer:
                     )
                     if self.use_goal and goals is not None:
                         goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
-                        media[f"val/sample_{i}_goal"] = wandb.Image(goal_np[0], caption="goal")
+                        media[f"val/sample_{i}_goal"] = wandb.Image(
+                            goal_np[0], caption="goal"
+                        )
 
             wandb.log(media, step=self.global_step)
 
@@ -1105,13 +1247,19 @@ class Trainer:
                 pred_np = self._frames_to_uint8(pred_frames[i])
 
                 if total_frames <= 2:
-                    parts = [ctx_np[f] for f in range(ctx_np.shape[0])] +                             [tgt_np[f] for f in range(tgt_np.shape[0])] +                             [pred_np[f] for f in range(pred_np.shape[0])]
+                    parts = (
+                        [ctx_np[f] for f in range(ctx_np.shape[0])]
+                        + [tgt_np[f] for f in range(tgt_np.shape[0])]
+                        + [pred_np[f] for f in range(pred_np.shape[0])]
+                    )
                     caption = "ctx|tgt|pred"
                     if self.use_goal and goals is not None:
                         goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
                         parts.append(goal_np[0])
                         caption = "ctx|tgt|pred|goal"
-                    media[f"train/sample_{i}"] = wandb.Image(np.concatenate(parts, axis=1), caption=caption)
+                    media[f"train/sample_{i}"] = wandb.Image(
+                        np.concatenate(parts, axis=1), caption=caption
+                    )
                 else:
                     media[f"train/sample_{i}_target"] = wandb.Video(
                         np.concatenate([ctx_np, tgt_np], axis=0).transpose(0, 3, 1, 2),
@@ -1125,14 +1273,15 @@ class Trainer:
                     )
                     if self.use_goal and goals is not None:
                         goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
-                        media[f"train/sample_{i}_goal"] = wandb.Image(goal_np[0], caption="goal")
+                        media[f"train/sample_{i}_goal"] = wandb.Image(
+                            goal_np[0], caption="goal"
+                        )
 
             wandb.log(media, step=self.global_step)
 
         ddp_barrier()
 
     # --- Main loop ---
-
 
     def train(self):
         tcfg = self.cfg.train
@@ -1165,7 +1314,9 @@ class Trainer:
                     except RuntimeError as e:
                         if self._is_dataloader_timeout_error(e):
                             local_dl_timeout = True
-                            log.warning(f"[Rank {self.rank}] DL timeout epoch {epoch} attempt {attempt}/{max_dl_timeouts}: {e}")
+                            log.warning(
+                                f"[Rank {self.rank}] DL timeout epoch {epoch} attempt {attempt}/{max_dl_timeouts}: {e}"
+                            )
                             self.optimizer.zero_grad(set_to_none=True)
                         elif self._is_fatal_dist_error(e):
                             local_fatal = True
@@ -1174,7 +1325,10 @@ class Trainer:
                             raise
 
                     if self._sync_fatal_flag(local_fatal):
-                        self._abort_all_ranks("Synchronized fatal distributed/CUDA failure during training.", epoch=epoch)
+                        self._abort_all_ranks(
+                            "Synchronized fatal distributed/CUDA failure during training.",
+                            epoch=epoch,
+                        )
 
                     any_timeout = ddp_all_reduce_bool(local_dl_timeout, op="or")
                     all_ok = ddp_all_reduce_bool(train_ok, op="and")
@@ -1185,13 +1339,18 @@ class Trainer:
                     if any_timeout:
                         if attempt >= max_dl_timeouts:
                             if self.is_main:
-                                log.error(f"Max DataLoader timeouts reached at epoch {epoch}; marking train loss as inf and continuing.")
+                                log.error(
+                                    f"Max DataLoader timeouts reached at epoch {epoch}; marking train loss as inf and continuing."
+                                )
                             train_loss = float("inf")
                             break
                         ddp_barrier()
                         continue
 
-                    self._abort_all_ranks("Ranks diverged during training without a recognized synchronized timeout.", epoch=epoch)
+                    self._abort_all_ranks(
+                        "Ranks diverged during training without a recognized synchronized timeout.",
+                        epoch=epoch,
+                    )
 
                 val_loss = float("inf")
                 val_loss_raw = float("inf")
@@ -1200,14 +1359,27 @@ class Trainer:
                     val_loss_raw = val_loss
                 except RuntimeError as e:
                     if self._is_dataloader_timeout_error(e):
-                        log.warning(f"[Rank {self.rank}] DL timeout during val, using inf: {e}")
+                        log.warning(
+                            f"[Rank {self.rank}] DL timeout during val, using inf: {e}"
+                        )
                     elif self._is_fatal_dist_error(e):
-                        self._abort_all_ranks("Fatal distributed/CUDA failure during validation.", epoch=epoch)
+                        self._abort_all_ranks(
+                            "Fatal distributed/CUDA failure during validation.",
+                            epoch=epoch,
+                        )
                     else:
                         raise
 
                 test_every = int(tcfg.get("test_every", 1))
-                test_loss = self._test_loss() if (self.test_loader and test_every > 0 and (epoch + 1) % test_every == 0) else None
+                test_loss = (
+                    self._test_loss()
+                    if (
+                        self.test_loader
+                        and test_every > 0
+                        and (epoch + 1) % test_every == 0
+                    )
+                    else None
+                )
                 elapsed = time.time() - t0
 
                 ddp_barrier()
