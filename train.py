@@ -852,10 +852,6 @@ class Trainer:
                 resume="allow" if cfg.train.resume else None,
             )
 
-            wandb.define_metric("global_step")
-            wandb.define_metric("train/*", step_metric="global_step")
-            wandb.define_metric("val/*", step_metric="global_step")
-
     # --- Checkpointing ---
 
     def _save_checkpoint(self, epoch, val_loss, tag="last"):
@@ -1020,7 +1016,6 @@ class Trainer:
                                         "train/lr": lr,
                                         "train/epoch": self.current_epoch,
                                     },
-                                    step=self.global_step,
                                 )
 
                             pbar.set_postfix(
@@ -1187,7 +1182,7 @@ class Trainer:
 
             if val_loss is not None:
                 media["val/loss"] = val_loss
-            wandb.log(media, step=self.global_step)
+            wandb.log(media)
 
         ddp_barrier()
 
@@ -1272,7 +1267,7 @@ class Trainer:
                             goal_np[0], caption="goal"
                         )
 
-            wandb.log(media, step=self.global_step)
+            wandb.log(media)
 
         ddp_barrier()
 
