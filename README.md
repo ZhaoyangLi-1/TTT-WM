@@ -30,6 +30,9 @@ Set environment variables for outputs and logging:
 # Directory for saving outputs (logs, checkpoints, etc.)
 export TTT_WM_OUTPUTS_ROOT=your_folder_for_outputs
 
+# Directory for WANDB log
+export WANDB_DIR=your_wandb_log_folder
+
 # Weights & Biases API key (for experiment tracking)
 export WANDB_API_KEY=your_wandb_api_key
 ```
