@@ -1013,6 +1013,16 @@ class Trainer:
                         if self.is_main:
                             lr = self.scheduler.get_last_lr()[0]
 
+                            if self.use_wandb:
+                                wandb.log(
+                                    {
+                                        "train/loss": avg,
+                                        "train/lr": lr,
+                                        "train/epoch": self.current_epoch,
+                                    },
+                                    step=self.global_step,
+                                )
+
                             pbar.set_postfix(
                                 loss=f"{avg:.4f}",
                                 lr=f"{lr:.2e}",
@@ -1375,16 +1385,6 @@ class Trainer:
                     if test_loss is not None:
                         s += f"test{ema_tag} {test_loss:.6f} | "
                     log.info(s + f"{elapsed:.1f}s")
-
-                    if self.use_wandb:
-                        wandb.log(
-                            {
-                                "train/loss": train_loss,
-                                "train/lr": self.scheduler.get_last_lr()[0],
-                                "train/epoch": self.current_epoch,
-                            },
-                            step=self.global_step,
-                        )
 
                 self._log_val_videos(n_samples=3, val_loss=val_loss)
                 self._log_train_samples(n_samples=3)
