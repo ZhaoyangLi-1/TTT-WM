@@ -852,15 +852,9 @@ class Trainer:
                 resume="allow" if cfg.train.resume else None,
             )
 
-            # global step based metrics
             wandb.define_metric("global_step")
             wandb.define_metric("train/*", step_metric="global_step")
             wandb.define_metric("val/*", step_metric="global_step")
-
-            # epoch as staircase over global_step
-            wandb.define_metric("train/epoch", step_metric="global_step")
-            wandb.define_metric("epoch")
-            wandb.define_metric("epoch/*", step_metric="epoch")
 
     # --- Checkpointing ---
 
@@ -1019,17 +1013,6 @@ class Trainer:
                         if self.is_main:
                             lr = self.scheduler.get_last_lr()[0]
 
-                            if self.use_wandb:
-                                wandb.log(
-                                    {
-                                        "global_step": self.global_step,
-                                        "train/loss": avg,
-                                        "train/lr": lr,
-                                        "train/epoch": self.current_epoch,  # staircase epoch
-                                    },
-                                    step=self.global_step,
-                                )
-
                             pbar.set_postfix(
                                 loss=f"{avg:.4f}",
                                 lr=f"{lr:.2e}",
@@ -1112,7 +1095,7 @@ class Trainer:
         return torch.randperm(len(ds))[:n].tolist()
 
     @torch.no_grad()
-    def _log_val_videos(self, n_samples=4):
+    def _log_val_videos(self, n_samples=3, val_loss=None):
         if not self.cfg.get("wandb", {}).get("enabled", True):
             return
 
@@ -1192,12 +1175,14 @@ class Trainer:
                             goal_np[0], caption="goal"
                         )
 
+            if val_loss is not None:
+                media["val/loss"] = val_loss
             wandb.log(media, step=self.global_step)
 
         ddp_barrier()
 
     @torch.no_grad()
-    def _log_train_samples(self, n_samples=4):
+    def _log_train_samples(self, n_samples=3):
         if not self.cfg.get("wandb", {}).get("enabled", True):
             return
 
@@ -1391,23 +1376,18 @@ class Trainer:
                         s += f"test{ema_tag} {test_loss:.6f} | "
                     log.info(s + f"{elapsed:.1f}s")
 
-                    metrics = {
-                        "epoch": epoch,
-                        "epoch/train_loss": train_loss,
-                        "epoch/val_loss": val_loss,
-                        "epoch/val_loss_raw": val_loss_raw,
-                        "epoch/lr": self.scheduler.get_last_lr()[0],
-                    }
-                    if test_loss is not None:
-                        metrics["epoch/test_loss"] = test_loss
-
                     if self.use_wandb:
-                        wandb.log(metrics, step=self.global_step)
-                        if self.test_task_names:
-                            wandb.run.summary["test_tasks"] = list(self.test_task_names)
+                        wandb.log(
+                            {
+                                "train/loss": train_loss,
+                                "train/lr": self.scheduler.get_last_lr()[0],
+                                "train/epoch": self.current_epoch,
+                            },
+                            step=self.global_step,
+                        )
 
-                self._log_val_videos(n_samples=4)
-                self._log_train_samples(n_samples=4)
+                self._log_val_videos(n_samples=3, val_loss=val_loss)
+                self._log_train_samples(n_samples=3)
 
                 if self.is_main:
                     self._save_checkpoint(epoch, val_loss, tag="last")
@@ -1419,9 +1399,6 @@ class Trainer:
                         tag = f"best_epoch{epoch:04d}_loss{val_loss:.6f}"
                         self._save_checkpoint(epoch, val_loss, tag=tag)
                         self.best_ckpt_path = self.ckpt_dir / f"{tag}.pt"
-                        if self.use_wandb:
-                            wandb.run.summary["best_val_loss"] = val_loss
-                            wandb.run.summary["best_epoch"] = epoch
 
                     if (epoch + 1) % tcfg.save_every == 0:
                         self._save_checkpoint(epoch, val_loss, tag=f"epoch_{epoch:04d}")

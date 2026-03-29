@@ -65,7 +65,7 @@ train:
   stage1_ckpt: ""          # path to Stage 1 checkpoint (required for stage 2)
   freeze_backbone: true    # freeze Stage 1 backbone in stage 2
   resume: ""
-  test_every: 20
+  test_every: 2
   device: "auto"           # auto → cuda > mps > cpu
   find_unused_parameters: false
 
