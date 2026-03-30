@@ -335,6 +335,8 @@ class InverseDynamicsModelDP(nn.Module):
         for obs_key in self.obs_keys:
             normalizer[obs_key] = self._image_normalizer_factory()
         self.policy.set_normalizer(normalizer)
+        policy_device = next(self.policy.parameters()).device
+        self.policy.normalizer.to(device=policy_device)
 
     @staticmethod
     def _frames_to_policy_range(frames: torch.Tensor) -> torch.Tensor:
