@@ -9,6 +9,7 @@ from contextlib import nullcontext
 import hydra
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import tqdm
 from omegaconf import OmegaConf
@@ -156,7 +157,17 @@ class TrainDiffusionWorkspace(BaseWorkspace):
         val_dataset = dataset.get_validation_dataset()
         val_dataloader = self._build_dataloader(val_dataset, cfg.val_dataloader)
 
-        normalizer = dataset.get_normalizer()
+        if self.is_main:
+            print("Building dataset normalizer...")
+        normalizer = dataset.get_normalizer() if self.is_main or self.world_size == 1 else None
+        if self.world_size > 1:
+            normalizer_state_list = [normalizer.state_dict() if normalizer is not None else None]
+            dist.broadcast_object_list(normalizer_state_list, src=0)
+            if not self.is_main:
+                normalizer = copy.deepcopy(self.model.normalizer)
+                normalizer.load_state_dict(normalizer_state_list[0])
+        if self.is_main:
+            print("Dataset normalizer ready.")
         self.model.set_normalizer(normalizer)
         if self.ema_model is not None:
             self.ema_model.set_normalizer(normalizer)
@@ -184,6 +195,8 @@ class TrainDiffusionWorkspace(BaseWorkspace):
 
         device = self._resolve_training_device(cfg)
         self.device = device
+        if self.is_main:
+            print(f"Moving models to device: {device}")
         self.model.to(device)
         if self.ema_model is not None:
             self.ema_model.to(device)
@@ -193,9 +206,17 @@ class TrainDiffusionWorkspace(BaseWorkspace):
             if device.type == "cuda":
                 ddp_kwargs["device_ids"] = [self.local_rank]
                 ddp_kwargs["output_device"] = self.local_rank
+            if self.is_main:
+                print("Wrapping model with DistributedDataParallel...")
             self.ddp_model = DDP(self.model, **ddp_kwargs)
         train_model = self.ddp_model if self.ddp_model is not None else self.model
 
+        if self.is_main:
+            print(
+                "Initializing experiment logging"
+                f" (enabled={bool(OmegaConf.select(cfg, 'logging.enabled', default=True))},"
+                f" mode={OmegaConf.select(cfg, 'logging.mode', default='online')})..."
+            )
         wandb_run = self._init_wandb(cfg)
         topk_manager = (
             TopKCheckpointManager(
