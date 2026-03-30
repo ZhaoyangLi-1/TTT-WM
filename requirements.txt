@@ -12,11 +12,13 @@ omegaconf
 wandb
 tqdm
 imageio
+imageio-ffmpeg
 h5py
 pyarrow
 dill
 diffusers
 einops
+matplotlib
 numcodecs<=0.13.1
 robomimic==0.2.0
 zarr<3.5
