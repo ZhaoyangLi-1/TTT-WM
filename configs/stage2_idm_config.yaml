@@ -3,31 +3,76 @@ defaults:
   - _self_
 
 experiment_name: cosmos_stage2_idm_dp_gap_${data.frame_gap}
+seed: 42
 
 data:
   use_goal: false
+  frame_gap: 4
+  test_task_count: 3
+  test_tasks: []
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+  loader_timeout: 600
+
+ema:
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 32
+  num_workers: 8
+  shuffle: true
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+
+val_dataloader:
+  batch_size: 32
+  num_workers: 8
+  shuffle: false
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
 
 train:
   compile: false
-  epochs: 100
-  batch_size: 64
+  epochs: 300
+  batch_size: 32
+  gradient_accumulate_every: 1
   optimizer:
     lr: 1.0e-4
     weight_decay: 1.0e-6
     betas: [0.95, 0.999]
-    no_decay_norm: true
+    eps: 1.0e-8
+    no_decay_norm: false
   scheduler:
-    warmup_fraction: 0.02
-  ema:
-    enabled: true
-    decay: 0.9999
-    update_every: 1
-  save_every: 10
+    type: cosine
+    warmup_fraction: 0.0
+    min_lr: 0.0
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  checkpoint_every: 10
+  val_every: 1
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  grad_clip: 1.0
+  amp: true
+  amp_dtype: bf16
   stage: 2
   stage1_ckpt: ""
   freeze_backbone: true
   idm_type: diffusion_policy
+  find_unused_parameters: false
   idm_dp:
+    horizon: 4
+    n_obs_steps: 1
+    n_action_steps: 2
     num_train_timesteps: 100
     num_inference_steps: 100
     beta_start: 0.0001
@@ -36,8 +81,8 @@ train:
     variance_type: fixed_small
     clip_sample: true
     prediction_type: epsilon
-    obs_as_global_cond: true
-    crop_shape: [84, 84]
+    obs_as_global_cond: false
+    crop_shape: [224, 224]
     obs_encoder_group_norm: true
     eval_fixed_crop: true
     diffusion_step_embed_dim: 128
@@ -45,3 +90,17 @@ train:
     kernel_size: 5
     n_groups: 8
     cond_predict_scale: true
+
+wandb:
+  enabled: true
+  project: TTT-WM-diffusion
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${experiment_name}
+  mode: online
+  resume: false
+  tags:
+    - diffusion_policy
+    - ttt_wm
+    - stage2_idm
+    - ${experiment_name}
+  id: null
+  group: null

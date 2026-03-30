@@ -238,20 +238,45 @@ def resolve_amp_dtype(amp_dtype: str) -> torch.dtype:
 
 
 class EMA:
-    def __init__(self, model: nn.Module, decay: float):
+    def __init__(
+        self,
+        model: nn.Module,
+        decay: float | None = None,
+        *,
+        update_after_step: int = 0,
+        inv_gamma: float = 1.0,
+        power: float = 0.75,
+        min_value: float = 0.0,
+        max_value: float = 0.9999,
+    ):
         self.decay = decay
+        self.update_after_step = int(update_after_step)
+        self.inv_gamma = float(inv_gamma)
+        self.power = float(power)
+        self.min_value = float(min_value)
+        self.max_value = float(max_value)
         self.num_updates = 0
         self.shadow = copy.deepcopy(model)
         self.shadow.eval()
         for p in self.shadow.parameters():
             p.requires_grad_(False)
 
+    def _get_decay(self) -> float:
+        if self.decay is not None:
+            return min(self.decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
+
+        step = max(int(self.num_updates) - self.update_after_step - 1, 0)
+        if step <= 0:
+            return 0.0
+        value = 1.0 - (1.0 + step / self.inv_gamma) ** (-self.power)
+        return min(max(value, self.min_value), self.max_value)
+
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
-        d = min(self.decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
+        d = self._get_decay()
         self.num_updates += 1
         for s, m in zip(self.shadow.parameters(), model.parameters()):
-            s.data.mul_(d).add_(m.data, alpha=1.0 - d)
+            s.data.lerp_(m.data, 1.0 - d)
         for s_buf, m_buf in zip(self.shadow.buffers(), model.buffers()):
             s_buf.data.copy_(m_buf.data)
 
@@ -266,10 +291,18 @@ class EMA:
         del self._backup
 
     def state_dict(self) -> dict:
-        return self.shadow.state_dict()
+        return {
+            "shadow": self.shadow.state_dict(),
+            "num_updates": self.num_updates,
+        }
 
     def load_state_dict(self, state: dict) -> None:
+        if "shadow" in state:
+            self.shadow.load_state_dict(state["shadow"])
+            self.num_updates = int(state.get("num_updates", 0))
+            return
         self.shadow.load_state_dict(state)
+        self.num_updates = 0
 
 
 # ---------------------------------------------------------------------------
@@ -280,12 +313,14 @@ class EMA:
 def build_optimizer(
     model: nn.Module, opt_cfg: DictConfig, is_main: bool
 ) -> torch.optim.Optimizer:
+    eps = float(opt_cfg.get("eps", 1.0e-8))
     if not opt_cfg.no_decay_norm:
         return torch.optim.AdamW(
             model.parameters(),
             lr=opt_cfg.lr,
             weight_decay=opt_cfg.weight_decay,
             betas=tuple(opt_cfg.betas),
+            eps=eps,
         )
 
     no_decay_types = (nn.LayerNorm, nn.GroupNorm, nn.Embedding)
@@ -311,20 +346,35 @@ def build_optimizer(
         ],
         lr=opt_cfg.lr,
         betas=tuple(opt_cfg.betas),
+        eps=eps,
     )
 
 
-def build_scheduler(optimizer, sched_cfg, base_lr, total_steps, is_main: bool):
-    sched_type = sched_cfg.get("type", "cosine").lower()
-    warmup_fraction = float(sched_cfg.get("warmup_fraction", 0.0))
+def build_scheduler(
+    optimizer,
+    sched_cfg,
+    base_lr,
+    total_steps,
+    is_main: bool,
+    *,
+    sched_type_override: str | None = None,
+    num_warmup_steps: int | None = None,
+):
+    sched_type = str(
+        sched_type_override if sched_type_override is not None else sched_cfg.get("type", "cosine")
+    ).lower()
     min_lr = float(sched_cfg.get("min_lr", 0.0))
 
     total_steps = max(1, int(total_steps))
-    warmup_steps = (
-        min(total_steps - 1, int(total_steps * warmup_fraction))
-        if total_steps > 1
-        else 0
-    )
+    if num_warmup_steps is not None:
+        warmup_steps = min(total_steps - 1, max(int(num_warmup_steps), 0)) if total_steps > 1 else 0
+    else:
+        warmup_fraction = float(sched_cfg.get("warmup_fraction", 0.0))
+        warmup_steps = (
+            min(total_steps - 1, int(total_steps * warmup_fraction))
+            if total_steps > 1
+            else 0
+        )
     min_lr_ratio = min_lr / base_lr if base_lr > 0 else 0.0
 
     if sched_type != "cosine":
@@ -674,6 +724,9 @@ def build_datasets(data_cfg, model_cfg, is_main: bool):
 class Trainer:
     def __init__(self, cfg: DictConfig):
         self.cfg = cfg
+        self.seed = int(
+            OmegaConf.select(cfg, "seed", default=OmegaConf.select(cfg, "training.seed", default=42))
+        )
 
         nccl_timeout_min = int(cfg.train.get("nccl_timeout_min", 30))
         self.rank, self.local_rank, self.world_size = setup_ddp(
@@ -704,17 +757,68 @@ class Trainer:
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
 
-        torch.manual_seed(cfg.seed + self.rank)
+        torch.manual_seed(self.seed + self.rank)
 
-        self.grad_accum_steps = int(cfg.train.get("grad_accum_steps", 1))
+        self.grad_accum_steps = int(
+            OmegaConf.select(
+                cfg,
+                "train.gradient_accumulate_every",
+                default=cfg.train.get("grad_accum_steps", 1),
+            )
+        )
         self.current_epoch = 0
         self.compile_enabled = False
         self.idm_type = str(cfg.train.get("idm_type", "mlp")).lower()
+        self.num_epochs = int(
+            OmegaConf.select(cfg, "training.num_epochs", default=cfg.train.get("epochs", 1))
+        )
+        self.train_batch_size = int(
+            OmegaConf.select(cfg, "dataloader.batch_size", default=cfg.train.get("batch_size", 1))
+        )
+        self.val_batch_size = int(
+            OmegaConf.select(
+                cfg,
+                "val_dataloader.batch_size",
+                default=self.train_batch_size * 2,
+            )
+        )
+        self.val_every = int(
+            OmegaConf.select(
+                cfg,
+                "train.val_every",
+                default=OmegaConf.select(cfg, "training.val_every", default=1),
+            )
+        )
+        self.sample_every = int(
+            OmegaConf.select(
+                cfg,
+                "train.sample_every",
+                default=OmegaConf.select(cfg, "training.sample_every", default=1),
+            )
+        )
+        self.checkpoint_every = int(
+            OmegaConf.select(
+                cfg,
+                "train.checkpoint_every",
+                default=OmegaConf.select(cfg, "training.checkpoint_every", default=1),
+            )
+        )
+        self.max_train_steps = OmegaConf.select(
+            cfg,
+            "train.max_train_steps",
+            default=OmegaConf.select(cfg, "training.max_train_steps", default=None),
+        )
+        self.max_val_steps = OmegaConf.select(
+            cfg,
+            "train.max_val_steps",
+            default=OmegaConf.select(cfg, "training.max_val_steps", default=None),
+        )
+        self.ema_update_every = 1
 
         if self.is_main:
-            eff = cfg.train.batch_size * self.grad_accum_steps * self.world_size
+            eff = self.train_batch_size * self.grad_accum_steps * self.world_size
             log.info(
-                f"micro_batch={cfg.train.batch_size} | accum={self.grad_accum_steps} | "
+                f"micro_batch={self.train_batch_size} | accum={self.grad_accum_steps} | "
                 f"world={self.world_size} | eff_batch={eff}"
             )
 
@@ -815,11 +919,46 @@ class Trainer:
                     log.info("torch.compile enabled")
 
         # --- EMA ---
-        ema_cfg = cfg.train.ema
+        dp_ema_cfg = OmegaConf.select(cfg, "ema", default=None)
+        legacy_ema_cfg = OmegaConf.select(cfg, "train.ema", default=None)
         raw = unwrap_model(self.model)
-        self.ema = EMA(raw, decay=ema_cfg.decay) if ema_cfg.enabled else None
+        if dp_ema_cfg is not None:
+            use_ema = bool(OmegaConf.select(cfg, "training.use_ema", default=True))
+            self.ema = (
+                EMA(
+                    raw,
+                    update_after_step=int(dp_ema_cfg.update_after_step),
+                    inv_gamma=float(dp_ema_cfg.inv_gamma),
+                    power=float(dp_ema_cfg.power),
+                    min_value=float(dp_ema_cfg.min_value),
+                    max_value=float(dp_ema_cfg.max_value),
+                )
+                if use_ema
+                else None
+            )
+            self.ema_update_every = 1
+        else:
+            self.ema = (
+                EMA(raw, decay=float(legacy_ema_cfg.decay))
+                if legacy_ema_cfg is not None and legacy_ema_cfg.enabled
+                else None
+            )
+            self.ema_update_every = int(
+                legacy_ema_cfg.update_every if legacy_ema_cfg is not None else 1
+            )
         if self.ema and self.is_main:
-            log.info(f"EMA decay={ema_cfg.decay} update_every={ema_cfg.update_every}")
+            if dp_ema_cfg is not None:
+                log.info(
+                    "EMA enabled"
+                    f" update_after_step={int(dp_ema_cfg.update_after_step)}"
+                    f" inv_gamma={float(dp_ema_cfg.inv_gamma)}"
+                    f" power={float(dp_ema_cfg.power)}"
+                    f" max_value={float(dp_ema_cfg.max_value)}"
+                )
+            else:
+                log.info(
+                    f"EMA decay={float(legacy_ema_cfg.decay)} update_every={self.ema_update_every}"
+                )
 
         # --- Optimizer ---
         if self.stage == 2 and bool(cfg.train.get("freeze_backbone", True)):
@@ -831,6 +970,7 @@ class Trainer:
                 lr=cfg.train.optimizer.lr,
                 weight_decay=cfg.train.optimizer.weight_decay,
                 betas=tuple(cfg.train.optimizer.betas),
+                eps=float(cfg.train.optimizer.get("eps", 1.0e-8)),
             )
         else:
             self.optimizer = build_optimizer(
@@ -865,23 +1005,69 @@ class Trainer:
             if self.is_main:
                 log.info("Loaded train action stats into stage-2 diffusion-policy IDM.")
         self.test_task_names = list(getattr(train_ds, "test_tasks", ()))
-        n_workers = cfg.data.num_workers
         dl_timeout = int(cfg.data.get("loader_timeout", 600))
 
-        loader_kw = dict(
-            num_workers=n_workers,
-            pin_memory=cfg.data.pin_memory and self.device.type == "cuda",
-            persistent_workers=n_workers > 0,
-            prefetch_factor=(
-                cfg.data.get("prefetch_factor", 4) if n_workers > 0 else None
-            ),
-            timeout=dl_timeout if n_workers > 0 else 0,
+        def _loader_kwargs(cfg_path: str, *, fallback_workers: int | None = None) -> dict:
+            n_workers = int(
+                OmegaConf.select(
+                    cfg,
+                    f"{cfg_path}.num_workers",
+                    default=(
+                        fallback_workers
+                        if fallback_workers is not None
+                        else cfg.data.num_workers
+                    ),
+                )
+            )
+            pin_memory = bool(
+                OmegaConf.select(
+                    cfg,
+                    f"{cfg_path}.pin_memory",
+                    default=cfg.data.pin_memory,
+                )
+            ) and self.device.type == "cuda"
+            persistent_workers = bool(
+                OmegaConf.select(
+                    cfg,
+                    f"{cfg_path}.persistent_workers",
+                    default=cfg.data.get("persistent_workers", True),
+                )
+            ) and n_workers > 0
+            prefetch_factor = (
+                int(
+                    OmegaConf.select(
+                        cfg,
+                        f"{cfg_path}.prefetch_factor",
+                        default=cfg.data.get("prefetch_factor", 4),
+                    )
+                )
+                if n_workers > 0
+                else None
+            )
+            return dict(
+                num_workers=n_workers,
+                pin_memory=pin_memory,
+                persistent_workers=persistent_workers,
+                prefetch_factor=prefetch_factor,
+                timeout=dl_timeout if n_workers > 0 else 0,
+            )
+
+        train_loader_kw = _loader_kwargs("dataloader")
+        val_loader_kw = _loader_kwargs(
+            "val_dataloader",
+            fallback_workers=train_loader_kw["num_workers"],
         )
         if self.is_main:
             log.info(
-                f"DataLoader: workers={n_workers}, "
-                f"persistent={n_workers > 0}, "
-                f"prefetch={loader_kw.get('prefetch_factor', 'N/A')}, "
+                f"Train DataLoader: workers={train_loader_kw['num_workers']}, "
+                f"persistent={train_loader_kw['persistent_workers']}, "
+                f"prefetch={train_loader_kw.get('prefetch_factor', 'N/A')}, "
+                f"timeout={dl_timeout}s"
+            )
+            log.info(
+                f"Val DataLoader: workers={val_loader_kw['num_workers']}, "
+                f"persistent={val_loader_kw['persistent_workers']}, "
+                f"prefetch={val_loader_kw.get('prefetch_factor', 'N/A')}, "
                 f"timeout={dl_timeout}s"
             )
             log.info("Creating train DataLoader...")
@@ -895,16 +1081,16 @@ class Trainer:
             )
             self.train_loader = DataLoader(
                 train_ds,
-                batch_size=cfg.train.batch_size,
+                batch_size=self.train_batch_size,
                 sampler=train_sampler,
                 drop_last=True,
-                **loader_kw,
+                **train_loader_kw,
             )
             self.val_loader = DataLoader(
                 val_ds,
-                batch_size=cfg.train.batch_size * 2,
+                batch_size=self.val_batch_size,
                 sampler=val_sampler,
-                **loader_kw,
+                **val_loader_kw,
             )
             self.test_loader = None
             self._train_sampler = train_sampler
@@ -913,13 +1099,16 @@ class Trainer:
         else:
             self.train_loader = DataLoader(
                 train_ds,
-                batch_size=cfg.train.batch_size,
+                batch_size=self.train_batch_size,
                 shuffle=True,
                 drop_last=True,
-                **loader_kw,
+                **train_loader_kw,
             )
             self.val_loader = DataLoader(
-                val_ds, batch_size=cfg.train.batch_size * 2, shuffle=False, **loader_kw
+                val_ds,
+                batch_size=self.val_batch_size,
+                shuffle=False,
+                **val_loader_kw,
             )
             self.test_loader = None
             self._train_sampler = None
@@ -932,13 +1121,15 @@ class Trainer:
 
         # --- Scheduler ---
         steps_per_epoch = max(1, len(self.train_loader) // self.grad_accum_steps)
-        total_steps = cfg.train.epochs * steps_per_epoch
+        total_steps = self.num_epochs * steps_per_epoch
         self.scheduler = build_scheduler(
             self.optimizer,
-            cfg.train.scheduler,
+            cfg.train.get("scheduler", {}),
             cfg.train.optimizer.lr,
             total_steps,
             self.is_main,
+            sched_type_override=OmegaConf.select(cfg, "train.lr_scheduler", default=None),
+            num_warmup_steps=OmegaConf.select(cfg, "train.lr_warmup_steps", default=None),
         )
 
         # --- State ---
@@ -955,16 +1146,25 @@ class Trainer:
             self._load_checkpoint(cfg.train.resume)
 
         # --- wandb ---
-        wandb_cfg = cfg.get("wandb", {})
-        self.use_wandb = self.is_main and wandb_cfg.get("enabled", True)
+        self.wandb_cfg = cfg.get("wandb", None) or cfg.get("logging", {})
+        self.wandb_enabled = bool(self.wandb_cfg.get("enabled", True))
+        self.use_wandb = self.is_main and self.wandb_enabled
         if self.use_wandb:
             if self.is_main:
                 log.info("Initializing wandb...")
+            wandb_resume = bool(
+                self.wandb_cfg.get("resume", bool(cfg.train.get("resume", "")))
+            )
+            wandb_tags = self.wandb_cfg.get("tags", None)
             wandb.init(
-                project=wandb_cfg.get("project", "TTT-WM"),
-                name=wandb_cfg.get("name", cfg.experiment_name),
+                project=self.wandb_cfg.get("project", "TTT-WM"),
+                name=self.wandb_cfg.get("name", cfg.experiment_name),
                 config=OmegaConf.to_container(cfg, resolve=True),
-                resume="allow" if cfg.train.resume else None,
+                mode=self.wandb_cfg.get("mode", None),
+                tags=list(wandb_tags) if wandb_tags is not None else None,
+                group=self.wandb_cfg.get("group", None),
+                id=self.wandb_cfg.get("id", None),
+                resume="allow" if wandb_resume else None,
             )
             if self.is_main:
                 log.info("wandb initialized.")
@@ -1050,7 +1250,6 @@ class Trainer:
     def _run_epoch(self, loader, train):
         self.model.train(train)
         total_loss, n_opt_steps = 0.0, 0
-        ema_cfg = self.cfg.train.ema
 
         pbar = tqdm(
             loader,
@@ -1126,7 +1325,7 @@ class Trainer:
                         self.scheduler.step()
                         self.global_step += 1
 
-                        if self.ema and self.global_step % ema_cfg.update_every == 0:
+                        if self.ema and self.global_step % self.ema_update_every == 0:
                             self.ema.update(unwrap_model(self.model))
 
                         avg = accum_loss / self.grad_accum_steps
@@ -1155,6 +1354,9 @@ class Trainer:
                             log.info(f"First optimizer step done (loss={avg:.4f}), training is running normally.")
                         accum_loss, accum_step = 0.0, 0
 
+                        if self.max_train_steps is not None and (batch_idx + 1) >= int(self.max_train_steps):
+                            break
+
                 else:
                     try:
                         with torch.amp.autocast(
@@ -1176,6 +1378,9 @@ class Trainer:
 
                     total_loss += loss.item()
                     n_opt_steps += 1
+
+                    if self.max_val_steps is not None and (batch_idx + 1) >= int(self.max_val_steps):
+                        break
 
         avg = total_loss / max(n_opt_steps, 1)
         if self.world_size > 1 and not train:
@@ -1230,7 +1435,7 @@ class Trainer:
 
     @torch.no_grad()
     def _log_val_videos(self, n_samples=3, val_loss=None):
-        if not self.cfg.get("wandb", {}).get("enabled", True):
+        if not self.wandb_enabled:
             return
 
         ddp_barrier()
@@ -1317,7 +1522,7 @@ class Trainer:
 
     @torch.no_grad()
     def _log_train_samples(self, n_samples=3):
-        if not self.cfg.get("wandb", {}).get("enabled", True):
+        if not self.wandb_enabled:
             return
 
         ddp_barrier()
@@ -1408,7 +1613,7 @@ class Trainer:
 
         if self.is_main:
             log.info(
-                f"Training {tcfg.epochs} epochs | batch={tcfg.batch_size} | "
+                f"Training {self.num_epochs} epochs | batch={self.train_batch_size} | "
                 f"accum={self.grad_accum_steps} | world={self.world_size}"
             )
 
@@ -1419,7 +1624,7 @@ class Trainer:
                 log.info("Entering training loop...")
 
         try:
-            for epoch in range(self.start_epoch, tcfg.epochs):
+            for epoch in range(self.start_epoch, self.num_epochs):
                 self.current_epoch = epoch
 
                 if self._train_sampler:
@@ -1477,29 +1682,34 @@ class Trainer:
                         epoch=epoch,
                     )
 
-                val_loss = float("inf")
-                val_loss_raw = float("inf")
-                try:
-                    val_loss = self._val_loss()
-                    val_loss_raw = val_loss
-                except RuntimeError as e:
-                    if self._is_dataloader_timeout_error(e):
-                        log.warning(
-                            f"[Rank {self.rank}] DL timeout during val, using inf: {e}"
-                        )
-                    elif self._is_fatal_dist_error(e):
-                        self._abort_all_ranks(
-                            "Fatal distributed/CUDA failure during validation.",
-                            epoch=epoch,
-                        )
-                    else:
-                        raise
+                ran_val = (epoch % self.val_every) == 0
+                val_loss = float("nan")
+                val_loss_raw = float("nan")
+                if ran_val:
+                    try:
+                        val_loss = self._val_loss()
+                        val_loss_raw = val_loss
+                    except RuntimeError as e:
+                        if self._is_dataloader_timeout_error(e):
+                            log.warning(
+                                f"[Rank {self.rank}] DL timeout during val, using inf: {e}"
+                            )
+                            val_loss = float("inf")
+                            val_loss_raw = float("inf")
+                        elif self._is_fatal_dist_error(e):
+                            self._abort_all_ranks(
+                                "Fatal distributed/CUDA failure during validation.",
+                                epoch=epoch,
+                            )
+                        else:
+                            raise
 
                 test_every = int(tcfg.get("test_every", 1))
                 test_loss = (
                     self._test_loss()
                     if (
                         self.test_loader
+                        and ran_val
                         and test_every > 0
                         and (epoch + 1) % test_every == 0
                     )
@@ -1511,18 +1721,23 @@ class Trainer:
 
                 if self.is_main:
                     ema_tag = " [EMA]" if self.ema else ""
-                    s = f"epoch {epoch:04d} | train {train_loss:.6f} | val{ema_tag} {val_loss:.6f} | val[raw] {val_loss_raw:.6f} | "
+                    s = f"epoch {epoch:04d} | train {train_loss:.6f} | "
+                    if ran_val:
+                        s += f"val{ema_tag} {val_loss:.6f} | val[raw] {val_loss_raw:.6f} | "
                     if test_loss is not None:
                         s += f"test{ema_tag} {test_loss:.6f} | "
                     log.info(s + f"{elapsed:.1f}s")
 
-                self._log_val_videos(n_samples=3, val_loss=val_loss)
-                self._log_train_samples(n_samples=3)
+                if (epoch % self.sample_every) == 0:
+                    if ran_val:
+                        self._log_val_videos(n_samples=3, val_loss=val_loss)
+                    self._log_train_samples(n_samples=3)
 
                 if self.is_main:
-                    self._save_checkpoint(epoch, val_loss, tag="last")
+                    if (epoch % self.checkpoint_every) == 0:
+                        self._save_checkpoint(epoch, val_loss, tag="last")
 
-                    if val_loss < self.best_val_loss:
+                    if ran_val and val_loss < self.best_val_loss:
                         if self.best_ckpt_path and self.best_ckpt_path.exists():
                             self.best_ckpt_path.unlink()
                         self.best_val_loss = val_loss
@@ -1530,7 +1745,7 @@ class Trainer:
                         self._save_checkpoint(epoch, val_loss, tag=tag)
                         self.best_ckpt_path = self.ckpt_dir / f"{tag}.pt"
 
-                    if (epoch + 1) % tcfg.save_every == 0:
+                    if (epoch % self.checkpoint_every) == 0:
                         self._save_checkpoint(epoch, val_loss, tag=f"epoch_{epoch:04d}")
 
                 ddp_barrier()

@@ -181,6 +181,9 @@ class InverseDynamicsModelDP(nn.Module):
         n_actions: int,
         freeze_backbone: bool = True,
         *,
+        horizon: Optional[int] = None,
+        n_action_steps: Optional[int] = None,
+        n_obs_steps: int = 1,
         num_train_timesteps: int = 100,
         num_inference_steps: Optional[int] = None,
         beta_start: float = 0.0001,
@@ -222,6 +225,11 @@ class InverseDynamicsModelDP(nn.Module):
         cfg = stage1_model.cfg
         self.cfg = cfg
         self.n_actions = int(n_actions)
+        self.horizon = int(horizon) if horizon is not None else self.n_actions
+        self.n_action_steps = (
+            int(n_action_steps) if n_action_steps is not None else self.n_actions
+        )
+        self.n_obs_steps = int(n_obs_steps)
         self.freeze_backbone = freeze_backbone
 
         self.stage1 = stage1_model
@@ -258,9 +266,9 @@ class InverseDynamicsModelDP(nn.Module):
         self.policy = DiffusionUnetHybridImagePolicy(
             shape_meta=shape_meta,
             noise_scheduler=noise_scheduler,
-            horizon=self.n_actions,
-            n_action_steps=self.n_actions,
-            n_obs_steps=1,
+            horizon=self.horizon,
+            n_action_steps=self.n_action_steps,
+            n_obs_steps=self.n_obs_steps,
             num_inference_steps=num_inference_steps,
             obs_as_global_cond=obs_as_global_cond,
             crop_shape=tuple(crop_shape),
