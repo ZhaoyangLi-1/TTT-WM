@@ -772,6 +772,17 @@ class Trainer:
                 f"Stage: {self.stage} | Params: {np_:.2f}M | Trainable: {nt_:.2f}M"
             )
 
+        using_diffusion_policy_idm = (
+            self.stage == 2 and self.idm_type in {"dp", "diffusion", "diffusion_policy"}
+        )
+        if self.world_size > 1 and using_diffusion_policy_idm and hasattr(torch, "_dynamo"):
+            torch._dynamo.config.optimize_ddp = False
+            if self.is_main:
+                log.info(
+                    "Disabled TorchDynamo DDP optimizer for stage=2 diffusion_policy IDM "
+                    "to avoid flex_attention compile failures under DDP."
+                )
+
         # --- DDP ---
         if self.world_size > 1:
             self.model = DDP(
@@ -789,9 +800,6 @@ class Trainer:
 
         # --- torch.compile ---
         compile_requested = bool(cfg.train.get("compile", False))
-        using_diffusion_policy_idm = (
-            self.stage == 2 and self.idm_type in {"dp", "diffusion", "diffusion_policy"}
-        )
         if compile_requested and hasattr(torch, "compile"):
             if using_diffusion_policy_idm:
                 if self.is_main:
