@@ -212,9 +212,7 @@ class InverseDynamicsModelDP(nn.Module):
                 LinearNormalizer,
                 SingleFieldLinearNormalizer,
             )
-            from diffusion_policy.policy.diffusion_unet_hybrid_image_policy import (
-                DiffusionUnetHybridImagePolicy,
-            )
+            from dp.policy import TTTWMDiffusionPolicy
         except ImportError as exc:
             raise ImportError(
                 "InverseDynamicsModelDP requires `diffusers` and `diffusion_policy`. "
@@ -263,7 +261,7 @@ class InverseDynamicsModelDP(nn.Module):
             clip_sample=clip_sample,
             prediction_type=prediction_type,
         )
-        self.policy = DiffusionUnetHybridImagePolicy(
+        self.policy = TTTWMDiffusionPolicy(
             shape_meta=shape_meta,
             noise_scheduler=noise_scheduler,
             horizon=self.horizon,
