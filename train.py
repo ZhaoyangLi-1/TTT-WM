@@ -1016,6 +1016,8 @@ class Trainer:
 
         with grad_ctx:
             for batch_idx, (context, target, actions, goal) in enumerate(pbar):
+                if batch_idx == 0 and self.is_main:
+                    log.info(f"First batch loaded ({'train' if train else 'val'}), running forward pass (compiling if first epoch)...")
                 context = context.to(self.device, non_blocking=True)
                 target = target.to(self.device, non_blocking=True)
                 actions = actions.to(self.device, non_blocking=True)
@@ -1092,6 +1094,8 @@ class Trainer:
                                 epoch=self.current_epoch,
                             )
 
+                        if n_opt_steps == 1 and self.is_main:
+                            log.info(f"First optimizer step done (loss={avg:.4f}), training is running normally.")
                         accum_loss, accum_step = 0.0, 0
 
                 else:
@@ -1350,6 +1354,9 @@ class Trainer:
                 f"Training {tcfg.epochs} epochs | batch={tcfg.batch_size} | "
                 f"accum={self.grad_accum_steps} | world={self.world_size}"
             )
+
+        if self.is_main:
+            log.info("Entering training loop (first batch may be slow due to torch.compile)...")
 
         try:
             for epoch in range(self.start_epoch, tcfg.epochs):
