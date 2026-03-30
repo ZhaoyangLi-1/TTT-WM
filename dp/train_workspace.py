@@ -224,7 +224,7 @@ class TrainDiffusionWorkspace(BaseWorkspace):
                 ddp_kwargs["output_device"] = self.local_rank
             if self.is_main:
                 print("Wrapping model with DistributedDataParallel...")
-            self.ddp_model = DDP(self.model, **ddp_kwargs)
+            self.ddp_model = DDP(self.model, find_unused_parameters=True, **ddp_kwargs)
         train_model = self.ddp_model if self.ddp_model is not None else self.model
 
         if self.is_main:
