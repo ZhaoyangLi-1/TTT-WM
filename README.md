@@ -51,10 +51,6 @@ git clone https://huggingface.co/datasets/JeffreyLii/libero_wm
 export TTT_WM_DATA_ROOT=your_folder_for_libero_wm
 ```
 
-### Stage 1 (Diffusion Policy)
-
-Currently uses the third-person camera (resized to 96x96) as the RGB observation input. See `configs/dp_config.yaml` for the full `shape_meta` definition.
-
 Set environment variables for outputs and logging:
 
 ```bash
@@ -69,9 +65,9 @@ export WANDB_API_KEY=your_wandb_api_key
 ```
 
 
-## 3. Training
+## 3. Stage 1 (World Model Pre-training)
 
-If `TTT_WM_DATA_ROOT` is not set, you can specify the dataset path using `data.root`.
+Currently uses the third-person camera (resized to 96x96) as the RGB observation input. See `configs/dp_config.yaml` for the full `shape_meta` definition. If `TTT_WM_DATA_ROOT` is not set, you can specify the dataset path using `data.root`.
 
 ### Key Arguments
 
@@ -91,44 +87,7 @@ torchrun \
   data.frame_gap=4
 ```
 
-### Run Diffusion Policy Training
-
-`configs/dp_config.yaml` is the diffusion-policy training config. By default it assumes:
-
-- parquet dataset root from `TTT_WM_DATA_ROOT`
-- RGB observation column `image`
-- action column `actions`
-- single-camera `shape_meta` with action dim 7
-
-Run training:
-
-```bash
-python train_dp.py \
-  --config-name dp_config \
-  dataset_root=/path/to/libero_wm
-```
-
-Multi-GPU training:
-
-```bash
-torchrun \
-  --nproc_per_node=4 \
-  --master_port=29511 \
-  train_dp.py \
-  --config-name dp_config \
-  dataset_root=/path/to/libero_wm
-```
-
-Common overrides:
-
-```bash
-python train_dp.py \
-  --config-name dp_config \
-  dataset_root=/path/to/libero_wm \
-  shape_meta.obs.image.shape=[3,128,128] \
-  data.action_key=actions \
-  data.test_task_count=3
-```
+## 4. Stage 2 (IDM Training)
 
 ### Run IDM Diffusion-Policy Training
 
@@ -203,6 +162,45 @@ python test_dp.py \
   --dataset-root /path/to/libero_wm \
   --split val \
   --output-json /tmp/dp_eval.json
+```
+
+## 5. Standard Standard Diffusion Policy Training
+
+`configs/dp_config.yaml` is the diffusion-policy training config. By default it assumes:
+
+- parquet dataset root from `TTT_WM_DATA_ROOT`
+- RGB observation column `image`
+- action column `actions`
+- single-camera `shape_meta` with action dim 7
+
+Run training:
+
+```bash
+python train_dp.py \
+  --config-name dp_config \
+  dataset_root=/path/to/libero_wm
+```
+
+Multi-GPU training:
+
+```bash
+torchrun \
+  --nproc_per_node=4 \
+  --master_port=29511 \
+  train_dp.py \
+  --config-name dp_config \
+  dataset_root=/path/to/libero_wm
+```
+
+Common overrides:
+
+```bash
+python train_dp.py \
+  --config-name dp_config \
+  dataset_root=/path/to/libero_wm \
+  shape_meta.obs.image.shape=[3,128,128] \
+  data.action_key=actions \
+  data.test_task_count=3
 ```
 
 ---
