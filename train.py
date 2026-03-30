@@ -384,6 +384,7 @@ class VideoFrameDataset(Dataset):
         )
 
         root = Path(data_cfg.root)
+        self._data_root = root
 
         with open(root / "meta" / "info.json") as f:
             info = json.load(f)
@@ -514,13 +515,25 @@ class VideoFrameDataset(Dataset):
         if self._action_stats_cache is not None:
             return {k: v.copy() for k, v in self._action_stats_cache.items()}
 
+        # Try loading from disk cache
+        cache_path = self._data_root / "meta" / "action_stats.json"
+        if cache_path.exists():
+            if self.is_main:
+                log.info(f"Loading cached action stats from {cache_path}")
+            with open(cache_path) as f:
+                saved = json.load(f)
+            self._action_stats_cache = {
+                k: np.array(v, dtype=np.float32) for k, v in saved.items()
+            }
+            return {k: v.copy() for k, v in self._action_stats_cache.items()}
+
         action_min = None
         action_max = None
         action_sum = None
         action_sq_sum = None
         count = 0
 
-        for ep_idx in self.episode_indices:
+        for ep_idx in tqdm(self.episode_indices, desc="Computing action stats", disable=not self.is_main):
             path = self.episode_files[ep_idx]
             df = self._read_parquet(path)
             actions = np.stack(
@@ -553,6 +566,14 @@ class VideoFrameDataset(Dataset):
             "mean": mean.astype(np.float32),
             "std": std.astype(np.float32),
         }
+
+        # Save to disk for next run
+        if self.is_main:
+            saved = {k: v.tolist() for k, v in self._action_stats_cache.items()}
+            with open(cache_path, "w") as f:
+                json.dump(saved, f)
+            log.info(f"Saved action stats cache to {cache_path}")
+
         return {k: v.copy() for k, v in self._action_stats_cache.items()}
 
     def __getitem__(self, idx):
