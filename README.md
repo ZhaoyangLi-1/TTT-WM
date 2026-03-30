@@ -67,7 +67,7 @@ export WANDB_API_KEY=your_wandb_api_key
 
 ## 3. Stage 1 (World Model Pre-training)
 
-Currently uses the third-person camera (resized to 96x96) as the RGB observation input. See `configs/dp_config.yaml` for the full `shape_meta` definition. If `TTT_WM_DATA_ROOT` is not set, you can specify the dataset path using `data.root`.
+Currently uses the third-person camera as the RGB observation input. See `configs/dp_config.yaml` for the full `shape_meta` definition. If `TTT_WM_DATA_ROOT` is not set, you can specify the dataset path using `data.root`.
 
 ### Key Arguments
 
