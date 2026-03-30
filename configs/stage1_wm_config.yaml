@@ -60,7 +60,7 @@ train:
   amp: true
   amp_dtype: bf16
   ckpt_dir: ${outputs_root}/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
-  checkpoint_every: 10
+  checkpoint_every: 20
   stage: 1
   resume: ""
   # test_every: 2          # No used
