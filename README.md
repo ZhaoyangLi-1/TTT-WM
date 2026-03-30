@@ -108,13 +108,20 @@ diffusion-policy action head. This is different from `train_dp.py`:
 
 - `train_dp.py` trains a standalone diffusion policy from image observations
 - `train.py` with `train.stage=2 train.idm_type=diffusion_policy` trains the
-  Cosmos Stage 2 IDM, using the Stage 1 video model as the conditioning backbone
+  Cosmos Stage 2 IDM by first predicting the next frame with Stage 1, then
+  conditioning the diffusion action model on the frame pair
+  `[current frame, predicted next frame]`
+
+In this Stage 2 setup, the Stage 1 model is used only to predict
+`predicted_next_frame`. The diffusion action model then takes
+`(s_t, predicted_next_frame)` as its condition and predicts the intermediate
+action sequence `a_{t:t+m-1}`.
 
 Requirements:
 
 - install external `diffusion_policy` and expose it through `PYTHONPATH` or `DIFFUSION_POLICY_SRC`
 - provide a trained Stage 1 checkpoint via `train.stage1_ckpt`
-- set `data.frame_gap` to the number of action steps predicted by IDM
+- set `data.frame_gap` to the number of intermediate action steps predicted by IDM
 
 Single-GPU example:
 
