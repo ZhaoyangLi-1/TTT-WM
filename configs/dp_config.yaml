@@ -21,7 +21,7 @@ shape_meta:
     shape: [7]
   obs:
     image:
-      shape: [3, 96, 96]
+      shape: [3, 256, 256]
       type: rgb
 
 data:
@@ -34,7 +34,7 @@ data:
   max_train_episodes: null
 
 policy:
-  _target_: diffusion_policy.policy.diffusion_unet_hybrid_image_policy.DiffusionUnetHybridImagePolicy
+  _target_: dp.policy.TTTWMDiffusionPolicy
   shape_meta: ${shape_meta}
 
   noise_scheduler:
@@ -53,7 +53,7 @@ policy:
   num_inference_steps: 100
   obs_as_global_cond: ${obs_as_global_cond}
 
-  crop_shape: [84, 84]
+  crop_shape: [224, 224]
   obs_encoder_group_norm: true
   eval_fixed_crop: true
 

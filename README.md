@@ -26,7 +26,19 @@ export PYTHONPATH="$DIFFUSION_POLICY_SRC:$PYTHONPATH"
 ---
 
 ## 2. Dataset
-Download via git-lfs
+
+### LIBERO Parquet Format
+
+Each episode is stored as a single `.parquet` file with the following columns:
+
+| Column | Type | Shape | Description |
+|---|---|---|---|
+| `image` | PNG bytes | (256, 256, 3) | Third-person camera RGB |
+| `wrist_image` | PNG bytes | (256, 256, 3) | Wrist-mounted camera RGB |
+| `state` | float32 | (8,) | Robot state (joint angles + gripper) |
+| `actions` | float32 | (7,) | Action vector |
+
+### Download
 
 ```bash
 # install git-lfs if not installed
@@ -38,6 +50,10 @@ git clone https://huggingface.co/datasets/JeffreyLii/libero_wm
 # set data path
 export TTT_WM_DATA_ROOT=your_folder_for_libero_wm
 ```
+
+### Stage 1 (Diffusion Policy)
+
+Currently uses the third-person camera (resized to 96x96) as the RGB observation input. See `configs/dp_config.yaml` for the full `shape_meta` definition.
 
 Set environment variables for outputs and logging:
 
