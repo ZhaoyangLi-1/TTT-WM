@@ -1,17 +1,25 @@
 #!/bin/bash
 set -e
 
-DP_PATH="/opt/venv/src/diffusion-policy"
+# DP_PATH can be overridden through an environment variable.
+# Default: /opt/venv/src/diffusion-policy
+# Usage: DP_PATH=/your/path ./install_diffusion_policy.sh
+DP_PATH="${DP_PATH:-/opt/venv/src/diffusion-policy}"
 COMMIT="5ba07ac6661db573af695b419a7947ecb704690f"
 
-echo ">>> Cloning diffusion_policy..."
-git clone https://github.com/real-stanford/diffusion_policy.git "$DP_PATH"
+echo ">>> DP_PATH: $DP_PATH"
 
-echo ">>> Checking out commit $COMMIT..."
-cd "$DP_PATH"
-git checkout "$COMMIT"
+# Clone the repository if the target directory does not exist.
+if [ ! -d "$DP_PATH" ]; then
+  echo ">>> Cloning diffusion_policy..."
+  git clone https://github.com/real-stanford/diffusion_policy.git "$DP_PATH"
+  echo ">>> Checking out commit $COMMIT..."
+  cd "$DP_PATH"
+  git checkout "$COMMIT"
+else
+  echo ">>> Source already exists, skipping clone."
+fi
 
-# 3. 确保 __init__.py 存在
 echo ">>> Ensuring __init__.py exists..."
 touch "$DP_PATH/diffusion_policy/__init__.py"
 

@@ -11,7 +11,7 @@ uv pip install -r requirements.txt
 Install the external `diffusion_policy` package with the provided script:
 
 ```bash
-bash /scr2/zhaoyang/TTT-WM/install_diffusion_policy.sh
+DP_PATH=your_folder_for_diffusion_policy ./install_diffusion_policy.sh
 ```
 
 This script clones `diffusion_policy` to `/opt/venv/src/diffusion-policy`, checks out commit `5ba07ac6661db573af695b419a7947ecb704690f`, ensures `diffusion_policy/__init__.py` exists, and installs it in editable mode.
