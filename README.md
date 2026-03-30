@@ -76,12 +76,14 @@ Currently uses the third-person camera as the RGB observation input. See `config
 
 ### Run Training
 
+`configs/stage1_wm_config.yaml` is the dedicated Stage 1 world-model config.
+
 ```bash
 torchrun \
   --nproc_per_node=4 \
   --master_port=29501 \
   train.py \
-  --config-name config \
+  --config-name stage1_wm_config \
   data.root=/ariesdv0/zhaoyang/libero_wm \
   data.use_goal=true \
   data.frame_gap=4
@@ -95,7 +97,7 @@ torchrun \
 diffusion-policy action head. This is different from `train_dp.py`:
 
 - `train_dp.py` trains a standalone diffusion policy from image observations
-- `train.py` with `train.stage=2 train.idm_type=diffusion_policy` trains the
+- `train.py` with `--config-name stage2_idm_config` trains the
   Cosmos Stage 2 IDM by first predicting the next frame with Stage 1, then
   feeding the frame pair into the original diffusion-policy image architecture
   `[current frame, predicted next frame]`
@@ -104,6 +106,8 @@ In this Stage 2 setup, the Stage 1 model is used only to predict
 `predicted_next_frame`. The diffusion action model then takes
 `(s_t, predicted_next_frame)` as an extra two-image observation and predicts
 the intermediate action sequence `a_{t:t+m-1}` with the original DP U-Net.
+
+`configs/stage2_idm_config.yaml` is the dedicated Stage 2 diffusion-policy config.
 
 Requirements:
 
@@ -115,9 +119,7 @@ Single-GPU example:
 
 ```bash
 python train.py \
-  --config-name config \
-  train.stage=2 \
-  train.idm_type=diffusion_policy \
+  --config-name stage2_idm_config \
   train.stage1_ckpt=/path/to/stage1_checkpoint.pt \
   data.root=/path/to/libero_wm \
   data.frame_gap=4
@@ -130,9 +132,7 @@ torchrun \
   --nproc_per_node=4 \
   --master_port=29501 \
   train.py \
-  --config-name config \
-  train.stage=2 \
-  train.idm_type=diffusion_policy \
+  --config-name stage2_idm_config \
   train.stage1_ckpt=/path/to/stage1_checkpoint.pt \
   data.root=/path/to/libero_wm \
   data.frame_gap=4
@@ -142,9 +142,7 @@ Common overrides:
 
 ```bash
 python train.py \
-  --config-name config \
-  train.stage=2 \
-  train.idm_type=diffusion_policy \
+  --config-name stage2_idm_config \
   train.stage1_ckpt=/path/to/stage1_checkpoint.pt \
   data.root=/path/to/libero_wm \
   data.frame_gap=4 \

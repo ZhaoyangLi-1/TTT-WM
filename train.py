@@ -1540,7 +1540,7 @@ class Trainer:
             cleanup_ddp()
 
 
-@hydra.main(config_path="configs", config_name="config", version_base="1.3")
+@hydra.main(config_path="configs", config_name="stage1_wm_config", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     Trainer(cfg).train()
 

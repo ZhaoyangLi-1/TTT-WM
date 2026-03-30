@@ -1,0 +1,47 @@
+defaults:
+  - stage1_wm_config
+  - _self_
+
+experiment_name: cosmos_stage2_idm_dp_gap_${data.frame_gap}
+
+data:
+  use_goal: false
+
+train:
+  compile: false
+  epochs: 100
+  batch_size: 64
+  optimizer:
+    lr: 1.0e-4
+    weight_decay: 1.0e-6
+    betas: [0.95, 0.999]
+    no_decay_norm: true
+  scheduler:
+    warmup_fraction: 0.02
+  ema:
+    enabled: true
+    decay: 0.9999
+    update_every: 1
+  save_every: 10
+  stage: 2
+  stage1_ckpt: ""
+  freeze_backbone: true
+  idm_type: diffusion_policy
+  idm_dp:
+    num_train_timesteps: 100
+    num_inference_steps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    variance_type: fixed_small
+    clip_sample: true
+    prediction_type: epsilon
+    obs_as_global_cond: true
+    crop_shape: [84, 84]
+    obs_encoder_group_norm: true
+    eval_fixed_crop: true
+    diffusion_step_embed_dim: 128
+    down_dims: [512, 1024, 2048]
+    kernel_size: 5
+    n_groups: 8
+    cond_predict_scale: true
