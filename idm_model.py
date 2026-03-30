@@ -280,6 +280,9 @@ class InverseDynamicsModelDP(nn.Module):
         self._linear_normalizer_cls = LinearNormalizer
         self._single_field_normalizer_cls = SingleFieldLinearNormalizer
         self._image_normalizer_factory = get_image_range_normalizer
+        for name, param in self.policy.named_parameters():
+            if name.endswith("_dummy_variable"):
+                param.requires_grad_(False)
 
     def train(self, mode: bool = True):
         super().train(mode)
