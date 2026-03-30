@@ -14,7 +14,7 @@ Install the external `diffusion_policy` package with the provided script:
 DP_PATH=your_folder_for_diffusion_policy ./install_diffusion_policy.sh
 ```
 
-This script clones `diffusion_policy` to `/opt/venv/src/diffusion-policy`, checks out commit `5ba07ac6661db573af695b419a7947ecb704690f`, ensures `diffusion_policy/__init__.py` exists, and installs it in editable mode.
+This script clones `diffusion_policy` to `your_folder_for_diffusion_policy/diffusion-policy`, checks out commit `5ba07ac6661db573af695b419a7947ecb704690f`, ensures `diffusion_policy/__init__.py` exists, and installs it in editable mode.
 
 If you want to use a different local checkout later, you can still override the import path:
 
