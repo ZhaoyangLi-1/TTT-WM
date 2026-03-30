@@ -215,6 +215,9 @@ class TrainDiffusionWorkspace(BaseWorkspace):
             self.ema_model.to(device)
         optimizer_to(self.optimizer, device)
         if self.world_size > 1:
+            # DDP only proxies forward(). The policy has no forward() but uses
+            # compute_loss() for training, so alias it so DDP can intercept it.
+            self.model.forward = self.model.compute_loss
             ddp_kwargs = {}
             if device.type == "cuda":
                 ddp_kwargs["device_ids"] = [self.local_rank]
@@ -279,7 +282,10 @@ class TrainDiffusionWorkspace(BaseWorkspace):
                             else self.ddp_model.no_sync()
                         )
                         with sync_ctx:
-                            raw_loss = train_model.compute_loss(batch)
+                            # DDP model: forward() is aliased to compute_loss(),
+                            # so calling the model directly goes through DDP's
+                            # gradient sync machinery.
+                            raw_loss = train_model(batch) if self.ddp_model is not None else train_model.compute_loss(batch)
                             loss = raw_loss / grad_accum
                             loss.backward()
                         if should_step:
