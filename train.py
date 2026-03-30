@@ -708,6 +708,8 @@ class Trainer:
 
         self.grad_accum_steps = int(cfg.train.get("grad_accum_steps", 1))
         self.current_epoch = 0
+        self.compile_enabled = False
+        self.idm_type = str(cfg.train.get("idm_type", "mlp")).lower()
 
         if self.is_main:
             eff = cfg.train.batch_size * self.grad_accum_steps * self.world_size
@@ -744,8 +746,7 @@ class Trainer:
             s1 = str(cfg.train.get("stage1_ckpt", ""))
             if s1:
                 self._load_stage1_weights(raw_model, s1)
-            idm_type = str(cfg.train.get("idm_type", "mlp")).lower()
-            if idm_type in {"dp", "diffusion", "diffusion_policy"}:
+            if self.idm_type in {"dp", "diffusion", "diffusion_policy"}:
                 raw_model = _IDMModelDP(
                     raw_model,
                     n_actions=int(cfg.data.get("frame_gap", 0)),
@@ -787,11 +788,23 @@ class Trainer:
             self.model = raw_model
 
         # --- torch.compile ---
-        if cfg.train.get("compile", False) and hasattr(torch, "compile"):
-            torch._dynamo.config.optimize_ddp = False
-            self.model = torch.compile(self.model)
-            if self.is_main:
-                log.info("torch.compile enabled")
+        compile_requested = bool(cfg.train.get("compile", False))
+        using_diffusion_policy_idm = (
+            self.stage == 2 and self.idm_type in {"dp", "diffusion", "diffusion_policy"}
+        )
+        if compile_requested and hasattr(torch, "compile"):
+            if using_diffusion_policy_idm:
+                if self.is_main:
+                    log.info(
+                        "Skipping torch.compile for stage=2 diffusion_policy IDM "
+                        "because the robomimic/diffusion_policy vision stack is not compile-safe."
+                    )
+            else:
+                torch._dynamo.config.optimize_ddp = False
+                self.model = torch.compile(self.model)
+                self.compile_enabled = True
+                if self.is_main:
+                    log.info("torch.compile enabled")
 
         # --- EMA ---
         ema_cfg = cfg.train.ema
@@ -1045,7 +1058,15 @@ class Trainer:
         with grad_ctx:
             for batch_idx, (context, target, actions, goal) in enumerate(pbar):
                 if batch_idx == 0 and self.is_main:
-                    log.info(f"First batch loaded ({'train' if train else 'val'}), running forward pass (compiling if first epoch)...")
+                    warmup_note = (
+                        "compiling if first epoch"
+                        if self.compile_enabled
+                        else "no torch.compile on this run"
+                    )
+                    log.info(
+                        f"First batch loaded ({'train' if train else 'val'}), "
+                        f"running forward pass ({warmup_note})..."
+                    )
                 context = context.to(self.device, non_blocking=True)
                 target = target.to(self.device, non_blocking=True)
                 actions = actions.to(self.device, non_blocking=True)
@@ -1384,7 +1405,10 @@ class Trainer:
             )
 
         if self.is_main:
-            log.info("Entering training loop (first batch may be slow due to torch.compile)...")
+            if self.compile_enabled:
+                log.info("Entering training loop (first batch may be slow due to torch.compile)...")
+            else:
+                log.info("Entering training loop...")
 
         try:
             for epoch in range(self.start_epoch, tcfg.epochs):
