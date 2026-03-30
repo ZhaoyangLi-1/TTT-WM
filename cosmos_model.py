@@ -3,8 +3,6 @@ Cosmos-style AR Video Patch Transformer  (FlexAttention + Goal)
 ================================================================
 
 Stage 1 — Video prediction via teacher forcing (no actions).
-Stage 2 — Inverse dynamics model (InverseDynamicsModel) predicts actions
-           from (input_frames, Stage-1-predicted frames).
 
 Sequence layout (training, Stage 1)
 -------------------------------------
@@ -27,13 +25,10 @@ Interface
 ----------
     Stage 1 training:   pred_frames, loss = model(ctx, tgt, goal)
     Stage 1 inference:  pred_frames       = model(ctx, goal=goal)
-    Stage 2 training:   pred_frames, pred_actions, loss = idm(ctx, tgt, actions)
-    Stage 2 inference:  pred_frames, pred_actions       = idm.generate(ctx)
 """
 
 from __future__ import annotations
 from dataclasses import dataclass
-from contextlib import nullcontext
 from typing import Optional, Tuple
 
 import torch
@@ -70,7 +65,7 @@ class ARPatchConfig:
     frames_in:  int = 4
     frames_out: int = 4
 
-    # actions (used only by InverseDynamicsModel)
+    # actions (used by Stage 2 inverse-dynamics models)
     action_dim: int = 7
 
     @property
@@ -618,154 +613,6 @@ class ARVideoPatchTransformer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Stage 2: Inverse Dynamics Model
-# ---------------------------------------------------------------------------
-
-class InverseDynamicsModel(nn.Module):
-    """
-    Stage 2 — Inverse Dynamics Model.
-
-    Uses a frozen Stage 1 video predictor to generate predicted frames,
-    then predicts intermediate actions from (input_frames, predicted_frames).
-
-    Forward flow
-    -------------
-        1. Frozen Stage 1: input_frames → predicted_frames
-        2. Encode [input | predicted] through Stage 1 backbone
-        3. Mean-pool per-frame hidden states, concatenate
-        4. Trainable MLP head: (2 × d_model) → (n_actions × action_dim)
-
-    Interface
-    ----------
-        Training:   pred_frames, pred_actions, loss = model(input, target, actions)
-                    (target_frames is ignored; Stage 1 predictions used instead)
-        Inference:  pred_frames, pred_actions = model.generate(input)
-    """
-
-    def __init__(
-        self,
-        stage1_model: ARVideoPatchTransformer,
-        n_actions: int,
-        freeze_backbone: bool = True,
-    ):
-        super().__init__()
-        cfg = stage1_model.cfg
-        self.cfg = cfg
-        self.n_actions = n_actions
-        self.freeze_backbone = freeze_backbone
-
-        # Stage 1 backbone
-        self.stage1 = stage1_model
-        if freeze_backbone:
-            for p in self.stage1.parameters():
-                p.requires_grad_(False)
-            self.stage1.eval()
-
-        # Trainable action prediction head
-        d = cfg.d_model
-        self.action_head = nn.Sequential(
-            nn.Linear(2 * d, d),
-            nn.SiLU(),
-            nn.Linear(d, n_actions * cfg.action_dim),
-        )
-        self._init_action_head()
-
-    def _init_action_head(self):
-        for m in self.action_head.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.trunc_normal_(m.weight, std=0.02)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def train(self, mode: bool = True):
-        super().train(mode)
-        if self.freeze_backbone:
-            self.stage1.eval()
-        return self
-
-    def prebuild_mask(self, device: torch.device, has_goal: bool = False) -> None:
-        """Pre-build FlexAttention masks needed by IDM."""
-        # Stage 1 inference mask (input frames only, no goal)
-        self.stage1._ensure_mask(
-            self.cfg.frames_in, 0, device, has_goal=False,
-        )
-        # IDM encoding mask: [input | pred] treated as context
-        self.stage1._ensure_mask(2, 0, device, has_goal=False)
-
-    def forward(
-        self,
-        input_frames:  torch.Tensor,
-        target_frames: Optional[torch.Tensor] = None,
-        actions:       Optional[torch.Tensor] = None,
-        goal:          Optional[torch.Tensor] = None,
-    ):
-        """
-        Parameters
-        ----------
-        input_frames  : (B, 1, C, H, W)
-        target_frames : ignored — Stage 1 predictions used instead
-        actions       : (B, n_actions, action_dim)  GT for loss; None at inference
-        goal          : ignored — IDM does not use goal
-
-        Returns
-        -------
-        pred_frames  : (B, 1, C, H, W)            Stage 1 predicted frames
-        pred_actions : (B, n_actions, action_dim)
-        loss         : scalar or None
-        """
-        B = input_frames.shape[0]
-        N_p = self.cfg.n_patches
-
-        backbone_ctx = torch.no_grad() if self.freeze_backbone else nullcontext()
-
-        with backbone_ctx:
-            # 1) Stage 1 inference → predicted frames (no goal)
-            pred_frames, _ = self.stage1(input_frames)
-
-            # 2) Encode [input | pred] through backbone
-            all_frames = torch.cat([input_frames, pred_frames], dim=1)
-
-            tokens = self.stage1._embed_frames(all_frames)
-            t_idx, s_idx = self.stage1._build_position_indices(
-                2, 0, tokens.device, has_goal=False,
-            )
-            block_mask = self.stage1._ensure_mask(
-                2, 0, tokens.device, has_goal=False,
-            )
-            hidden = self.stage1._run_transformer(tokens, t_idx, s_idx, block_mask)
-
-        # 3) Pool per-frame features
-        input_feat = hidden[:, :N_p].mean(dim=1)
-        pred_feat  = hidden[:, N_p : 2 * N_p].mean(dim=1)
-
-        combined = torch.cat([input_feat, pred_feat], dim=-1)  # (B, 2*d_model)
-
-        # 4) Predict actions
-        pred_actions = self.action_head(combined).reshape(
-            B, self.n_actions, self.cfg.action_dim,
-        )
-
-        # 5) Loss
-        loss = None
-        if actions is not None:
-            loss = F.mse_loss(pred_actions, actions)
-
-        return pred_frames, pred_actions, loss
-
-    @torch.no_grad()
-    def generate(
-        self,
-        input_frames: torch.Tensor,
-        goal: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Predict next frame and intermediate actions (goal is ignored)."""
-        pred_frames, pred_actions, _ = self.forward(
-            input_frames, actions=None,
-        )
-        return pred_frames, pred_actions
-
-
-# ---------------------------------------------------------------------------
 # Sanity check
 # ---------------------------------------------------------------------------
 
@@ -815,20 +662,3 @@ if __name__ == "__main__":
 
     gen_ng = model.generate(ctx)
     print(f"generated      : {gen_ng.shape}")
-
-    # ── Stage 2: inverse dynamics ─────────────────────────────────────
-    n_act = 4
-    actions = torch.randn(B, n_act, cfg.action_dim, device=device, dtype=dtype)
-
-    idm = InverseDynamicsModel(model, n_actions=n_act).to(device=device, dtype=dtype)
-    idm.prebuild_mask(device)
-
-    pred_f, pred_a, loss2 = idm(ctx, target, actions)
-    print(f"\n=== Stage 2 (inverse dynamics, no goal) ===")
-    print(f"pred frames    : {pred_f.shape}")
-    print(f"pred actions   : {pred_a.shape}")
-    print(f"action loss    : {loss2.item():.4f}")
-
-    gen_f2, gen_a2 = idm.generate(ctx)
-    print(f"gen frames     : {gen_f2.shape}")
-    print(f"gen actions    : {gen_a2.shape}")

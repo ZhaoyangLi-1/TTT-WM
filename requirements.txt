@@ -14,3 +14,12 @@ tqdm
 imageio
 h5py
 pyarrow
+dill
+diffusers
+einops
+numcodecs<=0.13.1
+robomimic==0.2.0
+zarr<3.5
+
+# install diffusion_policy separately so the source path remains swappable:
+# -e git+https://github.com/real-stanford/diffusion_policy.git@5ba07ac6661db573af695b419a7947ecb704690f#egg=diffusion_policy

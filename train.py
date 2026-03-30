@@ -31,7 +31,10 @@ from tqdm import tqdm
 from cosmos_model import (
     ARPatchConfig as _CosmosConfig,
     ARVideoPatchTransformer as _CosmosModel,
-    InverseDynamicsModel as _CosmosIDM,
+)
+from idm_model import (
+    InverseDynamicsModel as _IDMModel,
+    InverseDynamicsModelDP as _IDMModelDP,
 )
 
 OmegaConf.register_new_resolver("if", lambda cond, t, f: t if cond else f, replace=True)
@@ -462,6 +465,8 @@ class VideoFrameDataset(Dataset):
         ep_tasks = {r["episode_index"]: r["task"] for r in episode_meta}
 
         ep_indices = in_domain_eps if split == "train" else test_eps
+        self.episode_indices = list(ep_indices)
+        self.episode_files = {ep_idx: str(episode_files[ep_idx]) for ep_idx in range(total_episodes)}
 
         self.samples = []
         span = self.fin + self.gap + self.fout - 1
@@ -490,6 +495,7 @@ class VideoFrameDataset(Dataset):
             )
 
         self._parquet_cache: dict[str, pd.DataFrame] = {}
+        self._action_stats_cache: dict[str, np.ndarray] | None = None
 
     def _read_parquet(self, path: str) -> pd.DataFrame:
         if path in self._parquet_cache:
@@ -503,6 +509,51 @@ class VideoFrameDataset(Dataset):
 
     def __len__(self):
         return len(self.samples)
+
+    def get_action_stats(self) -> dict[str, np.ndarray]:
+        if self._action_stats_cache is not None:
+            return {k: v.copy() for k, v in self._action_stats_cache.items()}
+
+        action_min = None
+        action_max = None
+        action_sum = None
+        action_sq_sum = None
+        count = 0
+
+        for ep_idx in self.episode_indices:
+            path = self.episode_files[ep_idx]
+            df = self._read_parquet(path)
+            actions = np.stack(
+                [np.array(value, copy=False) for value in df[self.action_key].tolist()],
+                axis=0,
+            ).astype(np.float64, copy=False)
+
+            batch_min = actions.min(axis=0)
+            batch_max = actions.max(axis=0)
+            batch_sum = actions.sum(axis=0)
+            batch_sq_sum = np.square(actions).sum(axis=0)
+
+            action_min = batch_min if action_min is None else np.minimum(action_min, batch_min)
+            action_max = batch_max if action_max is None else np.maximum(action_max, batch_max)
+            action_sum = batch_sum if action_sum is None else (action_sum + batch_sum)
+            action_sq_sum = (
+                batch_sq_sum if action_sq_sum is None else (action_sq_sum + batch_sq_sum)
+            )
+            count += actions.shape[0]
+
+        if count == 0:
+            raise RuntimeError("Cannot compute action stats from an empty dataset.")
+
+        mean = action_sum / count
+        var = np.maximum(action_sq_sum / count - np.square(mean), 0.0)
+        std = np.sqrt(var)
+        self._action_stats_cache = {
+            "min": action_min.astype(np.float32),
+            "max": action_max.astype(np.float32),
+            "mean": mean.astype(np.float32),
+            "std": std.astype(np.float32),
+        }
+        return {k: v.copy() for k, v in self._action_stats_cache.items()}
 
     def __getitem__(self, idx):
         parquet_path, start, ep_length = self.samples[idx]
@@ -672,11 +723,20 @@ class Trainer:
             s1 = str(cfg.train.get("stage1_ckpt", ""))
             if s1:
                 self._load_stage1_weights(raw_model, s1)
-            raw_model = _CosmosIDM(
-                raw_model,
-                n_actions=int(cfg.data.get("frame_gap", 0)),
-                freeze_backbone=bool(cfg.train.get("freeze_backbone", True)),
-            ).to(self.device)
+            idm_type = str(cfg.train.get("idm_type", "mlp")).lower()
+            if idm_type in {"dp", "diffusion", "diffusion_policy"}:
+                raw_model = _IDMModelDP(
+                    raw_model,
+                    n_actions=int(cfg.data.get("frame_gap", 0)),
+                    freeze_backbone=bool(cfg.train.get("freeze_backbone", True)),
+                    **OmegaConf.to_container(cfg.train.get("idm_dp", {}), resolve=True),
+                ).to(self.device)
+            else:
+                raw_model = _IDMModel(
+                    raw_model,
+                    n_actions=int(cfg.data.get("frame_gap", 0)),
+                    freeze_backbone=bool(cfg.train.get("freeze_backbone", True)),
+                ).to(self.device)
             raw_model.prebuild_mask(device=self.device)
         else:
             raw_model.prebuild_mask(device=self.device, has_goal=has_goal)
@@ -754,6 +814,14 @@ class Trainer:
         # --- Data ---
         self.use_goal = cfg.data.get("use_goal", True)
         train_ds, val_ds, test_ds = build_datasets(cfg.data, cfg.model, self.is_main)
+        raw = unwrap_model(self.model)
+        if self.stage == 2 and hasattr(raw, "set_action_stats") and hasattr(train_ds, "get_action_stats"):
+            action_stats = train_ds.get_action_stats()
+            raw.set_action_stats(action_stats)
+            if self.ema is not None and hasattr(self.ema.shadow, "set_action_stats"):
+                self.ema.shadow.set_action_stats(action_stats)
+            if self.is_main:
+                log.info("Loaded train action stats into stage-2 diffusion-policy IDM.")
         self.test_task_names = list(getattr(train_ds, "test_tasks", ()))
         n_workers = cfg.data.num_workers
         dl_timeout = int(cfg.data.get("loader_timeout", 600))

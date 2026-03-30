@@ -1,0 +1,163 @@
+defaults:
+  - _self_
+
+runtime:
+  diffusion_policy_src: ${oc.env:DIFFUSION_POLICY_SRC,}
+
+name: diffusion_policy_tttwm
+exp_name: default
+task_name: tttwm_parquet_image
+
+outputs_root: ${oc.env:TTT_WM_OUTPUTS_ROOT,/ariesdv0/zhaoyang/data}
+dataset_root: ${oc.env:TTT_WM_DATA_ROOT,/scr2/zhaoyang/libero_wm}
+
+horizon: 16
+n_obs_steps: 1
+n_action_steps: 8
+obs_as_global_cond: true
+
+shape_meta:
+  action:
+    shape: [7]
+  obs:
+    image:
+      shape: [3, 96, 96]
+      type: rgb
+
+data:
+  action_key: actions
+  obs_key_mapping: {}
+  split_mode: auto
+  val_ratio: 0.1
+  test_task_count: 3
+  test_tasks: []
+  max_train_episodes: null
+
+policy:
+  _target_: diffusion_policy.policy.diffusion_unet_hybrid_image_policy.DiffusionUnetHybridImagePolicy
+  shape_meta: ${shape_meta}
+
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    variance_type: fixed_small
+    clip_sample: true
+    prediction_type: epsilon
+
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+  num_inference_steps: 100
+  obs_as_global_cond: ${obs_as_global_cond}
+
+  crop_shape: [84, 84]
+  obs_encoder_group_norm: true
+  eval_fixed_crop: true
+
+  diffusion_step_embed_dim: 128
+  down_dims: [512, 1024, 2048]
+  kernel_size: 5
+  n_groups: 8
+  cond_predict_scale: true
+
+ema:
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+training:
+  device: auto
+  output_dir: ${hydra:runtime.output_dir}
+  seed: 42
+  debug: false
+  resume: false
+  resume_path: null
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 300
+  gradient_accumulate_every: 1
+  grad_clip: 1.0
+  use_ema: true
+  checkpoint_every: 10
+  val_every: 1
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+dataloader:
+  batch_size: 32
+  num_workers: 8
+  shuffle: true
+  pin_memory: true
+  persistent_workers: true
+
+val_dataloader:
+  batch_size: 32
+  num_workers: 8
+  shuffle: false
+  pin_memory: true
+  persistent_workers: true
+
+task:
+  name: ${task_name}
+  shape_meta: ${shape_meta}
+
+  dataset:
+    _target_: dp.parquet_dataset.TTTWMParquetImageDataset
+    shape_meta: ${shape_meta}
+    dataset_root: ${dataset_root}
+    horizon: ${horizon}
+    pad_before: ${eval:'${n_obs_steps}-1'}
+    pad_after: ${eval:'${n_action_steps}-1'}
+    n_obs_steps: ${n_obs_steps}
+    action_key: ${data.action_key}
+    obs_key_mapping: ${data.obs_key_mapping}
+    split_mode: ${data.split_mode}
+    val_ratio: ${data.val_ratio}
+    test_task_count: ${data.test_task_count}
+    test_tasks: ${data.test_tasks}
+    seed: ${training.seed}
+    max_train_episodes: ${data.max_train_episodes}
+    cache_size: 32
+    verbose: true
+
+checkpoint:
+  topk:
+    monitor_key: val_loss
+    mode: min
+    k: 3
+    format_str: epoch={epoch:04d}-val_loss={val_loss:.4f}.ckpt
+  save_last_ckpt: true
+  save_last_snapshot: false
+
+logging:
+  enabled: true
+  project: TTT-WM-diffusion
+  mode: online
+  resume: false
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}
+  tags:
+    - diffusion_policy
+    - ttt_wm
+    - ${exp_name}
+  id: null
+  group: null
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: ${outputs_root}/diffusion_policy/${now:%Y-%m-%d}/${now:%H-%M-%S}_${name}

@@ -90,6 +90,17 @@ python train_dp.py \
   dataset_root=/path/to/libero_wm
 ```
 
+Multi-GPU training:
+
+```bash
+torchrun \
+  --nproc_per_node=4 \
+  --master_port=29511 \
+  train_dp.py \
+  --config-name dp_config \
+  dataset_root=/path/to/libero_wm
+```
+
 Common overrides:
 
 ```bash
@@ -109,13 +120,13 @@ diffusion-policy action head. This is different from `train_dp.py`:
 - `train_dp.py` trains a standalone diffusion policy from image observations
 - `train.py` with `train.stage=2 train.idm_type=diffusion_policy` trains the
   Cosmos Stage 2 IDM by first predicting the next frame with Stage 1, then
-  conditioning the diffusion action model on the frame pair
+  feeding the frame pair into the original diffusion-policy image architecture
   `[current frame, predicted next frame]`
 
 In this Stage 2 setup, the Stage 1 model is used only to predict
 `predicted_next_frame`. The diffusion action model then takes
-`(s_t, predicted_next_frame)` as its condition and predicts the intermediate
-action sequence `a_{t:t+m-1}`.
+`(s_t, predicted_next_frame)` as an extra two-image observation and predicts
+the intermediate action sequence `a_{t:t+m-1}` with the original DP U-Net.
 
 Requirements:
 

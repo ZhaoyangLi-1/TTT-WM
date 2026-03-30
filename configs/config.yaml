@@ -64,8 +64,27 @@ train:
   stage: 1                # 1 = video prediction, 2 = inverse dynamics
   stage1_ckpt: ""          # path to Stage 1 checkpoint (required for stage 2)
   freeze_backbone: true    # freeze Stage 1 backbone in stage 2
+  idm_type: mlp            # "mlp" | "diffusion_policy"
+  idm_dp:
+    num_train_timesteps: 100
+    num_inference_steps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    variance_type: fixed_small
+    clip_sample: true
+    prediction_type: epsilon
+    obs_as_global_cond: true
+    crop_shape: [84, 84]
+    obs_encoder_group_norm: true
+    eval_fixed_crop: true
+    diffusion_step_embed_dim: 128
+    down_dims: [512, 1024, 2048]
+    kernel_size: 5
+    n_groups: 8
+    cond_predict_scale: true
   resume: ""
-  # test_every: 2
+  # test_every: 2          # No used
   device: "auto"           # auto → cuda > mps > cpu
   find_unused_parameters: false
 

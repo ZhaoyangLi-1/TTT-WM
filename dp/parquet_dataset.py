@@ -1,0 +1,447 @@
+from __future__ import annotations
+
+import copy
+import io
+import json
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import torch
+from omegaconf import OmegaConf
+from PIL import Image
+
+from diffusion_policy.common.normalize_util import get_image_range_normalizer
+from diffusion_policy.dataset.base_dataset import BaseImageDataset
+from diffusion_policy.model.common.normalizer import (
+    LinearNormalizer,
+    SingleFieldLinearNormalizer,
+)
+
+from dp.common import dict_apply
+
+
+def _to_container(value: Any) -> Any:
+    if OmegaConf.is_config(value):
+        return OmegaConf.to_container(value, resolve=True)
+    return copy.deepcopy(value)
+
+
+class TTTWMParquetImageDataset(BaseImageDataset):
+    def __init__(
+        self,
+        shape_meta: dict,
+        dataset_root: str,
+        horizon: int,
+        pad_before: int = 0,
+        pad_after: int = 0,
+        n_obs_steps: int | None = None,
+        action_key: str = "actions",
+        obs_key_mapping: dict[str, str] | None = None,
+        split: str = "train",
+        split_mode: str = "auto",
+        val_ratio: float = 0.1,
+        test_task_count: int = 0,
+        test_tasks: list[str] | None = None,
+        seed: int = 42,
+        max_train_episodes: int | None = None,
+        cache_size: int = 32,
+        verbose: bool = True,
+    ):
+        super().__init__()
+
+        if split not in {"train", "val"}:
+            raise ValueError(f"Unsupported split: {split}")
+
+        shape_meta = _to_container(shape_meta)
+        obs_key_mapping = _to_container(obs_key_mapping) or {}
+        test_tasks = list(_to_container(test_tasks) or [])
+
+        self.shape_meta = shape_meta
+        self.dataset_root = str(Path(dataset_root).expanduser())
+        self.root = Path(self.dataset_root)
+        self.horizon = int(horizon)
+        self.pad_before = int(pad_before)
+        self.pad_after = int(pad_after)
+        self.n_obs_steps = int(n_obs_steps) if n_obs_steps is not None else self.horizon
+        self.action_key = str(action_key)
+        self.obs_key_mapping = dict(obs_key_mapping)
+        self.split = split
+        self.split_mode = str(split_mode).lower()
+        self.val_ratio = float(val_ratio)
+        self.test_task_count = int(test_task_count)
+        self.test_tasks = list(test_tasks)
+        self.seed = int(seed)
+        self.max_train_episodes = max_train_episodes
+        self.cache_size = max(int(cache_size), 1)
+        self.verbose = bool(verbose)
+
+        if self.horizon < 1:
+            raise ValueError("horizon must be >= 1")
+        if self.n_obs_steps < 1:
+            raise ValueError("n_obs_steps must be >= 1")
+
+        action_shape = tuple(shape_meta["action"]["shape"])
+        if len(action_shape) != 1:
+            raise ValueError(f"Only 1D actions are supported, got {action_shape}")
+        self.action_shape = action_shape
+
+        obs_meta = shape_meta["obs"]
+        self.rgb_keys: list[str] = []
+        self.lowdim_keys: list[str] = []
+        self.obs_shapes: dict[str, tuple[int, ...]] = {}
+        self.obs_columns: dict[str, str] = {}
+        for key, attr in obs_meta.items():
+            obs_type = attr.get("type", "low_dim")
+            self.obs_shapes[key] = tuple(attr["shape"])
+            self.obs_columns[key] = self.obs_key_mapping.get(key, key)
+            if obs_type == "rgb":
+                self.rgb_keys.append(key)
+            elif obs_type == "low_dim":
+                self.lowdim_keys.append(key)
+            else:
+                raise ValueError(f"Unsupported obs type for {key}: {obs_type}")
+
+        self._required_columns = list(
+            dict.fromkeys(
+                [self.action_key]
+                + [self.obs_columns[key] for key in self.rgb_keys + self.lowdim_keys]
+            )
+        )
+
+        self._episode_paths, episode_meta = self._load_episode_manifest()
+        self._episode_meta = episode_meta
+        (
+            self._train_episode_indices,
+            self._val_episode_indices,
+            self._split_reason,
+        ) = self._split_episode_indices(episode_meta)
+        self._train_episode_indices = self._downsample_episode_indices(
+            self._train_episode_indices, self.max_train_episodes
+        )
+
+        self._episode_indices = (
+            self._train_episode_indices if split == "train" else self._val_episode_indices
+        )
+
+        self.samples: list[tuple[int, int]] = []
+        for episode_idx in self._episode_indices:
+            ep_length = self._episode_meta[episode_idx]["length"]
+            min_start = -self.pad_before
+            max_start = ep_length - self.horizon + self.pad_after
+            for start in range(min_start, max_start + 1):
+                self.samples.append((episode_idx, start))
+
+        if self.verbose:
+            split_tasks = sorted(
+                {
+                    self._episode_meta[idx]["task"]
+                    for idx in self._episode_indices
+                    if self._episode_meta[idx]["task"] is not None
+                }
+            )
+            print(
+                f"[TTTWMParquetImageDataset:{self.split}] "
+                f"{len(self.samples)} windows / {len(self._episode_indices)} episodes "
+                f"/ {len(split_tasks)} tasks ({self._split_reason})"
+            )
+
+        self._parquet_cache: dict[str, pd.DataFrame] = {}
+        self._all_actions_cache: torch.Tensor | None = None
+
+        self._init_kwargs = dict(
+            shape_meta=shape_meta,
+            dataset_root=self.dataset_root,
+            horizon=self.horizon,
+            pad_before=self.pad_before,
+            pad_after=self.pad_after,
+            n_obs_steps=self.n_obs_steps,
+            action_key=self.action_key,
+            obs_key_mapping=self.obs_key_mapping,
+            split_mode=self.split_mode,
+            val_ratio=self.val_ratio,
+            test_task_count=self.test_task_count,
+            test_tasks=self.test_tasks,
+            seed=self.seed,
+            max_train_episodes=self.max_train_episodes,
+            cache_size=self.cache_size,
+            verbose=self.verbose,
+        )
+
+    def _load_episode_manifest(self) -> tuple[dict[int, Path], dict[int, dict[str, Any]]]:
+        info_path = self.root / "meta" / "info.json"
+        episodes_path = self.root / "meta" / "episodes.jsonl"
+        if not info_path.is_file() or not episodes_path.is_file():
+            raise FileNotFoundError(
+                f"{self.root} is missing `meta/info.json` or `meta/episodes.jsonl`."
+            )
+
+        with info_path.open() as f:
+            info = json.load(f)
+
+        total_episodes = int(info["total_episodes"])
+        chunks_size = int(info["chunks_size"])
+        episode_paths = {
+            episode_idx: self.root
+            / "data"
+            / f"chunk-{episode_idx // chunks_size:03d}"
+            / f"episode_{episode_idx:06d}.parquet"
+            for episode_idx in range(total_episodes)
+        }
+
+        episode_meta: dict[int, dict[str, Any]] = {}
+        with episodes_path.open() as f:
+            for line in f:
+                record = json.loads(line)
+                tasks = record.get("tasks", [])
+                episode_idx = int(record["episode_index"])
+                episode_meta[episode_idx] = {
+                    "episode_index": episode_idx,
+                    "length": int(record["length"]),
+                    "task": tasks[0] if tasks else None,
+                }
+
+        return episode_paths, episode_meta
+
+    def _load_task_names(self, episode_meta: dict[int, dict[str, Any]]) -> list[str]:
+        tasks_path = self.root / "meta" / "tasks.jsonl"
+        task_names: list[str] = []
+        if tasks_path.is_file():
+            with tasks_path.open() as f:
+                for line in f:
+                    record = json.loads(line)
+                    task_name = record.get("task")
+                    if task_name:
+                        task_names.append(task_name)
+
+        if task_names:
+            return task_names
+
+        seen: set[str] = set()
+        for episode_idx in sorted(episode_meta.keys()):
+            task_name = episode_meta[episode_idx]["task"]
+            if task_name and task_name not in seen:
+                seen.add(task_name)
+                task_names.append(task_name)
+        return task_names
+
+    def _resolve_heldout_tasks(self, task_names: list[str]) -> list[str]:
+        selected = list(self.test_tasks)
+        meta_path = self.root / "meta" / "test_tasks.json"
+        if not selected and meta_path.is_file():
+            with meta_path.open() as f:
+                stored = json.load(f)
+            selected = list(stored.get("tasks", []) if isinstance(stored, dict) else stored)
+
+        if not selected and self.test_task_count > 0 and task_names:
+            if self.test_task_count >= len(task_names):
+                raise ValueError(
+                    f"test_task_count={self.test_task_count} must be < total tasks ({len(task_names)})"
+                )
+            selected = task_names[: self.test_task_count]
+
+        if selected:
+            unknown = sorted(set(selected) - set(task_names))
+            if unknown:
+                raise ValueError("Missing test tasks: " + ", ".join(unknown))
+        return selected
+
+    def _split_episode_indices(
+        self, episode_meta: dict[int, dict[str, Any]]
+    ) -> tuple[list[int], list[int], str]:
+        task_names = self._load_task_names(episode_meta)
+        all_episode_indices = sorted(episode_meta.keys())
+
+        if self.split_mode not in {"auto", "heldout_tasks", "episode"}:
+            raise ValueError(
+                f"Unsupported split_mode={self.split_mode}. Use auto, heldout_tasks, or episode."
+            )
+
+        if self.split_mode in {"auto", "heldout_tasks"} and task_names:
+            heldout_tasks = self._resolve_heldout_tasks(task_names)
+            if heldout_tasks:
+                heldout_set = set(heldout_tasks)
+                train_eps = [
+                    idx for idx in all_episode_indices if episode_meta[idx]["task"] not in heldout_set
+                ]
+                val_eps = [
+                    idx for idx in all_episode_indices if episode_meta[idx]["task"] in heldout_set
+                ]
+                return train_eps, val_eps, f"heldout_tasks={','.join(heldout_tasks)}"
+
+        if self.val_ratio > 0.0 and len(all_episode_indices) > 1:
+            n_val = min(
+                max(1, round(len(all_episode_indices) * self.val_ratio)),
+                len(all_episode_indices) - 1,
+            )
+            rng = np.random.default_rng(self.seed)
+            shuffled = np.array(all_episode_indices)
+            rng.shuffle(shuffled)
+            val_eps = sorted(int(x) for x in shuffled[:n_val])
+            val_set = set(val_eps)
+            train_eps = [idx for idx in all_episode_indices if idx not in val_set]
+            return train_eps, val_eps, f"episode_val_ratio={self.val_ratio:.3f}"
+
+        return all_episode_indices, [], "single_split"
+
+    def _downsample_episode_indices(
+        self, episode_indices: list[int], max_n: int | None
+    ) -> list[int]:
+        if max_n is None or len(episode_indices) <= int(max_n):
+            return list(episode_indices)
+        rng = np.random.default_rng(self.seed)
+        selected = rng.choice(episode_indices, size=int(max_n), replace=False)
+        return sorted(int(x) for x in selected)
+
+    def _read_parquet(self, episode_idx: int) -> pd.DataFrame:
+        path = self._episode_paths[episode_idx]
+        cache_key = str(path)
+        if cache_key in self._parquet_cache:
+            df = self._parquet_cache.pop(cache_key)
+            self._parquet_cache[cache_key] = df
+            return df
+
+        df = pd.read_parquet(path, columns=self._required_columns)
+        self._parquet_cache[cache_key] = df
+        while len(self._parquet_cache) > self.cache_size:
+            oldest = next(iter(self._parquet_cache))
+            del self._parquet_cache[oldest]
+        return df
+
+    @staticmethod
+    def _extract_image_bytes(value: Any) -> bytes | Any:
+        if isinstance(value, dict) and "bytes" in value:
+            return value["bytes"]
+        return value
+
+    def _decode_rgb_value(self, value: Any, obs_key: str) -> np.ndarray:
+        value = self._extract_image_bytes(value)
+        if isinstance(value, (bytes, bytearray)):
+            image = Image.open(io.BytesIO(value)).convert("RGB")
+        elif isinstance(value, Image.Image):
+            image = value.convert("RGB")
+        else:
+            array = np.asarray(value)
+            if array.ndim != 3:
+                raise ValueError(
+                    f"RGB observation `{obs_key}` must decode to HWC, got shape {array.shape}."
+                )
+            if array.dtype != np.uint8:
+                array = np.clip(array, 0, 255).astype(np.uint8)
+            image = Image.fromarray(array).convert("RGB")
+
+        channels, height, width = self.obs_shapes[obs_key]
+        if channels != 3:
+            raise ValueError(f"RGB observation `{obs_key}` must have 3 channels, got {channels}.")
+        if image.size != (width, height):
+            image = image.resize((width, height), Image.BILINEAR)
+
+        array = np.asarray(image, dtype=np.float32) / 255.0
+        return np.moveaxis(array, -1, 0)
+
+    def _decode_lowdim_value(self, value: Any, obs_key: str) -> np.ndarray:
+        array = np.asarray(value, dtype=np.float32)
+        expected_shape = self.obs_shapes[obs_key]
+        return array.reshape(expected_shape)
+
+    def _decode_action_value(self, value: Any) -> np.ndarray:
+        array = np.asarray(value, dtype=np.float32)
+        return array.reshape(self.action_shape)
+
+    def _build_row_indices(self, episode_idx: int, start: int) -> list[int]:
+        ep_length = self._episode_meta[episode_idx]["length"]
+        return [
+            min(max(start + offset, 0), ep_length - 1)
+            for offset in range(self.horizon)
+        ]
+
+    def get_validation_dataset(self) -> "TTTWMParquetImageDataset":
+        return self.__class__(**self._init_kwargs, split="val")
+
+    def get_all_actions(self) -> torch.Tensor:
+        if self._all_actions_cache is None:
+            actions: list[np.ndarray] = []
+            for episode_idx in self._train_episode_indices:
+                df = self._read_parquet(episode_idx)
+                actions.append(
+                    np.stack(
+                        [
+                            self._decode_action_value(value)
+                            for value in df[self.action_key].tolist()
+                        ],
+                        axis=0,
+                    )
+                )
+            if actions:
+                self._all_actions_cache = torch.from_numpy(np.concatenate(actions, axis=0))
+            else:
+                self._all_actions_cache = torch.empty((0,) + self.action_shape)
+        return self._all_actions_cache
+
+    def get_normalizer(self, **kwargs: Any) -> LinearNormalizer:
+        normalizer = LinearNormalizer()
+        normalizer["action"] = SingleFieldLinearNormalizer.create_fit(
+            self.get_all_actions().cpu().numpy()
+        )
+
+        for obs_key in self.lowdim_keys:
+            values: list[np.ndarray] = []
+            column_name = self.obs_columns[obs_key]
+            for episode_idx in self._train_episode_indices:
+                df = self._read_parquet(episode_idx)
+                values.append(
+                    np.stack(
+                        [
+                            self._decode_lowdim_value(value, obs_key)
+                            for value in df[column_name].tolist()
+                        ],
+                        axis=0,
+                    )
+                )
+            if values:
+                normalizer[obs_key] = SingleFieldLinearNormalizer.create_fit(
+                    np.concatenate(values, axis=0)
+                )
+
+        for obs_key in self.rgb_keys:
+            normalizer[obs_key] = get_image_range_normalizer()
+        return normalizer
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        episode_idx, start = self.samples[idx]
+        df = self._read_parquet(episode_idx)
+        row_indices = self._build_row_indices(episode_idx, start)
+        obs_row_indices = row_indices[: self.n_obs_steps]
+
+        obs_dict: dict[str, np.ndarray] = {}
+        for obs_key in self.rgb_keys:
+            column_name = self.obs_columns[obs_key]
+            obs_dict[obs_key] = np.stack(
+                [
+                    self._decode_rgb_value(df.iloc[row_idx][column_name], obs_key)
+                    for row_idx in obs_row_indices
+                ],
+                axis=0,
+            )
+
+        for obs_key in self.lowdim_keys:
+            column_name = self.obs_columns[obs_key]
+            obs_dict[obs_key] = np.stack(
+                [
+                    self._decode_lowdim_value(df.iloc[row_idx][column_name], obs_key)
+                    for row_idx in obs_row_indices
+                ],
+                axis=0,
+            )
+
+        action = np.stack(
+            [self._decode_action_value(df.iloc[row_idx][self.action_key]) for row_idx in row_indices],
+            axis=0,
+        )
+
+        data = {"obs": obs_dict, "action": action.astype(np.float32)}
+        return dict_apply(data, torch.from_numpy)
