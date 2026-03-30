@@ -842,6 +842,7 @@ class Trainer:
                 f"prefetch={loader_kw.get('prefetch_factor', 'N/A')}, "
                 f"timeout={dl_timeout}s"
             )
+            log.info("Creating train DataLoader...")
 
         if self.world_size > 1:
             train_sampler = DistributedSampler(
@@ -865,6 +866,8 @@ class Trainer:
             )
             self.test_loader = None
             self._train_sampler = train_sampler
+            if self.is_main:
+                log.info("DataLoaders created.")
         else:
             self.train_loader = DataLoader(
                 train_ds,
@@ -913,12 +916,16 @@ class Trainer:
         wandb_cfg = cfg.get("wandb", {})
         self.use_wandb = self.is_main and wandb_cfg.get("enabled", True)
         if self.use_wandb:
+            if self.is_main:
+                log.info("Initializing wandb...")
             wandb.init(
                 project=wandb_cfg.get("project", "TTT-WM"),
                 name=wandb_cfg.get("name", cfg.experiment_name),
                 config=OmegaConf.to_container(cfg, resolve=True),
                 resume="allow" if cfg.train.resume else None,
             )
+            if self.is_main:
+                log.info("wandb initialized.")
 
     # --- Checkpointing ---
 
