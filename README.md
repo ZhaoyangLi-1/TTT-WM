@@ -8,13 +8,15 @@ Install dependencies:
 uv pip install -r requirements.txt
 ```
 
-Install the external `diffusion_policy` package separately:
+Install the external `diffusion_policy` package with the provided script:
 
 ```bash
-uv pip install -e git+https://github.com/real-stanford/diffusion_policy.git@5ba07ac6661db573af695b419a7947ecb704690f#egg=diffusion_policy
+bash /scr2/zhaoyang/TTT-WM/install_diffusion_policy.sh
 ```
 
-If you want to point to a different local checkout later, update the path once:
+This script clones `diffusion_policy` to `/opt/venv/src/diffusion-policy`, checks out commit `5ba07ac6661db573af695b419a7947ecb704690f`, ensures `diffusion_policy/__init__.py` exists, and installs it in editable mode.
+
+If you want to use a different local checkout later, you can still override the import path:
 
 ```bash
 export DIFFUSION_POLICY_SRC=/path/to/diffusion-policy
@@ -130,7 +132,7 @@ the intermediate action sequence `a_{t:t+m-1}` with the original DP U-Net.
 
 Requirements:
 
-- install external `diffusion_policy` and expose it through `PYTHONPATH` or `DIFFUSION_POLICY_SRC`
+- run `bash /scr2/zhaoyang/TTT-WM/install_diffusion_policy.sh`
 - provide a trained Stage 1 checkpoint via `train.stage1_ckpt`
 - set `data.frame_gap` to the number of intermediate action steps predicted by IDM
 
@@ -195,4 +197,5 @@ python test_dp.py \
 - Adjust `--nproc_per_node` based on the number of available GPUs.
 - Change `--master_port` if there are conflicts with other distributed jobs.
 - Stage 2 IDM diffusion-policy training expects a valid Stage 1 checkpoint in `train.stage1_ckpt`.
-- If the external `diffusion_policy` checkout moves, only update `DIFFUSION_POLICY_SRC` or `runtime.diffusion_policy_src`; the TTT-WM diffusion-policy code does not hardcode the old path.
+- The default diffusion-policy install script places the editable checkout at `/opt/venv/src/diffusion-policy`.
+- If you later switch to a different external `diffusion_policy` checkout, update `DIFFUSION_POLICY_SRC` or `runtime.diffusion_policy_src`; the TTT-WM diffusion-policy code does not hardcode the old path.
