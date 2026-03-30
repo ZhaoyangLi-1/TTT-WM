@@ -195,9 +195,7 @@ Common overrides:
 ```bash
 python train_dp.py \
   --config-name dp_config \
-  dataset_root=/path/to/libero_wm \
-  data.action_key=actions \
-  data.test_task_count=3
+  dataset_root=/path/to/libero_wm
 ```
 
 ---
