@@ -362,7 +362,13 @@ class TTTWMParquetImageDataset(BaseImageDataset):
     def get_all_actions(self) -> torch.Tensor:
         if self._all_actions_cache is None:
             actions: list[np.ndarray] = []
-            for episode_idx in self._train_episode_indices:
+            indices = self._train_episode_indices
+            try:
+                from tqdm import tqdm
+                iterator = tqdm(indices, desc="Reading actions", unit="ep")
+            except ImportError:
+                iterator = indices
+            for episode_idx in iterator:
                 df = self._read_parquet(episode_idx)
                 actions.append(
                     np.stack(

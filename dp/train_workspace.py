@@ -5,6 +5,7 @@ import math
 import os
 import random
 from contextlib import nullcontext
+from pathlib import Path
 
 import hydra
 import numpy as np
@@ -157,9 +158,21 @@ class TrainDiffusionWorkspace(BaseWorkspace):
         val_dataset = dataset.get_validation_dataset()
         val_dataloader = self._build_dataloader(val_dataset, cfg.val_dataloader)
 
-        if self.is_main:
-            print("Building dataset normalizer...")
-        normalizer = dataset.get_normalizer() if self.is_main or self.world_size == 1 else None
+        # Try to load cached normalizer from disk
+        normalizer_cache_path = Path(dataset.root) / "meta" / "normalizer_cache.pt"
+        normalizer = None
+        if self.is_main or self.world_size == 1:
+            if normalizer_cache_path.is_file():
+                print(f"Loading cached normalizer from {normalizer_cache_path} ...")
+                normalizer = copy.deepcopy(self.model.normalizer)
+                normalizer.load_state_dict(torch.load(normalizer_cache_path, map_location="cpu"))
+                print("Cached normalizer loaded.")
+            else:
+                print("Building dataset normalizer (this reads all parquet files, may be slow)...")
+                normalizer = dataset.get_normalizer()
+                torch.save(normalizer.state_dict(), normalizer_cache_path)
+                print(f"Normalizer cached to {normalizer_cache_path}")
+
         if self.world_size > 1:
             normalizer_state_list = [normalizer.state_dict() if normalizer is not None else None]
             dist.broadcast_object_list(normalizer_state_list, src=0)

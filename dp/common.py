@@ -5,6 +5,7 @@ import json
 import math
 import numbers
 import os
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -70,7 +71,7 @@ def setup_distributed() -> tuple[int, int, int]:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     world_size = int(os.environ["WORLD_SIZE"])
     backend = "nccl" if torch.cuda.is_available() else "gloo"
-    dist.init_process_group(backend=backend)
+    dist.init_process_group(backend=backend, timeout=timedelta(minutes=120))
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
     return rank, local_rank, world_size
