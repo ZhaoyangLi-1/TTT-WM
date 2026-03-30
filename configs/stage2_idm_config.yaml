@@ -81,7 +81,7 @@ train:
     variance_type: fixed_small
     clip_sample: true
     prediction_type: epsilon
-    obs_as_global_cond: false
+    obs_as_global_cond: true
     crop_shape: [224, 224]
     obs_encoder_group_norm: true
     eval_fixed_crop: true
