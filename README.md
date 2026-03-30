@@ -196,7 +196,6 @@ Common overrides:
 python train_dp.py \
   --config-name dp_config \
   dataset_root=/path/to/libero_wm \
-  shape_meta.obs.image.shape=[3,128,128] \
   data.action_key=actions \
   data.test_task_count=3
 ```
