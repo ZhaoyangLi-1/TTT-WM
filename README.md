@@ -202,7 +202,8 @@ python train_dp.py \
 
 ## Notes
 
-- Ensure the dataset path is correctly set via `TTT_WM_DATA_ROOT` or `data.root`.
+- For `train_dp.py`, set the dataset path via `TTT_WM_DATA_ROOT` or `dataset_root`.
+- For `train.py`, set the dataset path via `TTT_WM_DATA_ROOT` or `data.root`.
 - Adjust `--nproc_per_node` based on the number of available GPUs.
 - Change `--master_port` if there are conflicts with other distributed jobs.
 - Stage 2 IDM diffusion-policy training expects a valid Stage 1 checkpoint in `train.stage1_ckpt`.

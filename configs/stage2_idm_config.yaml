@@ -24,7 +24,7 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 32
+  batch_size: 128
   num_workers: 8
   shuffle: true
   pin_memory: true
@@ -32,7 +32,7 @@ dataloader:
   prefetch_factor: 4
 
 val_dataloader:
-  batch_size: 32
+  batch_size: 128
   num_workers: 8
   shuffle: false
   pin_memory: true
@@ -42,7 +42,6 @@ val_dataloader:
 train:
   compile: false
   epochs: 300
-  batch_size: 32
   gradient_accumulate_every: 1
   optimizer:
     lr: 1.0e-4

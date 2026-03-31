@@ -40,6 +40,7 @@ from dp.common import (
 class TrainDiffusionWorkspace(BaseWorkspace):
     include_keys = ("global_step", "epoch", "optimizer_step")
     exclude_keys = ("ddp_model",)
+    wandb_exclude_keys = frozenset({"global_step", "optimizer_step"})
 
     def __init__(self, cfg: OmegaConf, output_dir: str | None = None):
         super().__init__(cfg, output_dir=output_dir)
@@ -125,6 +126,14 @@ class TrainDiffusionWorkspace(BaseWorkspace):
             **logging_cfg,
         )
         return run
+
+    def _wandb_log(self, wandb_run, payload: dict, *, step: int) -> None:
+        filtered = {
+            key: value
+            for key, value in payload.items()
+            if key not in self.wandb_exclude_keys
+        }
+        wandb_run.log(filtered, step=step)
 
     def _resolve_training_device(self, cfg: OmegaConf) -> torch.device:
         device_name = str(cfg.training.device)
@@ -315,7 +324,7 @@ class TrainDiffusionWorkspace(BaseWorkspace):
                                 "train_loss_step": raw_loss_value,
                                 "lr": float(lr_scheduler.get_last_lr()[0]),
                             }
-                            wandb_run.log(batch_log, step=self.global_step)
+                            self._wandb_log(wandb_run, batch_log, step=self.global_step)
                             json_logger.log(batch_log)
                         self.global_step += 1
 
@@ -397,7 +406,7 @@ class TrainDiffusionWorkspace(BaseWorkspace):
 
                 self.model.train()
                 if self.is_main:
-                    wandb_run.log(step_log, step=self.global_step)
+                    self._wandb_log(wandb_run, step_log, step=self.global_step)
                     json_logger.log(step_log)
                 self.epoch += 1
 

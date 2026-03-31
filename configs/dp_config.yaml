@@ -98,14 +98,14 @@ training:
   tqdm_interval_sec: 1.0
 
 dataloader:
-  batch_size: 32
+  batch_size: 128
   num_workers: 8
   shuffle: true
   pin_memory: true
   persistent_workers: true
 
 val_dataloader:
-  batch_size: 32
+  batch_size: 128
   num_workers: 8
   shuffle: false
   pin_memory: true
