@@ -34,6 +34,25 @@ def _validate_stage1_micro_batch(
     return value
 
 
+def _run_stage1_in_chunks(
+    stage1: ARVideoPatchTransformer,
+    input_frames: torch.Tensor,
+    goal: Optional[torch.Tensor],
+    micro_batch: int,
+) -> torch.Tensor:
+    if micro_batch >= input_frames.shape[0]:
+        pred_frames, _ = stage1(input_frames, goal=goal)
+        return pred_frames
+
+    pred_chunks = []
+    for start in range(0, input_frames.shape[0], micro_batch):
+        end = start + micro_batch
+        goal_chunk = goal[start:end] if goal is not None else None
+        pred_chunk, _ = stage1(input_frames[start:end], goal=goal_chunk)
+        pred_chunks.append(pred_chunk)
+    return torch.cat(pred_chunks, dim=0)
+
+
 class InverseDynamicsModel(nn.Module):
     """
     Stage 2 — Inverse Dynamics Model.
@@ -69,6 +88,7 @@ class InverseDynamicsModel(nn.Module):
         self.n_actions = n_actions
         self.freeze_backbone = freeze_backbone
         self.stage1_micro_batch = _validate_stage1_micro_batch(stage1_micro_batch)
+        self._auto_stage1_micro_batch_cache: dict[int, int] = {}
 
         self.stage1 = stage1_model
         if freeze_backbone:
@@ -149,17 +169,27 @@ class InverseDynamicsModel(nn.Module):
         goal: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         micro_batch = self.stage1_micro_batch
-        if micro_batch is None or input_frames.shape[0] <= micro_batch:
-            pred_frames, _ = self.stage1(input_frames, goal=goal)
-            return pred_frames
+        if micro_batch is not None:
+            return _run_stage1_in_chunks(
+                self.stage1, input_frames, goal, micro_batch,
+            )
 
-        pred_chunks = []
-        for start in range(0, input_frames.shape[0], micro_batch):
-            end = start + micro_batch
-            goal_chunk = goal[start:end] if goal is not None else None
-            pred_chunk, _ = self.stage1(input_frames[start:end], goal=goal_chunk)
-            pred_chunks.append(pred_chunk)
-        return torch.cat(pred_chunks, dim=0)
+        batch_size = int(input_frames.shape[0])
+        cached_micro_batch = self._auto_stage1_micro_batch_cache.get(batch_size)
+        trial_micro_batch = cached_micro_batch or batch_size
+
+        while True:
+            try:
+                pred_frames = _run_stage1_in_chunks(
+                    self.stage1, input_frames, goal, trial_micro_batch,
+                )
+                self._auto_stage1_micro_batch_cache[batch_size] = trial_micro_batch
+                return pred_frames
+            except torch.OutOfMemoryError:
+                if not torch.cuda.is_available() or trial_micro_batch <= 1:
+                    raise
+                torch.cuda.empty_cache()
+                trial_micro_batch = max(1, trial_micro_batch // 2)
 
     @torch.no_grad()
     def generate(
@@ -267,6 +297,7 @@ class InverseDynamicsModelDP(nn.Module):
         self.n_obs_steps = int(n_obs_steps)
         self.freeze_backbone = freeze_backbone
         self.stage1_micro_batch = _validate_stage1_micro_batch(stage1_micro_batch)
+        self._auto_stage1_micro_batch_cache: dict[int, int] = {}
 
         self.stage1 = stage1_model
         if freeze_backbone:
@@ -408,19 +439,29 @@ class InverseDynamicsModelDP(nn.Module):
         backbone_ctx = torch.no_grad() if self.freeze_backbone else nullcontext()
         with backbone_ctx:
             micro_batch = self.stage1_micro_batch
-            if micro_batch is None or input_frames.shape[0] <= micro_batch:
-                pred_frames, _ = self.stage1(input_frames, goal=goal)
-                return pred_frames
-
-            pred_chunks = []
-            for start in range(0, input_frames.shape[0], micro_batch):
-                end = start + micro_batch
-                goal_chunk = goal[start:end] if goal is not None else None
-                pred_chunk, _ = self.stage1(
-                    input_frames[start:end], goal=goal_chunk
+            if micro_batch is not None:
+                return _run_stage1_in_chunks(
+                    self.stage1, input_frames, goal, micro_batch,
                 )
-                pred_chunks.append(pred_chunk)
-            return torch.cat(pred_chunks, dim=0)
+
+            batch_size = int(input_frames.shape[0])
+            cached_micro_batch = self._auto_stage1_micro_batch_cache.get(batch_size)
+            trial_micro_batch = cached_micro_batch or batch_size
+
+            while True:
+                try:
+                    pred_frames = _run_stage1_in_chunks(
+                        self.stage1, input_frames, goal, trial_micro_batch,
+                    )
+                    self._auto_stage1_micro_batch_cache[batch_size] = (
+                        trial_micro_batch
+                    )
+                    return pred_frames
+                except torch.OutOfMemoryError:
+                    if not torch.cuda.is_available() or trial_micro_batch <= 1:
+                        raise
+                    torch.cuda.empty_cache()
+                    trial_micro_batch = max(1, trial_micro_batch // 2)
 
     def forward(
         self,
