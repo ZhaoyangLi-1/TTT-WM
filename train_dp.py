@@ -3,9 +3,12 @@ from __future__ import annotations
 import builtins
 import logging
 import os
+import sys
+import traceback
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
+from torch.distributed.elastic.multiprocessing.errors import record
 
 from dp.runtime import configure_diffusion_policy_path, register_omegaconf_resolvers
 
@@ -30,7 +33,7 @@ register_omegaconf_resolvers()
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="dp_config")
-def main(cfg: DictConfig) -> None:
+def _hydra_main(cfg: DictConfig) -> None:
     diffusion_policy_src = OmegaConf.select(
         cfg, "runtime.diffusion_policy_src", default=None
     )
@@ -42,10 +45,28 @@ def main(cfg: DictConfig) -> None:
 
     OmegaConf.resolve(cfg)
 
+    from dp.common import cleanup_distributed
     from dp.train_workspace import TrainDiffusionWorkspace
 
-    workspace = TrainDiffusionWorkspace(cfg)
-    workspace.run()
+    try:
+        workspace = TrainDiffusionWorkspace(cfg)
+        workspace.run()
+    except BaseException as exc:
+        rank = os.environ.get("RANK", "0")
+        sys.stderr.write(
+            f"[rank{rank}] Unhandled exception in train_dp.py: "
+            f"{type(exc).__name__}: {exc}\n"
+        )
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        raise
+    finally:
+        cleanup_distributed()
+
+
+@record
+def main() -> None:
+    _hydra_main()
 
 
 if __name__ == "__main__":

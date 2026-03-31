@@ -14,6 +14,19 @@ import torch.distributed as dist
 from torch.optim.lr_scheduler import LambdaLR
 
 
+def _set_dist_env_defaults() -> None:
+    if not torch.cuda.is_available():
+        return
+
+    defaults = {
+        "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
+        "NCCL_IB_TIMEOUT": "23",
+        "NCCL_IB_RETRY_CNT": "7",
+    }
+    for key, value in defaults.items():
+        os.environ.setdefault(key, value)
+
+
 def dict_apply(x: Any, func: Callable[[torch.Tensor], torch.Tensor]) -> Any:
     if isinstance(x, dict):
         return {key: dict_apply(value, func) for key, value in x.items()}
@@ -71,6 +84,7 @@ def setup_distributed() -> tuple[int, int, int]:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     world_size = int(os.environ["WORLD_SIZE"])
     backend = "nccl" if torch.cuda.is_available() else "gloo"
+    _set_dist_env_defaults()
     dist.init_process_group(backend=backend, timeout=timedelta(minutes=120))
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
@@ -78,8 +92,12 @@ def setup_distributed() -> tuple[int, int, int]:
 
 
 def cleanup_distributed() -> None:
-    if is_dist_initialized():
+    if not is_dist_initialized():
+        return
+    try:
         dist.destroy_process_group()
+    except Exception:
+        pass
 
 
 def distributed_mean(value: float | torch.Tensor, device: torch.device) -> float:

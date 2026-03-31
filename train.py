@@ -1213,9 +1213,16 @@ class Trainer:
 
     def _load_stage1_weights(self, model, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        model.load_state_dict(_clean_state_dict(ckpt["model"]))
+        if "ema" in ckpt:
+            ema_state = ckpt["ema"]
+            raw_sd = ema_state["shadow"] if "shadow" in ema_state else ema_state
+            weight_source = "EMA"
+        else:
+            raw_sd = ckpt["model"]
+            weight_source = "live"
+        model.load_state_dict(_clean_state_dict(raw_sd))
         if self.is_main:
-            log.info(f"Loaded Stage 1 from {path}")
+            log.info(f"Loaded Stage 1 ({weight_source} weights) from {path}")
 
     # --- Epoch loop ---
 
