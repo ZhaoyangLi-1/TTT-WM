@@ -21,6 +21,19 @@ import torch.nn.functional as F
 from cosmos_model import ARVideoPatchTransformer
 
 
+def _validate_stage1_micro_batch(
+    stage1_micro_batch: Optional[int],
+) -> Optional[int]:
+    if stage1_micro_batch is None:
+        return None
+    value = int(stage1_micro_batch)
+    if value <= 0:
+        raise ValueError(
+            f"stage1_micro_batch must be positive when set, got {value}."
+        )
+    return value
+
+
 class InverseDynamicsModel(nn.Module):
     """
     Stage 2 — Inverse Dynamics Model.
@@ -48,12 +61,14 @@ class InverseDynamicsModel(nn.Module):
         stage1_model: ARVideoPatchTransformer,
         n_actions: int,
         freeze_backbone: bool = True,
+        stage1_micro_batch: Optional[int] = None,
     ):
         super().__init__()
         cfg = stage1_model.cfg
         self.cfg = cfg
         self.n_actions = n_actions
         self.freeze_backbone = freeze_backbone
+        self.stage1_micro_batch = _validate_stage1_micro_batch(stage1_micro_batch)
 
         self.stage1 = stage1_model
         if freeze_backbone:
@@ -102,7 +117,7 @@ class InverseDynamicsModel(nn.Module):
         backbone_ctx = torch.no_grad() if self.freeze_backbone else nullcontext()
 
         with backbone_ctx:
-            pred_frames, _ = self.stage1(input_frames, goal=goal)
+            pred_frames = self._predict_next_frame(input_frames, goal=goal)
             all_frames = torch.cat([input_frames, pred_frames], dim=1)
 
             tokens = self.stage1._embed_frames(all_frames)
@@ -127,6 +142,24 @@ class InverseDynamicsModel(nn.Module):
             loss = F.mse_loss(pred_actions, actions)
 
         return pred_frames, pred_actions, loss
+
+    def _predict_next_frame(
+        self,
+        input_frames: torch.Tensor,
+        goal: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        micro_batch = self.stage1_micro_batch
+        if micro_batch is None or input_frames.shape[0] <= micro_batch:
+            pred_frames, _ = self.stage1(input_frames, goal=goal)
+            return pred_frames
+
+        pred_chunks = []
+        for start in range(0, input_frames.shape[0], micro_batch):
+            end = start + micro_batch
+            goal_chunk = goal[start:end] if goal is not None else None
+            pred_chunk, _ = self.stage1(input_frames[start:end], goal=goal_chunk)
+            pred_chunks.append(pred_chunk)
+        return torch.cat(pred_chunks, dim=0)
 
     @torch.no_grad()
     def generate(
@@ -204,6 +237,7 @@ class InverseDynamicsModelDP(nn.Module):
         crop_shape: Tuple[int, int] = (84, 84),
         obs_encoder_group_norm: bool = True,
         eval_fixed_crop: bool = True,
+        stage1_micro_batch: Optional[int] = None,
     ):
         super().__init__()
         _configure_diffusion_policy_import_path()
@@ -232,6 +266,7 @@ class InverseDynamicsModelDP(nn.Module):
         )
         self.n_obs_steps = int(n_obs_steps)
         self.freeze_backbone = freeze_backbone
+        self.stage1_micro_batch = _validate_stage1_micro_batch(stage1_micro_batch)
 
         self.stage1 = stage1_model
         if freeze_backbone:
@@ -372,8 +407,20 @@ class InverseDynamicsModelDP(nn.Module):
     ) -> torch.Tensor:
         backbone_ctx = torch.no_grad() if self.freeze_backbone else nullcontext()
         with backbone_ctx:
-            pred_frames, _ = self.stage1(input_frames, goal=goal)
-        return pred_frames
+            micro_batch = self.stage1_micro_batch
+            if micro_batch is None or input_frames.shape[0] <= micro_batch:
+                pred_frames, _ = self.stage1(input_frames, goal=goal)
+                return pred_frames
+
+            pred_chunks = []
+            for start in range(0, input_frames.shape[0], micro_batch):
+                end = start + micro_batch
+                goal_chunk = goal[start:end] if goal is not None else None
+                pred_chunk, _ = self.stage1(
+                    input_frames[start:end], goal=goal_chunk
+                )
+                pred_chunks.append(pred_chunk)
+            return torch.cat(pred_chunks, dim=0)
 
     def forward(
         self,
