@@ -135,6 +135,26 @@ class TrainDiffusionWorkspace(BaseWorkspace):
         }
         wandb_run.log(filtered, step=step)
 
+    def _format_wandb_batch_log(self, loss_value: float, lr: float) -> dict:
+        return {
+            "train/loss": float(loss_value),
+            "train/lr": float(lr),
+            "train/epoch": int(self.epoch),
+        }
+
+    def _format_wandb_epoch_log(self, step_log: dict) -> dict:
+        wandb_log = {
+            "train/epoch": int(step_log["epoch"]),
+            "train/lr": float(step_log["lr"]),
+        }
+        if "val_loss" in step_log:
+            wandb_log["val/loss"] = float(step_log["val_loss"])
+        if "train_action_mse_error" in step_log:
+            wandb_log["train/action_mse_error"] = float(
+                step_log["train_action_mse_error"]
+            )
+        return wandb_log
+
     def _resolve_training_device(self, cfg: OmegaConf) -> torch.device:
         device_name = str(cfg.training.device)
         if self.world_size > 1:
@@ -317,14 +337,19 @@ class TrainDiffusionWorkspace(BaseWorkspace):
                         tepoch.set_postfix(loss=raw_loss_value, refresh=False)
 
                         if self.is_main:
+                            current_lr = float(lr_scheduler.get_last_lr()[0])
                             batch_log = {
                                 "epoch": self.epoch,
                                 "global_step": self.global_step,
                                 "optimizer_step": self.optimizer_step,
                                 "train_loss_step": raw_loss_value,
-                                "lr": float(lr_scheduler.get_last_lr()[0]),
+                                "lr": current_lr,
                             }
-                            self._wandb_log(wandb_run, batch_log, step=self.global_step)
+                            self._wandb_log(
+                                wandb_run,
+                                self._format_wandb_batch_log(raw_loss_value, current_lr),
+                                step=self.global_step,
+                            )
                             json_logger.log(batch_log)
                         self.global_step += 1
 
@@ -406,7 +431,11 @@ class TrainDiffusionWorkspace(BaseWorkspace):
 
                 self.model.train()
                 if self.is_main:
-                    self._wandb_log(wandb_run, step_log, step=self.global_step)
+                    self._wandb_log(
+                        wandb_run,
+                        self._format_wandb_epoch_log(step_log),
+                        step=self.global_step,
+                    )
                     json_logger.log(step_log)
                 self.epoch += 1
 
