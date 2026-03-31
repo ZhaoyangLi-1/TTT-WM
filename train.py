@@ -879,6 +879,7 @@ class Trainer:
         using_diffusion_policy_idm = (
             self.stage == 2 and self.idm_type in {"dp", "diffusion", "diffusion_policy"}
         )
+        self._stage2_dp_ddp_safe_mode = self.world_size > 1 and using_diffusion_policy_idm
         if self.world_size > 1 and using_diffusion_policy_idm and hasattr(torch, "_dynamo"):
             torch._dynamo.config.optimize_ddp = False
             if self.is_main:
@@ -893,12 +894,18 @@ class Trainer:
                 raw_model,
                 device_ids=[self.local_rank],
                 output_device=self.local_rank,
+                broadcast_buffers=not self._stage2_dp_ddp_safe_mode,
                 find_unused_parameters=bool(
                     cfg.train.get("find_unused_parameters", False)
                 ),
             )
             if self.is_main:
                 log.info(f"DDP enabled ({self.world_size} GPUs)")
+                if self._stage2_dp_ddp_safe_mode:
+                    log.info(
+                        "Disabled DDP buffer broadcasts for stage=2 diffusion_policy IDM "
+                        "to avoid collective mismatches from buffer sync."
+                    )
         else:
             self.model = raw_model
 
@@ -1413,6 +1420,8 @@ class Trainer:
 
     def _sync_model_before_logging(self):
         if self.world_size <= 1:
+            return
+        if getattr(self, "_stage2_dp_ddp_safe_mode", False):
             return
         raw = unwrap_model(self.model)
         for p in raw.parameters():
