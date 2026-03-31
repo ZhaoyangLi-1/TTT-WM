@@ -37,6 +37,9 @@ class TTTWMParquetImageDataset(BaseImageDataset):
         pad_before: int = 0,
         pad_after: int = 0,
         n_obs_steps: int | None = None,
+        sample_mode: str = "horizon_pad",
+        frame_gap: int | None = None,
+        frames_out: int = 1,
         action_key: str = "actions",
         obs_key_mapping: dict[str, str] | None = None,
         split: str = "train",
@@ -65,6 +68,9 @@ class TTTWMParquetImageDataset(BaseImageDataset):
         self.pad_before = int(pad_before)
         self.pad_after = int(pad_after)
         self.n_obs_steps = int(n_obs_steps) if n_obs_steps is not None else self.horizon
+        self.sample_mode = str(sample_mode).lower()
+        self.frame_gap = int(frame_gap) if frame_gap is not None else self.horizon
+        self.frames_out = int(frames_out)
         self.action_key = str(action_key)
         self.obs_key_mapping = dict(obs_key_mapping)
         self.split = split
@@ -81,6 +87,15 @@ class TTTWMParquetImageDataset(BaseImageDataset):
             raise ValueError("horizon must be >= 1")
         if self.n_obs_steps < 1:
             raise ValueError("n_obs_steps must be >= 1")
+        if self.sample_mode not in {"horizon_pad", "video_frame"}:
+            raise ValueError(
+                f"Unsupported sample_mode={self.sample_mode}. Use horizon_pad or video_frame."
+            )
+        if self.sample_mode == "video_frame" and self.horizon != self.frame_gap:
+            raise ValueError(
+                "video_frame sample_mode requires horizon == frame_gap so the "
+                "returned action sequence matches the policy horizon."
+            )
 
         action_shape = tuple(shape_meta["action"]["shape"])
         if len(action_shape) != 1:
@@ -126,12 +141,21 @@ class TTTWMParquetImageDataset(BaseImageDataset):
         )
 
         self.samples: list[tuple[int, int]] = []
-        for episode_idx in self._episode_indices:
-            ep_length = self._episode_meta[episode_idx]["length"]
-            min_start = -self.pad_before
-            max_start = ep_length - self.horizon + self.pad_after
-            for start in range(min_start, max_start + 1):
-                self.samples.append((episode_idx, start))
+        if self.sample_mode == "video_frame":
+            span = self.n_obs_steps + self.frame_gap + self.frames_out - 1
+            for episode_idx in self._episode_indices:
+                ep_length = self._episode_meta[episode_idx]["length"]
+                if ep_length < span:
+                    continue
+                for start in range(ep_length - span + 1):
+                    self.samples.append((episode_idx, start))
+        else:
+            for episode_idx in self._episode_indices:
+                ep_length = self._episode_meta[episode_idx]["length"]
+                min_start = -self.pad_before
+                max_start = ep_length - self.horizon + self.pad_after
+                for start in range(min_start, max_start + 1):
+                    self.samples.append((episode_idx, start))
 
         if self.verbose:
             split_tasks = sorted(
@@ -157,6 +181,9 @@ class TTTWMParquetImageDataset(BaseImageDataset):
             pad_before=self.pad_before,
             pad_after=self.pad_after,
             n_obs_steps=self.n_obs_steps,
+            sample_mode=self.sample_mode,
+            frame_gap=self.frame_gap,
+            frames_out=self.frames_out,
             action_key=self.action_key,
             obs_key_mapping=self.obs_key_mapping,
             split_mode=self.split_mode,
@@ -420,8 +447,15 @@ class TTTWMParquetImageDataset(BaseImageDataset):
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         episode_idx, start = self.samples[idx]
         df = self._read_parquet(episode_idx)
-        row_indices = self._build_row_indices(episode_idx, start)
-        obs_row_indices = row_indices[: self.n_obs_steps]
+        if self.sample_mode == "video_frame":
+            obs_row_indices = [start + offset for offset in range(self.n_obs_steps)]
+            action_start = start + self.n_obs_steps - 1
+            action_row_indices = [
+                action_start + offset for offset in range(self.frame_gap)
+            ]
+        else:
+            action_row_indices = self._build_row_indices(episode_idx, start)
+            obs_row_indices = action_row_indices[: self.n_obs_steps]
 
         obs_dict: dict[str, np.ndarray] = {}
         for obs_key in self.rgb_keys:
@@ -445,7 +479,10 @@ class TTTWMParquetImageDataset(BaseImageDataset):
             )
 
         action = np.stack(
-            [self._decode_action_value(df.iloc[row_idx][self.action_key]) for row_idx in row_indices],
+            [
+                self._decode_action_value(df.iloc[row_idx][self.action_key])
+                for row_idx in action_row_indices
+            ],
             axis=0,
         )
 
