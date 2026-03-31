@@ -6,7 +6,7 @@ experiment_name: cosmos_stage2_idm_dp_gap_${data.frame_gap}
 seed: 42
 
 data:
-  use_goal: false
+  use_goal: true
   frame_gap: 4
   test_task_count: 3
   test_tasks: []

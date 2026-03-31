@@ -863,7 +863,7 @@ class Trainer:
                     n_actions=int(cfg.data.get("frame_gap", 0)),
                     freeze_backbone=bool(cfg.train.get("freeze_backbone", True)),
                 ).to(self.device)
-            raw_model.prebuild_mask(device=self.device)
+            raw_model.prebuild_mask(device=self.device, has_goal=has_goal)
         else:
             raw_model.prebuild_mask(device=self.device, has_goal=has_goal)
 
@@ -1312,7 +1312,7 @@ class Trainer:
                             if self.stage == 1:
                                 _, loss = self.model(context, target, goal)
                             else:
-                                _, _, loss = self.model(context, target, actions)
+                                _, _, loss = self.model(context, target, actions, goal=goal)
                             scaled = loss / self.grad_accum_steps
                         self.scaler.scale(scaled).backward()
                     except RuntimeError as e:
@@ -1379,7 +1379,7 @@ class Trainer:
                             if self.stage == 1:
                                 _, loss = self.model(context, target, goal)
                             else:
-                                _, _, loss = self.model(context, target, actions)
+                                _, _, loss = self.model(context, target, actions, goal=goal)
                     except RuntimeError as e:
                         if self._is_fatal_dist_error(e):
                             log.error(f"[Rank {self.rank}] Eval error: {e}")
@@ -1482,7 +1482,7 @@ class Trainer:
             if self.stage == 1:
                 pred_frames, _ = raw(context, target, goals)
             else:
-                pred_frames, _, _ = raw(context, target, actions)
+                pred_frames, _, _ = raw(context, target, actions, goal=goals)
 
         if self.ema:
             self.ema.restore(raw)
@@ -1569,7 +1569,7 @@ class Trainer:
             if self.stage == 1:
                 pred_frames, _ = raw(context, target, goals)
             else:
-                pred_frames, _, _ = raw(context, target, actions)
+                pred_frames, _, _ = raw(context, target, actions, goal=goals)
 
         if self.ema:
             self.ema.restore(raw)

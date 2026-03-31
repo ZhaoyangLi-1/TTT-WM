@@ -25,12 +25,13 @@ class InverseDynamicsModel(nn.Module):
     """
     Stage 2 — Inverse Dynamics Model.
 
-    Uses a frozen Stage 1 video predictor to generate predicted frames,
-    then predicts intermediate actions from (input_frames, predicted_frames).
+    Uses a frozen Stage 1 video predictor to generate goal-conditioned next
+    frames, then predicts intermediate actions from (input_frames,
+    predicted_frames).
 
     Forward flow
     -------------
-        1. Frozen Stage 1: input_frames → predicted_frames
+        1. Frozen Stage 1: (input_frames, goal) → predicted_frames
         2. Encode [input | predicted] through Stage 1 backbone
         3. Mean-pool per-frame hidden states, concatenate
         4. Trainable MLP head: (2 × d_model) → (n_actions × action_dim)
@@ -82,9 +83,8 @@ class InverseDynamicsModel(nn.Module):
         return self
 
     def prebuild_mask(self, device: torch.device, has_goal: bool = False) -> None:
-        del has_goal
         self.stage1._ensure_mask(
-            self.cfg.frames_in, 0, device, has_goal=False,
+            self.cfg.frames_in, 0, device, has_goal=has_goal,
         )
         self.stage1._ensure_mask(2, 0, device, has_goal=False)
 
@@ -95,14 +95,14 @@ class InverseDynamicsModel(nn.Module):
         actions: Optional[torch.Tensor] = None,
         goal: Optional[torch.Tensor] = None,
     ):
-        del target_frames, goal
+        del target_frames
 
         batch_size = input_frames.shape[0]
         n_patches = self.cfg.n_patches
         backbone_ctx = torch.no_grad() if self.freeze_backbone else nullcontext()
 
         with backbone_ctx:
-            pred_frames, _ = self.stage1(input_frames)
+            pred_frames, _ = self.stage1(input_frames, goal=goal)
             all_frames = torch.cat([input_frames, pred_frames], dim=1)
 
             tokens = self.stage1._embed_frames(all_frames)
@@ -134,8 +134,11 @@ class InverseDynamicsModel(nn.Module):
         input_frames: torch.Tensor,
         goal: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        del goal
-        pred_frames, pred_actions, _ = self.forward(input_frames, actions=None)
+        pred_frames, pred_actions, _ = self.forward(
+            input_frames,
+            actions=None,
+            goal=goal,
+        )
         return pred_frames, pred_actions
 
 
@@ -296,10 +299,9 @@ class InverseDynamicsModelDP(nn.Module):
             self.stage1.eval()
         return self
 
-    def prebuild_mask(self, device: torch.device, has_goal: bool = False) -> None:
-        del has_goal
+    def prebuild_mask(self, device: torch.device, has_goal: bool = True) -> None:
         self.stage1._ensure_mask(
-            self.cfg.frames_in, 0, device, has_goal=False,
+            self.cfg.frames_in, 0, device, has_goal=has_goal,
         )
 
     def set_action_stats(
@@ -366,10 +368,11 @@ class InverseDynamicsModelDP(nn.Module):
     def _predict_next_frame(
         self,
         input_frames: torch.Tensor,
+        goal: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         backbone_ctx = torch.no_grad() if self.freeze_backbone else nullcontext()
         with backbone_ctx:
-            pred_frames, _ = self.stage1(input_frames)
+            pred_frames, _ = self.stage1(input_frames, goal=goal)
         return pred_frames
 
     def forward(
@@ -379,9 +382,9 @@ class InverseDynamicsModelDP(nn.Module):
         actions: Optional[torch.Tensor] = None,
         goal: Optional[torch.Tensor] = None,
     ):
-        del target_frames, goal
+        del target_frames
 
-        pred_frames = self._predict_next_frame(input_frames)
+        pred_frames = self._predict_next_frame(input_frames, goal=goal)
         obs_dict = self._build_obs_dict(input_frames, pred_frames)
 
         loss = None
@@ -404,8 +407,7 @@ class InverseDynamicsModelDP(nn.Module):
         input_frames: torch.Tensor,
         goal: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        del goal
-        pred_frames = self._predict_next_frame(input_frames)
+        pred_frames = self._predict_next_frame(input_frames, goal=goal)
         obs_dict = self._build_obs_dict(input_frames, pred_frames)
         pred_actions = self.policy.predict_action(obs_dict)["action"]
         return pred_frames, pred_actions
