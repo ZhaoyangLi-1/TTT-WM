@@ -16,19 +16,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
     build-essential \
     ca-certificates \
+    curl \
+    wget \
     ffmpeg \
     git \
+    htop \
     libglib2.0-0 \
+    libgl1-mesa-glx \
     libsm6 \
     libxext6 \
     libxrender1 \
     tmux \
+    unzip \
     zip \
     rclone \
     vim \
+    libglfw3 \
+    libglew-dev \
+    xvfb \
+    libosmesa6-dev \
     && rm -rf /var/lib/apt/lists/*
-
-RUN nvcc -V
 
 COPY requirements.txt install_diffusion_policy.sh ./
 
