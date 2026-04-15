@@ -10,6 +10,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     DP_PATH=/opt/src/diffusion-policy \
     DIFFUSION_POLICY_SRC=/opt/src/diffusion-policy
 
+WORKDIR /workspace
+RUN git clone https://github.com/ZhaoyangLi-1/TTT-WM.git
+
 WORKDIR /workspace/TTT-WM
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -37,16 +40,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libosmesa6-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt install_diffusion_policy.sh ./
-
 RUN python -m pip install --upgrade pip setuptools wheel && \
     python -m pip install -r requirements.txt && \
     python -m pip install --no-build-isolation flash-attn && \
     sed -i 's/\r//' install_diffusion_policy.sh && \
     chmod +x install_diffusion_policy.sh && \
     DP_PATH="${DP_PATH}" bash ./install_diffusion_policy.sh
-
-COPY . .
 
 ENV PYTHONPATH=/workspace/TTT-WM:/opt/src/diffusion-policy
 
