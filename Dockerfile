@@ -41,11 +41,13 @@ COPY requirements.txt install_diffusion_policy.sh ./
 
 RUN python -m pip install --upgrade pip setuptools wheel && \
     python -m pip install -r requirements.txt && \
+    python -m pip install --no-build-isolation flash-attn && \
+    sed -i 's/\r//' install_diffusion_policy.sh && \
     chmod +x install_diffusion_policy.sh && \
     DP_PATH="${DP_PATH}" bash ./install_diffusion_policy.sh
 
 COPY . .
 
-ENV PYTHONPATH=/workspace/TTT-WM:/opt/src/diffusion-policy:${PYTHONPATH}
+ENV PYTHONPATH=/workspace/TTT-WM:/opt/src/diffusion-policy
 
 CMD ["bash"]

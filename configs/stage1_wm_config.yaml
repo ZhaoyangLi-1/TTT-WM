@@ -21,7 +21,7 @@ model:
 
 data:
   type: real                           # "synthetic" | "real"
-  root: ${oc.env:TTT_WM_DATA_ROOT,/scr2/zhaoyang}/libero_wm  # parquet dataset root; LIBERO-90 HDF5 can be converted with scripts/prepare_libero90_hdf5.py
+  root: ${oc.env:TTT_WM_DATA_ROOT,/scr2/zhaoyang/libero_wm}  # parquet dataset root; LIBERO-90 HDF5 can be converted with scripts/prepare_libero90_hdf5.py
   image_key: image                     # column name in parquet ("image" or "wrist_image")
   action_key: actions                  # column name for actions in parquet
   action_dim: 7                        # dimensionality of action vector
