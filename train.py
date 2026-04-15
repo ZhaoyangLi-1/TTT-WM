@@ -854,14 +854,12 @@ class Trainer:
                 raw_model = _IDMModelDP(
                     raw_model,
                     n_actions=int(cfg.data.get("frame_gap", 0)),
-                    freeze_backbone=bool(cfg.train.get("freeze_backbone", True)),
                     **OmegaConf.to_container(cfg.train.get("idm_dp", {}), resolve=True),
                 ).to(self.device)
             else:
                 raw_model = _IDMModel(
                     raw_model,
                     n_actions=int(cfg.data.get("frame_gap", 0)),
-                    freeze_backbone=bool(cfg.train.get("freeze_backbone", True)),
                 ).to(self.device)
             raw_model.prebuild_mask(device=self.device, has_goal=has_goal)
         else:
@@ -968,21 +966,9 @@ class Trainer:
                 )
 
         # --- Optimizer ---
-        if self.stage == 2 and bool(cfg.train.get("freeze_backbone", True)):
-            trainable = [
-                p for p in unwrap_model(self.model).parameters() if p.requires_grad
-            ]
-            self.optimizer = torch.optim.AdamW(
-                trainable,
-                lr=cfg.train.optimizer.lr,
-                weight_decay=cfg.train.optimizer.weight_decay,
-                betas=tuple(cfg.train.optimizer.betas),
-                eps=float(cfg.train.optimizer.get("eps", 1.0e-8)),
-            )
-        else:
-            self.optimizer = build_optimizer(
-                unwrap_model(self.model), cfg.train.optimizer, self.is_main
-            )
+        self.optimizer = build_optimizer(
+            unwrap_model(self.model), cfg.train.optimizer, self.is_main
+        )
 
         # --- AMP ---
         self.use_amp = cfg.train.amp and self.device.type == "cuda"
