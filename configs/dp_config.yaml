@@ -86,7 +86,7 @@ training:
   resume_path: null
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 300
+  num_epochs: 100
   gradient_accumulate_every: 1
   grad_clip: 1.0
   use_ema: true

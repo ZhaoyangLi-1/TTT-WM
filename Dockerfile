@@ -11,9 +11,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     DIFFUSION_POLICY_SRC=/opt/src/diffusion-policy
 
 WORKDIR /workspace
-RUN git clone https://github.com/ZhaoyangLi-1/TTT-WM.git
-
-WORKDIR /workspace/TTT-WM
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
@@ -43,6 +40,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y git-lfs \
     && git lfs install \
     && rm -rf /var/lib/apt/lists/*
+
+RUN git clone https://github.com/ZhaoyangLi-1/TTT-WM.git
+
+WORKDIR /workspace/TTT-WM
 
 RUN python -m pip install --upgrade pip setuptools wheel && \
     python -m pip install -r requirements.txt && \
