@@ -34,7 +34,7 @@ data:
   n_train: 2000                        # only used when type=synthetic
   n_val:   200
   moving_dot: true
-  num_workers: 8
+  num_workers: 4
   pin_memory: true
   persistent_workers: true    # keep worker processes alive between epochs
   prefetch_factor: 4          # prefetch batches per worker
@@ -44,7 +44,7 @@ train:
   max_dl_timeouts: 5
   compile: true               # torch.compile — significant speedup on H100
   epochs: 100
-  batch_size: 90             # H100 80G — 22M model @ 128x128, seq_len=512 tokens
+  batch_size: 16             # H100 80G — 22M model @ 128x128, seq_len=512 tokens
   optimizer:
     lr: 1.0e-4             # Cosmos / GPT training typically uses higher lr
     weight_decay: 1.0e-2
