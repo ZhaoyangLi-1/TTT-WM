@@ -10,8 +10,8 @@ model:
 
   # Cosmos-style causal transformer
   d_model: 768
-  n_heads: 8
-  n_layers: 8
+  n_heads: 12
+  n_layers: 12
   mlp_ratio: 4.0           # standard GELU MLP
   dropout: 0.1             # causal model benefits from dropout
 
