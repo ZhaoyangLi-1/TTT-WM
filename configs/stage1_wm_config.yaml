@@ -4,12 +4,12 @@ seed: 42
 outputs_root: ${oc.env:TTT_WM_OUTPUTS_ROOT,/ariesdv0/zhaoyang/data}
 
 model:
-  resolution: 256
+  resolution: 128
   num_channels: 3
   patch_size: 8            # 8×8 patches → 256 patches/frame
 
   # Cosmos-style causal transformer
-  d_model: 512
+  d_model: 768
   n_heads: 8
   n_layers: 8
   mlp_ratio: 4.0           # standard GELU MLP

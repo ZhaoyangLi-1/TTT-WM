@@ -21,7 +21,7 @@ shape_meta:
     shape: [7]
   obs:
     image:
-      shape: [3, 256, 256]
+      shape: [3, 128, 128]
       type: rgb
 
 data:
