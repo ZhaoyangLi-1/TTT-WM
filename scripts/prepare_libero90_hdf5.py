@@ -13,6 +13,7 @@ Example:
         --output-root /scr2/zhaoyang/libero_wm\
         --num-test-tasks 3 \
         --seed 42 \
+        --num-workers 48 \
         --overwrite
 """
 
@@ -41,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, required=True, help="Output parquet dataset root.")
     parser.add_argument("--base-root", type=Path, default=None, help="Optional existing parquet dataset root to merge first, e.g. /scr2/zhaoyang/libero.")
     parser.add_argument("--chunks-size", type=int, default=1000, help="Episodes per parquet chunk directory.")
-    parser.add_argument("--fps", type=int, default=20, help="Frame rate written into meta/info.json.")
+    parser.add_argument("--fps", type=int, default=10, help="Frame rate written into meta/info.json.")
     parser.add_argument("--camera-key", type=str, default="agentview_rgb", help="Observation key used as the main image column.")
     parser.add_argument("--wrist-camera-key", type=str, default="eye_in_hand_rgb", help="Observation key used as the wrist_image column.")
     parser.add_argument("--num-test-tasks", type=int, default=3, help="Number of LIBERO-90 tasks to hold out into meta/test_tasks.json.")
