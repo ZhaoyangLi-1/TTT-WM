@@ -80,7 +80,7 @@ train:
     clip_sample: true
     prediction_type: epsilon
     obs_as_global_cond: true
-    crop_shape: [224, 224]
+    crop_shape: [112, 112]
     obs_encoder_group_norm: true
     eval_fixed_crop: true
     stage1_micro_batch: null
@@ -89,6 +89,7 @@ train:
     kernel_size: 5
     n_groups: 8
     cond_predict_scale: true
+
 
 wandb:
   enabled: true
