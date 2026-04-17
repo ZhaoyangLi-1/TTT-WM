@@ -69,7 +69,7 @@ train:
 
 wandb:
   enabled: true
-  project: TTT-WM
+  project: TTT-WM-diffusion
   name: ${experiment_name}
 
 hydra:
