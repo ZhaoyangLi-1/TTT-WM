@@ -98,7 +98,16 @@ def get_split_episodes(dataset_root: str, data_cfg) -> dict[str, list[int]]:
 
     test_task_count = int(data_cfg.get("test_task_count", 0))
     if configured_test_tasks:
-        selected_test_tasks = configured_test_tasks
+        known_task_names = set(task_names)
+        unknown = [task for task in configured_test_tasks if task not in known_task_names]
+        if unknown:
+            print(
+                "Ignoring held-out tasks absent from the current dataset root: "
+                + ", ".join(unknown)
+            )
+        selected_test_tasks = [
+            task for task in configured_test_tasks if task in known_task_names
+        ]
     elif test_task_count > 0:
         selected_test_tasks = task_names[:test_task_count]
     else:

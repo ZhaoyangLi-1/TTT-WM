@@ -269,9 +269,14 @@ class TTTWMParquetImageDataset(BaseImageDataset):
             selected = task_names[: self.test_task_count]
 
         if selected:
-            unknown = sorted(set(selected) - set(task_names))
-            if unknown:
-                raise ValueError("Missing test tasks: " + ", ".join(unknown))
+            known_task_names = set(task_names)
+            unknown = [task for task in selected if task not in known_task_names]
+            if unknown and self.verbose:
+                print(
+                    "[TTTWMParquetImageDataset] ignoring held-out tasks absent from the "
+                    f"current dataset root: {', '.join(unknown)}"
+                )
+            selected = [task for task in selected if task in known_task_names]
         return selected
 
     def _split_episode_indices(
