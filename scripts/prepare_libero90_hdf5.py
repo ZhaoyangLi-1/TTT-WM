@@ -24,6 +24,7 @@ import json
 import random
 import shutil
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +49,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tasks", type=int, default=None, help="Optional limit for smoke tests.")
     parser.add_argument("--max-demos-per-task", type=int, default=None, help="Optional limit for smoke tests.")
     parser.add_argument("--max-base-episodes", type=int, default=None, help="Optional limit when copying the base parquet dataset.")
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help="Parallel worker processes for LIBERO-90 demo conversion. 1 disables parallelism.",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Remove output_root before writing.")
     return parser.parse_args()
 
@@ -233,6 +240,146 @@ def collect_hdf5_task_records(hdf5_files: list[Path]) -> list[dict[str, str]]:
     return task_records
 
 
+def _convert_hdf5_demo_job(job: dict[str, Any]) -> dict[str, Any]:
+    hdf5_path = Path(job["hdf5_path"])
+    output_path = Path(job["output_path"])
+
+    with h5py.File(hdf5_path, "r") as h5_file:
+        demo = h5_file["data"][job["demo_key"]]
+        obs = demo["obs"]
+        images = obs[job["camera_key"]][:]
+        wrist_images = obs[job["wrist_camera_key"]][:]
+        actions = demo["actions"][:].astype(np.float32)
+        state_vec = np.concatenate(
+            [
+                obs["ee_states"][:].astype(np.float32),
+                obs["gripper_states"][:].astype(np.float32),
+            ],
+            axis=-1,
+        )
+
+        if images.shape[0] != actions.shape[0]:
+            raise ValueError(
+                f"{hdf5_path.name}:{job['demo_key']} has {images.shape[0]} images but {actions.shape[0]} actions."
+            )
+        if wrist_images.shape[0] != images.shape[0]:
+            raise ValueError(
+                f"{hdf5_path.name}:{job['demo_key']} has {wrist_images.shape[0]} wrist frames but {images.shape[0]} images."
+            )
+
+        rows = []
+        for frame_idx in range(images.shape[0]):
+            rows.append(
+                {
+                    "image": {
+                        "bytes": encode_png(images[frame_idx]),
+                        "path": f"{hdf5_path.stem}/{job['demo_key']}/image/{frame_idx:06d}.png",
+                    },
+                    "wrist_image": {
+                        "bytes": encode_png(wrist_images[frame_idx]),
+                        "path": f"{hdf5_path.stem}/{job['demo_key']}/wrist_image/{frame_idx:06d}.png",
+                    },
+                    "state": state_vec[frame_idx],
+                    "actions": actions[frame_idx],
+                    "timestamp": np.float32(frame_idx / job["fps"]),
+                    "frame_index": np.int64(frame_idx),
+                    "episode_index": np.int64(job["episode_index"]),
+                    "index": np.int64(job["global_frame_index"] + frame_idx),
+                    "task_index": np.int64(job["task_index"]),
+                }
+            )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_parquet(output_path, index=False)
+    return {
+        "episode_index": int(job["episode_index"]),
+        "length": int(job["length"]),
+        "output_path": str(output_path),
+    }
+
+
+def build_hdf5_demo_jobs(
+    hdf5_files: list[Path],
+    output_root: Path,
+    chunks_size: int,
+    fps: int,
+    camera_key: str,
+    wrist_camera_key: str,
+    task_to_idx: dict[str, int],
+    task_records: list[dict[str, Any]],
+    episode_records: list[dict[str, Any]],
+    state: dict[str, Any],
+    max_demos_per_task: int | None,
+    heldout_tasks: set[str],
+) -> list[dict[str, Any]]:
+    jobs: list[dict[str, Any]] = []
+    for hdf5_path in tqdm(hdf5_files, desc="scan_libero90", leave=False):
+        with h5py.File(hdf5_path, "r") as h5_file:
+            data_group = h5_file["data"]
+            task_record = parse_hdf5_task_record(h5_file, hdf5_path.name)
+            task_name = task_record["task"]
+            if task_name in heldout_tasks:
+                continue
+
+            task_index = register_task(
+                task_name, task_to_idx, task_records, task_record=task_record
+            )
+
+            demo_keys = sorted_demo_keys(data_group)
+            if max_demos_per_task is not None:
+                demo_keys = demo_keys[:max_demos_per_task]
+
+            for demo_key in demo_keys:
+                demo = data_group[demo_key]
+                obs = demo["obs"]
+                frame_count = int(obs[camera_key].shape[0])
+                action_count = int(demo["actions"].shape[0])
+
+                if frame_count != action_count:
+                    raise ValueError(
+                        f"{hdf5_path.name}:{demo_key} has {frame_count} images but {action_count} actions."
+                    )
+
+                if state["image_shape"] is None:
+                    state["image_shape"] = list(obs[camera_key].shape[1:])
+
+                episode_index = int(state["episode_index"])
+                global_frame_index = int(state["global_frame_index"])
+                output_path = (
+                    output_root
+                    / "data"
+                    / f"chunk-{episode_index // chunks_size:03d}"
+                    / f"episode_{episode_index:06d}.parquet"
+                )
+
+                jobs.append(
+                    {
+                        "hdf5_path": str(hdf5_path),
+                        "demo_key": demo_key,
+                        "camera_key": camera_key,
+                        "wrist_camera_key": wrist_camera_key,
+                        "fps": fps,
+                        "task_index": task_index,
+                        "episode_index": episode_index,
+                        "global_frame_index": global_frame_index,
+                        "length": frame_count,
+                        "output_path": str(output_path),
+                    }
+                )
+                episode_records.append(
+                    {
+                        "episode_index": episode_index,
+                        "tasks": [task_name],
+                        "length": frame_count,
+                    }
+                )
+                state["episode_index"] += 1
+                state["global_frame_index"] += frame_count
+                state["total_frames"] += frame_count
+
+    return jobs
+
+
 def convert_hdf5_dataset(
     hdf5_files: list[Path],
     output_root: Path,
@@ -246,72 +393,37 @@ def convert_hdf5_dataset(
     state: dict[str, Any],
     max_demos_per_task: int | None,
     heldout_tasks: set[str],
+    num_workers: int,
 ) -> None:
-    for hdf5_path in tqdm(hdf5_files, desc="libero90_tasks"):
-        with h5py.File(hdf5_path, "r") as h5_file:
-            data_group = h5_file["data"]
-            task_record = parse_hdf5_task_record(h5_file, hdf5_path.name)
-            task_name = task_record["task"]
-            if task_name in heldout_tasks:
-                continue
+    jobs = build_hdf5_demo_jobs(
+        hdf5_files=hdf5_files,
+        output_root=output_root,
+        chunks_size=chunks_size,
+        fps=fps,
+        camera_key=camera_key,
+        wrist_camera_key=wrist_camera_key,
+        task_to_idx=task_to_idx,
+        task_records=task_records,
+        episode_records=episode_records,
+        state=state,
+        max_demos_per_task=max_demos_per_task,
+        heldout_tasks=heldout_tasks,
+    )
 
-            demo_keys = sorted_demo_keys(data_group)
-            if max_demos_per_task is not None:
-                demo_keys = demo_keys[:max_demos_per_task]
+    if not jobs:
+        return
 
-            for demo_key in demo_keys:
-                demo = data_group[demo_key]
-                obs = demo["obs"]
-                images = obs[camera_key][:]
-                wrist_images = obs[wrist_camera_key][:]
-                actions = demo["actions"][:].astype(np.float32)
-                state_vec = np.concatenate(
-                    [
-                        obs["ee_states"][:].astype(np.float32),
-                        obs["gripper_states"][:].astype(np.float32),
-                    ],
-                    axis=-1,
-                )
+    if num_workers <= 1:
+        iterator = map(_convert_hdf5_demo_job, jobs)
+        for _ in tqdm(iterator, total=len(jobs), desc="libero90_demos"):
+            pass
+        return
 
-                if images.shape[0] != actions.shape[0]:
-                    raise ValueError(
-                        f"{hdf5_path.name}:{demo_key} has {images.shape[0]} images but {actions.shape[0]} actions."
-                    )
-
-                if state["image_shape"] is None:
-                    state["image_shape"] = list(images.shape[1:])
-
-                rows = []
-                for frame_idx in range(images.shape[0]):
-                    rows.append(
-                        {
-                            "image": {
-                                "bytes": encode_png(images[frame_idx]),
-                                "path": f"{hdf5_path.stem}/{demo_key}/image/{frame_idx:06d}.png",
-                            },
-                            "wrist_image": {
-                                "bytes": encode_png(wrist_images[frame_idx]),
-                                "path": f"{hdf5_path.stem}/{demo_key}/wrist_image/{frame_idx:06d}.png",
-                            },
-                            "state": state_vec[frame_idx],
-                            "actions": actions[frame_idx],
-                            "timestamp": np.float32(frame_idx / fps),
-                            "frame_index": np.int64(frame_idx),
-                        }
-                    )
-
-                df = pd.DataFrame(rows)
-                write_episode_dataframe(
-                    df=df,
-                    task_name=task_name,
-                    output_root=output_root,
-                    chunks_size=chunks_size,
-                    task_to_idx=task_to_idx,
-                    task_records=task_records,
-                    episode_records=episode_records,
-                    state=state,
-                    task_record=task_record,
-                )
+    chunksize = max(1, len(jobs) // (num_workers * 8))
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        iterator = executor.map(_convert_hdf5_demo_job, jobs, chunksize=chunksize)
+        for _ in tqdm(iterator, total=len(jobs), desc=f"libero90_demos[{num_workers}p]"):
+            pass
 
 
 def write_metadata(
@@ -390,6 +502,8 @@ def write_metadata(
 
 def main() -> None:
     args = parse_args()
+    if args.num_workers < 1:
+        raise ValueError("--num-workers must be >= 1")
     ensure_output_root(args.output_root, overwrite=args.overwrite)
 
     hdf5_files = sorted(args.input_root.glob("*.hdf5"))
@@ -462,6 +576,7 @@ def main() -> None:
         state=state,
         max_demos_per_task=args.max_demos_per_task,
         heldout_tasks=heldout_task_set,
+        num_workers=args.num_workers,
     )
 
     write_metadata(
