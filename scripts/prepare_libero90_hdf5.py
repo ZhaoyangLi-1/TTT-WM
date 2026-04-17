@@ -3,14 +3,14 @@
 
 This script can optionally merge an existing parquet dataset root first, then
 append converted LIBERO-90 episodes after it. It also randomly samples a small
-set of LIBERO-90 tasks as held-out tasks and writes them into
-`meta/test_tasks.json`, which train.py can read automatically.
+set of LIBERO-90 source tasks as held-out tasks, excludes them from the merged
+parquet output, and writes their metadata into `meta/test_tasks.json`.
 
 Example:
     python scripts/prepare_libero90_hdf5.py \
         --base-root /scr2/zhaoyang/libero \
         --input-root /scr2/zhaoyang/LIBERO-data/libero_90 \
-        --output-root /scr2/zhaoyang/libero_combined \
+        --output-root /scr2/zhaoyang/libero_wm\
         --num-test-tasks 3 \
         --seed 42 \
         --overwrite
@@ -23,6 +23,7 @@ import io
 import json
 import random
 import shutil
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -67,31 +68,69 @@ def encode_png(image: np.ndarray) -> bytes:
     return buf.getvalue()
 
 
-def parse_task_name(h5_file: h5py.File, fallback_name: str) -> str:
-    data_group = h5_file["data"]
-    problem_info = data_group.attrs.get("problem_info")
-    if problem_info:
-        info = json.loads(problem_info)
-        language_instruction = info.get("language_instruction")
-        if language_instruction:
-            return language_instruction
+def _decode_h5_attr(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return value
 
-    stem = fallback_name.removesuffix("_demo.hdf5")
-    parts = stem.split("_")
+
+def _fallback_instruction(task_stem: str) -> str:
+    parts = task_stem.split("_")
     scene_pos = next((i for i, part in enumerate(parts) if part.startswith("SCENE")), None)
     if scene_pos is None:
-        return stem.replace("_", " ")
+        return task_stem.replace("_", " ")
     return " ".join(parts[scene_pos + 1 :]).replace("_", " ")
+
+
+def _extract_scene_name(task_stem: str) -> str:
+    parts = task_stem.split("_")
+    scene_pos = next((i for i, part in enumerate(parts) if part.startswith("SCENE")), None)
+    if scene_pos is None:
+        return ""
+    scene_start = max(scene_pos - 1, 0)
+    return "_".join(parts[scene_start : scene_pos + 1])
+
+
+def parse_hdf5_task_record(h5_file: h5py.File, fallback_name: str) -> dict[str, str]:
+    data_group = h5_file["data"]
+    problem_info = data_group.attrs.get("problem_info")
+    parsed_problem_info: dict[str, Any] = {}
+    if problem_info:
+        parsed_problem_info = json.loads(_decode_h5_attr(problem_info))
+
+    bddl_file_name = _decode_h5_attr(data_group.attrs.get("bddl_file_name", ""))
+    source_task = Path(bddl_file_name).stem if bddl_file_name else fallback_name.removesuffix("_demo.hdf5")
+    instruction = parsed_problem_info.get("language_instruction") or _fallback_instruction(source_task)
+    scene = _extract_scene_name(source_task)
+
+    # Keep per-scene task identity so repeated instructions across scenes stay distinct.
+    task_name = f"{scene}: {instruction}" if scene else instruction
+    return {
+        "task": task_name,
+        "instruction": instruction,
+        "source_task": source_task,
+        "scene": scene,
+        "source_file": fallback_name,
+    }
 
 
 def sorted_demo_keys(data_group: h5py.Group) -> list[str]:
     return sorted(data_group.keys(), key=lambda key: int(key.split("_")[-1]))
 
 
-def register_task(task_name: str, task_to_idx: dict[str, int], task_records: list[dict[str, Any]]) -> int:
+def register_task(
+    task_name: str,
+    task_to_idx: dict[str, int],
+    task_records: list[dict[str, Any]],
+    task_record: dict[str, Any] | None = None,
+) -> int:
     if task_name not in task_to_idx:
-        task_to_idx[task_name] = len(task_records)
-        task_records.append({"task_index": task_to_idx[task_name], "task": task_name})
+        task_index = len(task_records)
+        task_to_idx[task_name] = task_index
+        record = dict(task_record or {})
+        record["task"] = task_name
+        record["task_index"] = task_index
+        task_records.append(record)
     return task_to_idx[task_name]
 
 
@@ -104,8 +143,9 @@ def write_episode_dataframe(
     task_records: list[dict[str, Any]],
     episode_records: list[dict[str, Any]],
     state: dict[str, Any],
+    task_record: dict[str, Any] | None = None,
 ) -> None:
-    task_index = register_task(task_name, task_to_idx, task_records)
+    task_index = register_task(task_name, task_to_idx, task_records, task_record=task_record)
     length = len(df)
 
     df = df.copy()
@@ -185,12 +225,12 @@ def merge_base_dataset(
         )
 
 
-def collect_hdf5_task_names(hdf5_files: list[Path]) -> list[str]:
-    task_names = []
+def collect_hdf5_task_records(hdf5_files: list[Path]) -> list[dict[str, str]]:
+    task_records = []
     for hdf5_path in hdf5_files:
         with h5py.File(hdf5_path, "r") as h5_file:
-            task_names.append(parse_task_name(h5_file, hdf5_path.name))
-    return task_names
+            task_records.append(parse_hdf5_task_record(h5_file, hdf5_path.name))
+    return task_records
 
 
 def convert_hdf5_dataset(
@@ -205,11 +245,15 @@ def convert_hdf5_dataset(
     episode_records: list[dict[str, Any]],
     state: dict[str, Any],
     max_demos_per_task: int | None,
+    heldout_tasks: set[str],
 ) -> None:
     for hdf5_path in tqdm(hdf5_files, desc="libero90_tasks"):
         with h5py.File(hdf5_path, "r") as h5_file:
             data_group = h5_file["data"]
-            task_name = parse_task_name(h5_file, hdf5_path.name)
+            task_record = parse_hdf5_task_record(h5_file, hdf5_path.name)
+            task_name = task_record["task"]
+            if task_name in heldout_tasks:
+                continue
 
             demo_keys = sorted_demo_keys(data_group)
             if max_demos_per_task is not None:
@@ -266,6 +310,7 @@ def convert_hdf5_dataset(
                     task_records=task_records,
                     episode_records=episode_records,
                     state=state,
+                    task_record=task_record,
                 )
 
 
@@ -277,6 +322,7 @@ def write_metadata(
     episode_records: list[dict[str, Any]],
     state: dict[str, Any],
     sampled_test_tasks: list[str],
+    heldout_task_records: list[dict[str, Any]],
     seed: int,
 ) -> None:
     if state["image_shape"] is None:
@@ -296,6 +342,7 @@ def write_metadata(
                 "seed": seed,
                 "num_test_tasks": len(sampled_test_tasks),
                 "tasks": sampled_test_tasks,
+                "records": heldout_task_records,
             },
             f,
             indent=4,
@@ -335,6 +382,7 @@ def write_metadata(
         "total_frames": state["total_frames"],
         "total_tasks": len(task_records),
         "test_tasks": sampled_test_tasks,
+        "num_heldout_tasks": len(sampled_test_tasks),
     }
     with open(output_root / "meta" / "stats.json", "w") as f:
         json.dump(stats, f, indent=4)
@@ -350,7 +398,17 @@ def main() -> None:
     if not hdf5_files:
         raise FileNotFoundError(f"No .hdf5 files found under {args.input_root}")
 
-    hdf5_task_names = collect_hdf5_task_names(hdf5_files)
+    hdf5_task_records = collect_hdf5_task_records(hdf5_files)
+    hdf5_task_names = [rec["task"] for rec in hdf5_task_records]
+    duplicate_task_names = sorted(
+        task_name for task_name, count in Counter(hdf5_task_names).items() if count > 1
+    )
+    if duplicate_task_names:
+        raise ValueError(
+            "Expected unique LIBERO-90 task ids after scene-aware parsing, but found duplicates: "
+            + ", ".join(duplicate_task_names)
+        )
+
     if args.num_test_tasks < 0:
         raise ValueError("--num-test-tasks must be >= 0")
     if args.num_test_tasks > len(hdf5_task_names):
@@ -364,6 +422,10 @@ def main() -> None:
         if args.num_test_tasks > 0
         else []
     )
+    heldout_task_set = set(sampled_test_tasks)
+    heldout_task_records = [
+        rec for rec in hdf5_task_records if rec["task"] in heldout_task_set
+    ]
 
     task_to_idx: dict[str, int] = {}
     task_records: list[dict[str, Any]] = []
@@ -399,6 +461,7 @@ def main() -> None:
         episode_records=episode_records,
         state=state,
         max_demos_per_task=args.max_demos_per_task,
+        heldout_tasks=heldout_task_set,
     )
 
     write_metadata(
@@ -409,6 +472,7 @@ def main() -> None:
         episode_records=episode_records,
         state=state,
         sampled_test_tasks=sampled_test_tasks,
+        heldout_task_records=heldout_task_records,
         seed=args.seed,
     )
 
