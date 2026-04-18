@@ -107,14 +107,40 @@ def _clean_state_dict(state_dict: dict) -> dict:
     return state_dict
 
 
+def _resolve_weight_state(
+    ckpt: dict,
+    use_ema: bool | None,
+) -> tuple[dict, str]:
+    has_ema = "ema" in ckpt
+
+    if use_ema is None:
+        if has_ema:
+            ema_state = ckpt["ema"]
+            raw_sd = ema_state["shadow"] if "shadow" in ema_state else ema_state
+            print("Detected EMA weights in checkpoint; using EMA by default.")
+            return raw_sd, "EMA"
+        print("No EMA weights found in checkpoint; using live weights.")
+        return ckpt["model"], "live"
+
+    if use_ema:
+        if has_ema:
+            ema_state = ckpt["ema"]
+            raw_sd = ema_state["shadow"] if "shadow" in ema_state else ema_state
+            return raw_sd, "EMA"
+        print("Warning: --use-ema requested but no EMA weights found; using live weights")
+
+    return ckpt["model"], "live"
+
+
 def load_model_from_checkpoint(
     ckpt_path: str,
     device: torch.device,
-    use_ema: bool = False,
+    use_ema: bool | None = False,
     force_cosmos: bool = False,
 ):
     """Load model from checkpoint, reconstructing config from saved cfg."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    raw_sd, weight_source = _resolve_weight_state(ckpt, use_ema)
 
     cfg  = ckpt["cfg"]
     mcfg = cfg["model"]
@@ -131,10 +157,7 @@ def load_model_from_checkpoint(
         arch_source = 'cfg["model"]["arch"] = ' + mcfg["arch"]
     else:
         # cfg has no "arch" key — sniff from the actual weights
-        raw_sd_for_sniff = (
-            ckpt["ema"] if (use_ema and "ema" in ckpt) else ckpt["model"]
-        )
-        sniffed = _sniff_arch(_clean_state_dict(raw_sd_for_sniff))
+        sniffed = _sniff_arch(_clean_state_dict(raw_sd))
         if sniffed == "unknown":
             print(
                 "Warning: could not auto-detect architecture from state_dict keys. "
@@ -172,16 +195,6 @@ def load_model_from_checkpoint(
 
     model_cfg = ARPatchConfig(**config_kwargs)
     model     = ARVideoPatchTransformer(model_cfg).to(device)
-
-    # Choose weight source
-    if use_ema and "ema" in ckpt:
-        raw_sd        = ckpt["ema"]
-        weight_source = "EMA"
-    else:
-        raw_sd        = ckpt["model"]
-        weight_source = "live"
-        if use_ema:
-            print("Warning: --use-ema requested but no EMA weights found; using live weights")
 
     model.load_state_dict(_clean_state_dict(raw_sd))
     print(f"Loaded {weight_source} weights from {ckpt_path}")
