@@ -3,8 +3,10 @@
 
 This script can optionally merge an existing parquet dataset root first, then
 append converted LIBERO-90 episodes after it. It also randomly samples a small
-set of LIBERO-90 source tasks as held-out tasks, excludes them from the merged
-parquet output, and writes their metadata into `meta/test_tasks.json`.
+set of LIBERO-90 source tasks as held-out tasks and writes their metadata into
+`meta/test_tasks.json`. Held-out task episodes are still converted into the
+parquet output so downstream evaluation can read them; train.py filters them
+out at load time via `meta/test_tasks.json`.
 
 Example:
     python scripts/prepare_libero90_hdf5.py \
@@ -311,7 +313,6 @@ def build_hdf5_demo_jobs(
     episode_records: list[dict[str, Any]],
     state: dict[str, Any],
     max_demos_per_task: int | None,
-    heldout_tasks: set[str],
 ) -> list[dict[str, Any]]:
     jobs: list[dict[str, Any]] = []
     for hdf5_path in tqdm(hdf5_files, desc="scan_libero90", leave=False):
@@ -319,8 +320,6 @@ def build_hdf5_demo_jobs(
             data_group = h5_file["data"]
             task_record = parse_hdf5_task_record(h5_file, hdf5_path.name)
             task_name = task_record["task"]
-            if task_name in heldout_tasks:
-                continue
 
             task_index = register_task(
                 task_name, task_to_idx, task_records, task_record=task_record
@@ -393,7 +392,6 @@ def convert_hdf5_dataset(
     episode_records: list[dict[str, Any]],
     state: dict[str, Any],
     max_demos_per_task: int | None,
-    heldout_tasks: set[str],
     num_workers: int,
 ) -> None:
     jobs = build_hdf5_demo_jobs(
@@ -408,7 +406,6 @@ def convert_hdf5_dataset(
         episode_records=episode_records,
         state=state,
         max_demos_per_task=max_demos_per_task,
-        heldout_tasks=heldout_tasks,
     )
 
     if not jobs:
@@ -576,7 +573,6 @@ def main() -> None:
         episode_records=episode_records,
         state=state,
         max_demos_per_task=args.max_demos_per_task,
-        heldout_tasks=heldout_task_set,
         num_workers=args.num_workers,
     )
 
@@ -594,7 +590,8 @@ def main() -> None:
 
     print(
         f"Wrote {state['episode_index']} episodes across {len(task_records)} tasks to {args.output_root}\n"
-        f"Held-out tasks ({len(sampled_test_tasks)}): {sampled_test_tasks}"
+        f"Held-out tasks (stored in parquet, skipped by train.py via meta/test_tasks.json, "
+        f"count={len(sampled_test_tasks)}): {sampled_test_tasks}"
     )
 
 
