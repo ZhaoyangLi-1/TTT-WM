@@ -28,9 +28,10 @@ data:
   action_key: actions
   obs_key_mapping: {}
   split_mode: auto
-  val_ratio: 0.1
+  val_ratio: 0.01
   test_task_count: 3
   test_tasks: []
+  selected_task: null
   max_train_episodes: null
 
 policy:
@@ -134,6 +135,7 @@ task:
     val_ratio: ${data.val_ratio}
     test_task_count: ${data.test_task_count}
     test_tasks: ${data.test_tasks}
+    task_filter: ${data.selected_task}
     seed: ${training.seed}
     max_train_episodes: ${data.max_train_episodes}
     cache_size: 32

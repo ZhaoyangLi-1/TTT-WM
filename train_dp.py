@@ -32,6 +32,21 @@ _silence_non_main_rank_logging()
 register_omegaconf_resolvers()
 
 
+def _apply_selected_task_overrides(cfg: DictConfig) -> None:
+    selected_task = OmegaConf.select(cfg, "data.selected_task", default=None)
+    if selected_task in (None, "", "None"):
+        return
+
+    cfg.data.split_mode = "episode"
+    if _is_main_rank():
+        print(
+            "Using task-filtered episode split for diffusion policy training: "
+            f"data.selected_task={selected_task!r}, "
+            f"data.split_mode={cfg.data.split_mode!r}, "
+            f"data.val_ratio={float(cfg.data.val_ratio):.3f}"
+        )
+
+
 @hydra.main(version_base=None, config_path="configs", config_name="dp_config")
 def _hydra_main(cfg: DictConfig) -> None:
     diffusion_policy_src = OmegaConf.select(
@@ -43,6 +58,7 @@ def _hydra_main(cfg: DictConfig) -> None:
         for path in configured_paths:
             print(f"  - {path}")
 
+    _apply_selected_task_overrides(cfg)
     OmegaConf.resolve(cfg)
 
     from dp.common import cleanup_distributed

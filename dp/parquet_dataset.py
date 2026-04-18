@@ -47,6 +47,7 @@ class TTTWMParquetImageDataset(BaseImageDataset):
         val_ratio: float = 0.1,
         test_task_count: int = 0,
         test_tasks: list[str] | None = None,
+        task_filter: str | None = None,
         seed: int = 42,
         max_train_episodes: int | None = None,
         cache_size: int = 32,
@@ -78,6 +79,9 @@ class TTTWMParquetImageDataset(BaseImageDataset):
         self.val_ratio = float(val_ratio)
         self.test_task_count = int(test_task_count)
         self.test_tasks = list(test_tasks)
+        self.task_filter = (
+            str(task_filter) if task_filter not in (None, "", "None") else None
+        )
         self.seed = int(seed)
         self.max_train_episodes = max_train_episodes
         self.cache_size = max(int(cache_size), 1)
@@ -190,6 +194,7 @@ class TTTWMParquetImageDataset(BaseImageDataset):
             val_ratio=self.val_ratio,
             test_task_count=self.test_task_count,
             test_tasks=self.test_tasks,
+            task_filter=self.task_filter,
             seed=self.seed,
             max_train_episodes=self.max_train_episodes,
             cache_size=self.cache_size,
@@ -284,13 +289,28 @@ class TTTWMParquetImageDataset(BaseImageDataset):
     ) -> tuple[list[int], list[int], str]:
         task_names = self._load_task_names(episode_meta)
         all_episode_indices = sorted(episode_meta.keys())
+        split_reason_parts: list[str] = []
 
         if self.split_mode not in {"auto", "heldout_tasks", "episode"}:
             raise ValueError(
                 f"Unsupported split_mode={self.split_mode}. Use auto, heldout_tasks, or episode."
             )
 
-        if self.split_mode in {"auto", "heldout_tasks"} and task_names:
+        if self.task_filter is not None:
+            matching_episode_indices = [
+                idx
+                for idx in all_episode_indices
+                if episode_meta[idx]["task"] == self.task_filter
+            ]
+            if not matching_episode_indices:
+                raise ValueError(
+                    f"No episodes found for task_filter={self.task_filter!r} "
+                    f"under dataset_root={self.dataset_root}."
+                )
+            all_episode_indices = matching_episode_indices
+            split_reason_parts.append(f"task_filter={self.task_filter}")
+
+        if self.task_filter is None and self.split_mode in {"auto", "heldout_tasks"} and task_names:
             heldout_tasks = self._resolve_heldout_tasks(task_names)
             if heldout_tasks:
                 heldout_set = set(heldout_tasks)
@@ -313,9 +333,11 @@ class TTTWMParquetImageDataset(BaseImageDataset):
             val_eps = sorted(int(x) for x in shuffled[:n_val])
             val_set = set(val_eps)
             train_eps = [idx for idx in all_episode_indices if idx not in val_set]
-            return train_eps, val_eps, f"episode_val_ratio={self.val_ratio:.3f}"
+            split_reason_parts.append(f"episode_val_ratio={self.val_ratio:.3f}")
+            return train_eps, val_eps, ",".join(split_reason_parts)
 
-        return all_episode_indices, [], "single_split"
+        split_reason_parts.append("single_split")
+        return all_episode_indices, [], ",".join(split_reason_parts)
 
     def _downsample_episode_indices(
         self, episode_indices: list[int], max_n: int | None
