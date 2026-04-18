@@ -17,6 +17,7 @@ Example:
         --checkpoint /path/to/stage1_best.pt \
         --dataset /path/to/libero_wm \
         --seed 42 \
+        --output-dir /scr2/zhaoyang/TTT-WM-outputs/stage1 \     
         --episodes-per-task 5
 """
 
@@ -131,13 +132,17 @@ def load_episode_frames(
     episode_idx: int,
     image_key: str,
     transform: transforms.Compose,
+    flip_vertical: bool = False,
 ) -> list[torch.Tensor]:
     parquet_path = resolve_episode_path(root, chunks_size, episode_idx)
     if not parquet_path.is_file():
         raise FileNotFoundError(f"Episode parquet not found: {parquet_path}")
 
     df = pd.read_parquet(parquet_path, columns=[image_key])
-    return [decode_image(value, transform) for value in df[image_key].tolist()]
+    frames = [decode_image(value, transform) for value in df[image_key].tolist()]
+    if flip_vertical:
+        frames = [torch.flip(frame, dims=(-2,)) for frame in frames]
+    return frames
 
 
 class RunningFeatureStats:
@@ -232,9 +237,20 @@ def tensor_to_uint8_image(frame: torch.Tensor) -> np.ndarray:
     raise ValueError(f"Expected 3D or 4D frame tensor, got shape {tuple(frame.shape)}")
 
 
-def save_uint8_image(image: np.ndarray, path: Path):
+def upscale_uint8(image: np.ndarray, scale: int) -> np.ndarray:
+    if scale is None or int(scale) <= 1:
+        return image
+    scale = int(scale)
+    pil = Image.fromarray(image)
+    resized = pil.resize(
+        (pil.width * scale, pil.height * scale), resample=Image.NEAREST
+    )
+    return np.asarray(resized)
+
+
+def save_uint8_image(image: np.ndarray, path: Path, scale: int = 1):
     path.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(image).save(path)
+    Image.fromarray(upscale_uint8(image, scale)).save(path)
 
 
 def build_example_window_starts(
@@ -272,22 +288,24 @@ def save_teacher_forcing_examples(
     episode_dir: Path,
     goal_frame: torch.Tensor,
     examples: list[dict],
+    image_scale: int = 1,
 ) -> tuple[str, list[dict]]:
     goal_path = episode_dir / "goal.png"
-    save_uint8_image(tensor_to_uint8_image(goal_frame), goal_path)
+    save_uint8_image(tensor_to_uint8_image(goal_frame), goal_path, scale=image_scale)
 
     examples_dir = episode_dir / "examples"
     examples_dir.mkdir(parents=True, exist_ok=True)
     saved_examples: list[dict] = []
 
     for example in sorted(examples, key=lambda item: item["slot_index"]):
-        context_img = tensor_to_uint8_image(example["context"])
-        pred_img = tensor_to_uint8_image(example["predicted"])
-        target_img = tensor_to_uint8_image(example["target"])
-        goal_img = tensor_to_uint8_image(goal_frame)
+        context_img = upscale_uint8(tensor_to_uint8_image(example["context"]), image_scale)
+        pred_img = upscale_uint8(tensor_to_uint8_image(example["predicted"]), image_scale)
+        target_img = upscale_uint8(tensor_to_uint8_image(example["target"]), image_scale)
+        goal_img = upscale_uint8(tensor_to_uint8_image(goal_frame), image_scale)
 
         height = context_img.shape[0]
-        separator = np.full((height, 4, 3), 128, dtype=np.uint8)
+        sep_width = max(4, 4 * max(1, int(image_scale)))
+        separator = np.full((height, sep_width, 3), 128, dtype=np.uint8)
         combined = np.concatenate(
             [
                 context_img,
@@ -371,6 +389,7 @@ def evaluate_teacher_forcing_episode(
     example_seed: int,
     example_count: int,
     episode_dir: Path,
+    image_scale: int = 1,
 ):
     span = frames_in + frame_gap + frames_out - 1
     target_offset = frames_in - 1 + frame_gap
@@ -378,7 +397,11 @@ def evaluate_teacher_forcing_episode(
         goal_path = None
         if frames:
             goal_path = episode_dir / "goal.png"
-            save_uint8_image(tensor_to_uint8_image(frames[-1].detach().cpu()), goal_path)
+            save_uint8_image(
+                tensor_to_uint8_image(frames[-1].detach().cpu()),
+                goal_path,
+                scale=image_scale,
+            )
         return {
             "n_windows": 0,
             "avg_mse": None,
@@ -444,6 +467,7 @@ def evaluate_teacher_forcing_episode(
     goal_path, saved_examples = save_teacher_forcing_examples(
         episode_dir=episode_dir,
         goal_frame=goal_frame,
+        image_scale=image_scale,
         examples=example_records,
     )
     fid_pred_frames = torch.cat(pred_batches, dim=0).flatten(0, 1) if pred_batches else None
@@ -527,11 +551,16 @@ def save_rollout_comparison(
     pred_frames: list[np.ndarray],
     output_path: Path,
     fps: int,
+    image_scale: int = 1,
 ):
+    if int(image_scale) > 1:
+        gt_frames = [upscale_uint8(f, image_scale) for f in gt_frames]
+        pred_frames = [upscale_uint8(f, image_scale) for f in pred_frames]
     gt_arr = np.stack(gt_frames)
     pred_arr = np.stack(pred_frames)
     height = gt_arr.shape[1]
-    separator = np.full((len(gt_arr), height, 4, 3), 128, dtype=np.uint8)
+    sep_width = max(4, 4 * max(1, int(image_scale)))
+    separator = np.full((len(gt_arr), height, sep_width, 3), 128, dtype=np.uint8)
     combined = np.concatenate([gt_arr, separator, pred_arr], axis=2)
     save_video(combined, str(output_path), fps=fps)
 
@@ -569,7 +598,12 @@ def main():
         help="Max rollout steps per episode. Use 0 to roll out as far as possible.",
     )
     parser.add_argument("--fps", type=int, default=10)
-    parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        required=True,
+        help="Directory to store example images and metrics JSON for this run.",
+    )
     parser.add_argument(
         "--examples-per-episode",
         type=int,
@@ -594,7 +628,27 @@ def main():
         action="store_true",
         help="Disable AMP during inference.",
     )
+    parser.add_argument(
+        "--flip-vertical",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Flip each loaded frame vertically. LIBERO-90 HDF5 ingests store agentview "
+            "upside down; held-out tasks come from that source, so flipping is on by default."
+        ),
+    )
+    parser.add_argument(
+        "--image-scale",
+        type=int,
+        default=2,
+        help=(
+            "Integer upscale factor (nearest-neighbor) applied when saving PNGs and rollout "
+            "videos. Use 1 to save at native model resolution."
+        ),
+    )
     args = parser.parse_args()
+    if args.image_scale < 1:
+        parser.error("--image-scale must be >= 1")
 
     device = torch.device(
         args.device if (torch.cuda.is_available() or args.device != "cuda") else "cpu"
@@ -602,12 +656,9 @@ def main():
     use_amp = not args.no_amp
     print(f"Device: {device}")
 
-    use_ema_preference = False if args.live_weights else None
-    if args.use_ema:
-        use_ema_preference = True
 
     model, model_cfg, train_cfg = load_model_from_checkpoint(
-        args.checkpoint, device, use_ema=use_ema_preference
+        args.checkpoint, device, use_ema=None
     )
 
     cfg_data = train_cfg.get("data", {})
@@ -619,9 +670,6 @@ def main():
     use_goal = bool(cfg_data.get("use_goal", True))
     tasks = list(args.tasks) if args.tasks else list(DEFAULT_TASKS)
 
-    if args.output_dir is None:
-        ckpt_stem = Path(args.checkpoint).stem
-        args.output_dir = f"heldout_eval_results/{ckpt_stem}_seed{args.seed}"
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -684,6 +732,7 @@ def main():
                     episode_idx,
                     image_key,
                     transform,
+                    flip_vertical=bool(args.flip_vertical),
                 )
 
                 tf_metrics = evaluate_teacher_forcing_episode(
@@ -700,6 +749,7 @@ def main():
                     example_seed=int(args.seed),
                     example_count=int(args.examples_per_episode),
                     episode_dir=episode_dir,
+                    image_scale=int(args.image_scale),
                 )
 
                 fid_pred_frames = tf_metrics.pop("fid_pred_frames")
@@ -731,6 +781,7 @@ def main():
                         rollout_metrics["pred_frames"],
                         video_path,
                         fps=int(args.fps),
+                        image_scale=int(args.image_scale),
                     )
                 else:
                     video_path = None
@@ -751,6 +802,10 @@ def main():
                     },
                 }
                 results.append(episode_result)
+
+                episode_metrics_path = episode_dir / "metrics.json"
+                with episode_metrics_path.open("w") as f:
+                    json.dump(episode_result, f, indent=2)
 
                 print(
                     f"[{task_idx}/{len(tasks)}] episode {episode_idx}: "
