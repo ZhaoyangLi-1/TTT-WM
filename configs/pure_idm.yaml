@@ -104,7 +104,6 @@ wandb:
     - pure_idm
     - ttt_wm
     - ${experiment_name}
-    - ${data.task_tag}
   id: null
   group: null
 
