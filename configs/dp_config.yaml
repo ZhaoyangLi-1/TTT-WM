@@ -27,11 +27,8 @@ shape_meta:
 data:
   action_key: actions
   obs_key_mapping: {}
-  split_mode: auto
-  val_ratio: 0.01
-  test_task_count: 3
-  test_tasks: []
-  selected_task: null
+  val_ratio: 0.02
+  selected_task: "KITCHEN_SCENE10: put the butter at the back in the top drawer of the cabinet and close it"
   max_train_episodes: null
 
 policy:
@@ -91,15 +88,15 @@ training:
   gradient_accumulate_every: 1
   grad_clip: 1.0
   use_ema: true
-  checkpoint_every: 10
-  val_every: 1
+  checkpoint_every: 5
+  val_every: 5
   sample_every: 5
   max_train_steps: null
   max_val_steps: null
   tqdm_interval_sec: 1.0
 
 dataloader:
-  batch_size: 128
+  batch_size: 64
   num_workers: 8
   shuffle: true
   drop_last: true
@@ -107,7 +104,7 @@ dataloader:
   persistent_workers: true
 
 val_dataloader:
-  batch_size: 128
+  batch_size: 64
   num_workers: 8
   shuffle: false
   drop_last: false
@@ -131,10 +128,7 @@ task:
     frames_out: 1
     action_key: ${data.action_key}
     obs_key_mapping: ${data.obs_key_mapping}
-    split_mode: ${data.split_mode}
     val_ratio: ${data.val_ratio}
-    test_task_count: ${data.test_task_count}
-    test_tasks: ${data.test_tasks}
     task_filter: ${data.selected_task}
     seed: ${training.seed}
     max_train_episodes: ${data.max_train_episodes}

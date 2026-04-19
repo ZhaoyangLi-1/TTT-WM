@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import builtins
+import json
 import logging
 import os
 import sys
 import traceback
+from pathlib import Path
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -32,17 +34,74 @@ _silence_non_main_rank_logging()
 register_omegaconf_resolvers()
 
 
+def _resolve_dataset_root(cfg: DictConfig) -> Path:
+    dataset_root = OmegaConf.select(cfg, "task.dataset.dataset_root", default=None)
+    if dataset_root in (None, "", "None"):
+        dataset_root = OmegaConf.select(cfg, "dataset_root", default=None)
+    if dataset_root in (None, "", "None"):
+        raise ValueError(
+            "Dataset root is missing. Set `dataset_root` or `task.dataset.dataset_root`."
+        )
+    return Path(str(dataset_root)).expanduser()
+
+
+def _load_heldout_tasks(dataset_root: Path) -> tuple[Path, list[str]]:
+    meta_path = dataset_root / "meta" / "test_tasks.json"
+    if not meta_path.is_file():
+        raise FileNotFoundError(f"Held-out task metadata not found: {meta_path}")
+
+    with meta_path.open() as f:
+        payload = json.load(f)
+
+    records = payload.get("records") if isinstance(payload, dict) else None
+    if not isinstance(records, list) or not records:
+        raise ValueError(
+            f"`{meta_path}` must contain a non-empty `records` list."
+        )
+
+    heldout_tasks = [
+        str(record["task"])
+        for record in records
+        if isinstance(record, dict) and record.get("task") not in (None, "")
+    ]
+    if not heldout_tasks:
+        raise ValueError(f"No held-out tasks were found in {meta_path}.")
+
+    return meta_path, heldout_tasks
+
+
+def _resolve_selected_heldout_task(
+    selected_task: object,
+    heldout_tasks: list[str],
+) -> str:
+    selector = str(selected_task).strip()
+    if selector in ("", "None"):
+        raise ValueError("`data.selected_task` must not be empty.")
+
+    if selector in heldout_tasks:
+        return selector
+
+    raise ValueError(
+        "Configured `data.selected_task` does not match any held-out task in "
+        f"meta/test_tasks.json: {selector!r}. Available held-out tasks: {heldout_tasks}"
+    )
+
+
 def _apply_selected_task_overrides(cfg: DictConfig) -> None:
     selected_task = OmegaConf.select(cfg, "data.selected_task", default=None)
     if selected_task in (None, "", "None"):
         return
 
-    cfg.data.split_mode = "episode"
+    dataset_root = _resolve_dataset_root(cfg)
+    meta_path, heldout_tasks = _load_heldout_tasks(dataset_root)
+    resolved_task = _resolve_selected_heldout_task(selected_task, heldout_tasks)
+
+    cfg.data.selected_task = resolved_task
     if _is_main_rank():
         print(
-            "Using task-filtered episode split for diffusion policy training: "
-            f"data.selected_task={selected_task!r}, "
-            f"data.split_mode={cfg.data.split_mode!r}, "
+            "Using held-out task-filtered episode split for diffusion policy training: "
+            f"meta={meta_path}, "
+            f"data.selected_task={resolved_task!r}, "
             f"data.val_ratio={float(cfg.data.val_ratio):.3f}"
         )
 
