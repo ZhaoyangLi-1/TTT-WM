@@ -10,9 +10,11 @@ episode-level split builder from ``train_stage2.py``:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import re
 from pathlib import Path
 
 import hydra
@@ -25,6 +27,22 @@ from train_stage1 import Trainer, unwrap_model
 from train_stage2 import build_heldout_task_datasets
 
 log = logging.getLogger(__name__)
+
+
+def _build_wandb_safe_task_tag(task_name: str, *, max_len: int = 64) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", task_name).strip("._-")
+    if not normalized:
+        normalized = "task"
+    if len(normalized) <= max_len:
+        return normalized
+
+    digest = hashlib.sha1(task_name.encode("utf-8")).hexdigest()[:8]
+    keep = max_len - len(digest) - 1
+    keep = max(keep, 8)
+    shortened = normalized[:keep].rstrip("._-")
+    if not shortened:
+        shortened = "task"
+    return f"{shortened}_{digest}"
 
 
 def _resolve_dataset_root(cfg: DictConfig) -> Path:
@@ -98,6 +116,7 @@ def _apply_selected_task_overrides(cfg: DictConfig) -> None:
     resolved_task = _resolve_selected_heldout_task(selected_task, heldout_tasks)
 
     cfg.data.selected_task = resolved_task
+    cfg.data.task_tag = _build_wandb_safe_task_tag(resolved_task)
     cfg.data.test_tasks = [resolved_task]
     if int(OmegaConf.select(cfg, "data.test_task_count", default=1)) != 1:
         cfg.data.test_task_count = 1
@@ -107,6 +126,7 @@ def _apply_selected_task_overrides(cfg: DictConfig) -> None:
         log.info(
             "Using held-out task-filtered split for pure IDM training: "
             f"meta={meta_path}, data.selected_task={resolved_task!r}, "
+            f"data.task_tag={cfg.data.task_tag!r}, "
             f"data.stage2_val_fraction={float(cfg.data.stage2_val_fraction):.3f}"
         )
 
