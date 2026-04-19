@@ -924,7 +924,7 @@ class Trainer:
                     )
             else:
                 torch._dynamo.config.optimize_ddp = False
-                self.model = torch.compile(self.model)
+                self.model = torch.compile(self.model, mode="reduce-overhead")
                 self.compile_enabled = True
                 if self.is_main:
                     log.info("torch.compile enabled")
