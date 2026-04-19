@@ -20,7 +20,7 @@ from pathlib import Path
 import hydra
 import torch
 import torch.nn as nn
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 from pure_idm import PureInverseDynamicsModel, PureInverseDynamicsModelDP
 from train_stage1 import Trainer, unwrap_model
@@ -115,11 +115,12 @@ def _apply_selected_task_overrides(cfg: DictConfig) -> None:
     meta_path, heldout_tasks = _load_heldout_tasks(dataset_root)
     resolved_task = _resolve_selected_heldout_task(selected_task, heldout_tasks)
 
-    cfg.data.selected_task = resolved_task
-    cfg.data.task_tag = _build_wandb_safe_task_tag(resolved_task)
-    cfg.data.test_tasks = [resolved_task]
-    if int(OmegaConf.select(cfg, "data.test_task_count", default=1)) != 1:
-        cfg.data.test_task_count = 1
+    with open_dict(cfg.data):
+        cfg.data.selected_task = resolved_task
+        cfg.data.task_tag = _build_wandb_safe_task_tag(resolved_task)
+        cfg.data.test_tasks = [resolved_task]
+        if int(OmegaConf.select(cfg, "data.test_task_count", default=1)) != 1:
+            cfg.data.test_task_count = 1
 
     rank = int(os.environ.get("RANK", "0"))
     if rank == 0:
