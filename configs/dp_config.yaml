@@ -149,7 +149,7 @@ logging:
   project: TTT-WM-diffusion
   mode: online
   resume: false
-  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${data.selected_task}
   tags:
     - diffusion_policy
     - ttt_wm
@@ -161,4 +161,4 @@ hydra:
   job:
     override_dirname: ${name}
   run:
-    dir: ${outputs_root}/diffusion_policy/${now:%Y-%m-%d}/${now:%H-%M-%S}_${name}
+    dir: ${outputs_root}/original_diffusion_policy/${data.selected_task}/${now:%Y-%m-%d}/${now:%H-%M-%S}_${name}_${data.selected_task}
