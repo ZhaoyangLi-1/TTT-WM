@@ -17,6 +17,9 @@ Example:
         --seed 42 \
         --num-workers 48 \
         --overwrite
+
+Rerunning without `--overwrite` resumes an existing output root. Tasks already
+recorded in `meta/tasks.jsonl` are skipped instead of being converted again.
 """
 
 from __future__ import annotations
@@ -64,9 +67,8 @@ def parse_args() -> argparse.Namespace:
 
 def ensure_output_root(path: Path, overwrite: bool) -> None:
     if path.exists():
-        if not overwrite:
-            raise FileExistsError(f"{path} already exists. Pass --overwrite to replace it.")
-        shutil.rmtree(path)
+        if overwrite:
+            shutil.rmtree(path)
 
     (path / "data").mkdir(parents=True, exist_ok=True)
     (path / "meta").mkdir(parents=True, exist_ok=True)
@@ -76,6 +78,84 @@ def encode_png(image: np.ndarray) -> bytes:
     buf = io.BytesIO()
     Image.fromarray(image).save(buf, format="PNG")
     return buf.getvalue()
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    with open(path) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def load_existing_output_dataset(output_root: Path) -> dict[str, Any] | None:
+    info_path = output_root / "meta" / "info.json"
+    tasks_path = output_root / "meta" / "tasks.jsonl"
+    episodes_path = output_root / "meta" / "episodes.jsonl"
+
+    if not any(path.exists() for path in (info_path, tasks_path, episodes_path)):
+        data_dir = output_root / "data"
+        meta_dir = output_root / "meta"
+        has_untracked_outputs = any(data_dir.iterdir()) or any(meta_dir.iterdir())
+        if has_untracked_outputs:
+            raise FileNotFoundError(
+                f"Cannot resume from {output_root}; found existing files under data/ or meta/ but missing "
+                "required metadata (meta/info.json, meta/tasks.jsonl, meta/episodes.jsonl). "
+                "Pass --overwrite to rebuild from scratch."
+            )
+        return None
+
+    missing = [str(path.relative_to(output_root)) for path in (info_path, tasks_path, episodes_path) if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"Cannot resume from {output_root}; missing required metadata files: {', '.join(missing)}. "
+            "Pass --overwrite to rebuild from scratch."
+        )
+
+    with open(info_path) as f:
+        info = json.load(f)
+    task_records = _read_jsonl(tasks_path)
+    episode_records = _read_jsonl(episodes_path)
+
+    task_to_idx: dict[str, int] = {}
+    normalized_task_records: list[dict[str, Any]] = []
+    for idx, rec in enumerate(task_records):
+        task_name = rec.get("task")
+        if not task_name:
+            raise ValueError(f"{tasks_path} contains a task record without `task`.")
+        if task_name in task_to_idx:
+            raise ValueError(f"{tasks_path} contains duplicate task entries for {task_name!r}.")
+        normalized_rec = dict(rec)
+        normalized_rec["task_index"] = idx
+        task_to_idx[task_name] = idx
+        normalized_task_records.append(normalized_rec)
+
+    next_episode_index = max((int(rec["episode_index"]) for rec in episode_records), default=-1) + 1
+    total_frames = sum(int(rec["length"]) for rec in episode_records)
+    image_shape = info.get("features", {}).get("image", {}).get("shape")
+
+    return {
+        "task_to_idx": task_to_idx,
+        "task_records": normalized_task_records,
+        "episode_records": episode_records,
+        "state": {
+            "episode_index": next_episode_index,
+            "global_frame_index": total_frames,
+            "total_frames": total_frames,
+            "image_shape": list(image_shape) if image_shape is not None else None,
+        },
+    }
+
+
+def load_existing_test_tasks(output_root: Path) -> list[str]:
+    test_tasks_path = output_root / "meta" / "test_tasks.json"
+    if not test_tasks_path.exists():
+        return []
+
+    with open(test_tasks_path) as f:
+        payload = json.load(f)
+    if isinstance(payload, dict):
+        tasks = payload.get("tasks", [])
+    else:
+        tasks = payload
+    return [str(task) for task in tasks]
 
 
 def _decode_h5_attr(value: Any) -> Any:
@@ -239,7 +319,9 @@ def collect_hdf5_task_records(hdf5_files: list[Path]) -> list[dict[str, str]]:
     task_records = []
     for hdf5_path in hdf5_files:
         with h5py.File(hdf5_path, "r") as h5_file:
-            task_records.append(parse_hdf5_task_record(h5_file, hdf5_path.name))
+            record = parse_hdf5_task_record(h5_file, hdf5_path.name)
+            record["hdf5_path"] = str(hdf5_path)
+            task_records.append(record)
     return task_records
 
 
@@ -503,6 +585,7 @@ def main() -> None:
     if args.num_workers < 1:
         raise ValueError("--num-workers must be >= 1")
     ensure_output_root(args.output_root, overwrite=args.overwrite)
+    existing_output = load_existing_output_dataset(args.output_root)
 
     hdf5_files = sorted(args.input_root.glob("*.hdf5"))
     if args.max_tasks is not None:
@@ -511,7 +594,47 @@ def main() -> None:
         raise FileNotFoundError(f"No .hdf5 files found under {args.input_root}")
 
     hdf5_task_records = collect_hdf5_task_records(hdf5_files)
-    hdf5_task_names = [rec["task"] for rec in hdf5_task_records]
+
+    if existing_output is not None:
+        task_to_idx = existing_output["task_to_idx"]
+        task_records = existing_output["task_records"]
+        episode_records = existing_output["episode_records"]
+        state = existing_output["state"]
+        existing_task_names = {rec["task"] for rec in task_records}
+        existing_source_files = {rec["source_file"] for rec in task_records if rec.get("source_file")}
+        pending_hdf5_task_records = [
+            rec
+            for rec in hdf5_task_records
+            if rec["task"] not in existing_task_names and rec["source_file"] not in existing_source_files
+        ]
+        skipped_task_names = sorted(
+            rec["task"]
+            for rec in hdf5_task_records
+            if rec["task"] in existing_task_names or rec["source_file"] in existing_source_files
+        )
+        if skipped_task_names:
+            print(
+                f"Skipping {len(skipped_task_names)} already-saved LIBERO-90 tasks in {args.output_root}."
+            )
+        if args.base_root is not None:
+            print(
+                f"Resuming existing dataset at {args.output_root}; skipping --base-root merge from {args.base_root}."
+            )
+    else:
+        task_to_idx = {}
+        task_records = []
+        episode_records = []
+        state = {
+            "episode_index": 0,
+            "global_frame_index": 0,
+            "total_frames": 0,
+            "image_shape": None,
+        }
+        pending_hdf5_task_records = hdf5_task_records
+
+    existing_hdf5_task_records = [rec for rec in task_records if rec.get("source_file")]
+    all_hdf5_task_records = existing_hdf5_task_records + pending_hdf5_task_records
+    hdf5_task_names = [rec["task"] for rec in all_hdf5_task_records]
     duplicate_task_names = sorted(
         task_name for task_name, count in Counter(hdf5_task_names).items() if count > 1
     )
@@ -529,27 +652,44 @@ def main() -> None:
             f"HDF5 tasks ({len(hdf5_task_names)})."
         )
 
-    sampled_test_tasks = (
-        sorted(random.Random(args.seed).sample(hdf5_task_names, args.num_test_tasks))
-        if args.num_test_tasks > 0
-        else []
-    )
+    existing_test_tasks = load_existing_test_tasks(args.output_root)
+    if existing_test_tasks:
+        known_hdf5_tasks = set(hdf5_task_names)
+        preserved_test_tasks = []
+        seen_test_tasks = set()
+        for task in existing_test_tasks:
+            if task in known_hdf5_tasks and task not in seen_test_tasks:
+                preserved_test_tasks.append(task)
+                seen_test_tasks.add(task)
+        additional_needed = max(0, args.num_test_tasks - len(preserved_test_tasks))
+        additional_candidates = sorted(
+            rec["task"]
+            for rec in pending_hdf5_task_records
+            if rec["task"] not in preserved_test_tasks
+        )
+        if additional_needed > len(additional_candidates):
+            raise ValueError(
+                f"Need {additional_needed} additional held-out tasks to reach --num-test-tasks={args.num_test_tasks}, "
+                f"but only found {len(additional_candidates)} new HDF5 tasks to sample from."
+            )
+        sampled_test_tasks = sorted(
+            preserved_test_tasks
+            + random.Random(args.seed).sample(additional_candidates, additional_needed)
+        )
+    else:
+        sampled_test_tasks = (
+            sorted(random.Random(args.seed).sample(hdf5_task_names, args.num_test_tasks))
+            if args.num_test_tasks > 0
+            else []
+        )
     heldout_task_set = set(sampled_test_tasks)
     heldout_task_records = [
-        rec for rec in hdf5_task_records if rec["task"] in heldout_task_set
+        {key: value for key, value in rec.items() if key != "hdf5_path"}
+        for rec in all_hdf5_task_records
+        if rec["task"] in heldout_task_set
     ]
 
-    task_to_idx: dict[str, int] = {}
-    task_records: list[dict[str, Any]] = []
-    episode_records: list[dict[str, Any]] = []
-    state = {
-        "episode_index": 0,
-        "global_frame_index": 0,
-        "total_frames": 0,
-        "image_shape": None,
-    }
-
-    if args.base_root is not None:
+    if args.base_root is not None and existing_output is None:
         merge_base_dataset(
             base_root=args.base_root,
             output_root=args.output_root,
@@ -562,7 +702,7 @@ def main() -> None:
         )
 
     convert_hdf5_dataset(
-        hdf5_files=hdf5_files,
+        hdf5_files=[Path(rec["hdf5_path"]) for rec in pending_hdf5_task_records],
         output_root=args.output_root,
         chunks_size=args.chunks_size,
         fps=args.fps,
