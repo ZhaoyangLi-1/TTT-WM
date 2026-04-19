@@ -32,10 +32,6 @@ from cosmos_model import (
     ARPatchConfig as _CosmosConfig,
     ARVideoPatchTransformer as _CosmosModel,
 )
-from idm_model import (
-    InverseDynamicsModel as _IDMModel,
-    InverseDynamicsModelDP as _IDMModelDP,
-)
 
 OmegaConf.register_new_resolver("if", lambda cond, t, f: t if cond else f, replace=True)
 
@@ -54,11 +50,6 @@ def _is_rank0() -> bool:
 
 
 def configure_logging_for_ddp(is_main: bool) -> None:
-    """
-    Make DDP training quiet:
-    - rank0: normal INFO logging
-    - non-rank0: errors only
-    """
     root = logging.getLogger()
 
     if is_main:
@@ -74,10 +65,8 @@ def configure_logging_for_ddp(is_main: bool) -> None:
         log.setLevel(logging.INFO)
         warnings.filterwarnings("default")
     else:
-        # silence warnings on non-main ranks
         warnings.filterwarnings("ignore")
 
-        # remove all existing handlers and replace with ERROR-only handler
         for h in list(root.handlers):
             root.removeHandler(h)
 
@@ -89,7 +78,6 @@ def configure_logging_for_ddp(is_main: bool) -> None:
         root.addHandler(handler)
         root.setLevel(logging.ERROR)
 
-        # silence common noisy libraries
         logging.getLogger(__name__).setLevel(logging.ERROR)
         logging.getLogger("wandb").setLevel(logging.ERROR)
         logging.getLogger("urllib3").setLevel(logging.ERROR)
@@ -101,7 +89,6 @@ def configure_logging_for_ddp(is_main: bool) -> None:
         logging.getLogger("torch._inductor").setLevel(logging.ERROR)
         logging.getLogger("hydra").setLevel(logging.ERROR)
 
-        # reduce external noise
         os.environ["WANDB_SILENT"] = "true"
         os.environ["PYTHONWARNINGS"] = "ignore"
 
@@ -311,40 +298,52 @@ class EMA:
 
 
 def build_optimizer(
-    model: nn.Module, opt_cfg: DictConfig, is_main: bool
+    model_or_params, opt_cfg: DictConfig, is_main: bool
 ) -> torch.optim.Optimizer:
     eps = float(opt_cfg.get("eps", 1.0e-8))
-    if not opt_cfg.no_decay_norm:
+
+    if isinstance(model_or_params, nn.Module):
+        if not opt_cfg.no_decay_norm:
+            params = [p for p in model_or_params.parameters() if p.requires_grad]
+            return torch.optim.AdamW(
+                params,
+                lr=opt_cfg.lr,
+                weight_decay=opt_cfg.weight_decay,
+                betas=tuple(opt_cfg.betas),
+                eps=eps,
+            )
+
+        no_decay_types = (nn.LayerNorm, nn.GroupNorm, nn.Embedding)
+        decay_params, no_decay_params = [], []
+        for module in model_or_params.modules():
+            for param_name, param in module.named_parameters(recurse=False):
+                if not param.requires_grad:
+                    continue
+                if isinstance(module, no_decay_types) or param_name == "bias":
+                    no_decay_params.append(param)
+                else:
+                    decay_params.append(param)
+
+        if is_main:
+            log.info(
+                f"Optimizer groups — decay: {len(decay_params)} | no_decay: {len(no_decay_params)}"
+            )
+
         return torch.optim.AdamW(
-            model.parameters(),
+            [
+                {"params": decay_params, "weight_decay": opt_cfg.weight_decay},
+                {"params": no_decay_params, "weight_decay": 0.0},
+            ],
             lr=opt_cfg.lr,
-            weight_decay=opt_cfg.weight_decay,
             betas=tuple(opt_cfg.betas),
             eps=eps,
         )
 
-    no_decay_types = (nn.LayerNorm, nn.GroupNorm, nn.Embedding)
-    decay_params, no_decay_params = [], []
-    for module in model.modules():
-        for param_name, param in module.named_parameters(recurse=False):
-            if not param.requires_grad:
-                continue
-            if isinstance(module, no_decay_types) or param_name == "bias":
-                no_decay_params.append(param)
-            else:
-                decay_params.append(param)
-
-    if is_main:
-        log.info(
-            f"Optimizer groups — decay: {len(decay_params)} | no_decay: {len(no_decay_params)}"
-        )
-
+    params = [p for p in model_or_params if p.requires_grad]
     return torch.optim.AdamW(
-        [
-            {"params": decay_params, "weight_decay": opt_cfg.weight_decay},
-            {"params": no_decay_params, "weight_decay": 0.0},
-        ],
+        params,
         lr=opt_cfg.lr,
+        weight_decay=opt_cfg.weight_decay,
         betas=tuple(opt_cfg.betas),
         eps=eps,
     )
@@ -524,11 +523,14 @@ class VideoFrameDataset(Dataset):
         ep_indices = in_domain_eps if split == "train" else test_eps
         self.episode_indices = list(ep_indices)
         self.episode_files = {ep_idx: str(episode_files[ep_idx]) for ep_idx in range(total_episodes)}
+        self._ep_tasks = ep_tasks
+        self._ep_lengths = ep_lengths
 
         self.samples = []
         span = self.fin + self.gap + self.fout - 1
         self._target_offset = self.fin - 1 + self.gap
         self._action_offset = self.fin - 1
+        self._span = span
 
         for ep_idx in ep_indices:
             length = ep_lengths[ep_idx]
@@ -571,7 +573,6 @@ class VideoFrameDataset(Dataset):
         if self._action_stats_cache is not None:
             return {k: v.copy() for k, v in self._action_stats_cache.items()}
 
-        # Try loading from disk cache
         cache_path = self._data_root / "meta" / "action_stats.json"
         if cache_path.exists():
             if self.is_main:
@@ -623,7 +624,6 @@ class VideoFrameDataset(Dataset):
             "std": std.astype(np.float32),
         }
 
-        # Save to disk for next run
         if self.is_main:
             saved = {k: v.tolist() for k, v in self._action_stats_cache.items()}
             with open(cache_path, "w") as f:
@@ -723,7 +723,7 @@ def build_datasets(data_cfg, model_cfg, is_main: bool):
 
 
 # ---------------------------------------------------------------------------
-# Trainer
+# Trainer (Stage 1 only)
 # ---------------------------------------------------------------------------
 
 
@@ -774,7 +774,6 @@ class Trainer:
         )
         self.current_epoch = 0
         self.compile_enabled = False
-        self.idm_type = str(cfg.train.get("idm_type", "mlp")).lower()
         self.num_epochs = int(
             OmegaConf.select(cfg, "training.num_epochs", default=cfg.train.get("epochs", 1))
         )
@@ -829,68 +828,17 @@ class Trainer:
             )
 
         # --- Model ---
-        mcfg = cfg.model
-        self.stage = int(cfg.train.get("stage", 1))
         has_goal = bool(cfg.data.get("use_goal", True))
-
-        config_kwargs = dict(
-            resolution=mcfg.resolution,
-            num_channels=mcfg.num_channels,
-            patch_size=mcfg.patch_size,
-            d_model=mcfg.d_model,
-            n_heads=mcfg.n_heads,
-            n_layers=mcfg.n_layers,
-            mlp_ratio=mcfg.mlp_ratio,
-            dropout=mcfg.dropout,
-            frames_in=mcfg.frames_in,
-            frames_out=mcfg.frames_out,
-            action_dim=cfg.data.get("action_dim", 7),
-        )
-
-        config_kwargs["qk_norm"] = mcfg.get("qk_norm", True)
-        config_kwargs["parallel_attn"] = mcfg.get("parallel_attn", False)
-        self.model_cfg = _CosmosConfig(**config_kwargs)
-        raw_model = _CosmosModel(self.model_cfg).to(self.device)
-
-        if self.stage == 2:
-            s1 = str(cfg.train.get("stage1_ckpt", ""))
-            if s1:
-                self._load_stage1_weights(raw_model, s1)
-            if self.idm_type in {"dp", "diffusion", "diffusion_policy"}:
-                raw_model = _IDMModelDP(
-                    raw_model,
-                    n_actions=int(cfg.data.get("frame_gap", 0)),
-                    **OmegaConf.to_container(cfg.train.get("idm_dp", {}), resolve=True),
-                ).to(self.device)
-            else:
-                raw_model = _IDMModel(
-                    raw_model,
-                    n_actions=int(cfg.data.get("frame_gap", 0)),
-                ).to(self.device)
-            raw_model.prebuild_mask(device=self.device, has_goal=has_goal)
-        else:
-            raw_model.prebuild_mask(device=self.device, has_goal=has_goal)
+        self.model_cfg = self._build_model_cfg()
+        raw_wm = self._build_raw_model()
+        raw_model = self._build_trainable_model(raw_wm, has_goal)
 
         if self.is_main:
             np_ = sum(p.numel() for p in raw_model.parameters()) / 1e6
             nt_ = (
                 sum(p.numel() for p in raw_model.parameters() if p.requires_grad) / 1e6
             )
-            log.info(
-                f"Stage: {self.stage} | Params: {np_:.2f}M | Trainable: {nt_:.2f}M"
-            )
-
-        using_diffusion_policy_idm = (
-            self.stage == 2 and self.idm_type in {"dp", "diffusion", "diffusion_policy"}
-        )
-        self._stage2_dp_ddp_safe_mode = self.world_size > 1 and using_diffusion_policy_idm
-        if self.world_size > 1 and using_diffusion_policy_idm and hasattr(torch, "_dynamo"):
-            torch._dynamo.config.optimize_ddp = False
-            if self.is_main:
-                log.info(
-                    "Disabled TorchDynamo DDP optimizer for stage=2 diffusion_policy IDM "
-                    "to avoid flex_attention compile failures under DDP."
-                )
+            log.info(f"Stage: {self._stage_tag()} | Params: {np_:.2f}M | Trainable: {nt_:.2f}M")
 
         # --- DDP ---
         if self.world_size > 1:
@@ -898,36 +846,24 @@ class Trainer:
                 raw_model,
                 device_ids=[self.local_rank],
                 output_device=self.local_rank,
-                broadcast_buffers=not self._stage2_dp_ddp_safe_mode,
+                broadcast_buffers=self._ddp_broadcast_buffers(),
                 find_unused_parameters=bool(
                     cfg.train.get("find_unused_parameters", False)
                 ),
             )
             if self.is_main:
                 log.info(f"DDP enabled ({self.world_size} GPUs)")
-                if self._stage2_dp_ddp_safe_mode:
-                    log.info(
-                        "Disabled DDP buffer broadcasts for stage=2 diffusion_policy IDM "
-                        "to avoid collective mismatches from buffer sync."
-                    )
         else:
             self.model = raw_model
 
         # --- torch.compile ---
         compile_requested = bool(cfg.train.get("compile", False))
-        if compile_requested and hasattr(torch, "compile"):
-            if using_diffusion_policy_idm:
-                if self.is_main:
-                    log.info(
-                        "Skipping torch.compile for stage=2 diffusion_policy IDM "
-                        "because the robomimic/diffusion_policy vision stack is not compile-safe."
-                    )
-            else:
-                torch._dynamo.config.optimize_ddp = False
-                self.model = torch.compile(self.model, mode="reduce-overhead")
-                self.compile_enabled = True
-                if self.is_main:
-                    log.info("torch.compile enabled")
+        if compile_requested and hasattr(torch, "compile") and not self._should_skip_compile():
+            torch._dynamo.config.optimize_ddp = False
+            self.model = torch.compile(self.model, mode="reduce-overhead")
+            self.compile_enabled = True
+            if self.is_main:
+                log.info("torch.compile enabled")
 
         # --- EMA ---
         dp_ema_cfg = OmegaConf.select(cfg, "ema", default=None)
@@ -994,15 +930,8 @@ class Trainer:
 
         # --- Data ---
         self.use_goal = cfg.data.get("use_goal", True)
-        train_ds, val_ds, test_ds = build_datasets(cfg.data, cfg.model, self.is_main)
-        raw = unwrap_model(self.model)
-        if self.stage == 2 and hasattr(raw, "set_action_stats") and hasattr(train_ds, "get_action_stats"):
-            action_stats = train_ds.get_action_stats()
-            raw.set_action_stats(action_stats)
-            if self.ema is not None and hasattr(self.ema.shadow, "set_action_stats"):
-                self.ema.shadow.set_action_stats(action_stats)
-            if self.is_main:
-                log.info("Loaded train action stats into stage-2 diffusion-policy IDM.")
+        train_ds, val_ds, test_ds = self._build_datasets()
+        self._post_data_setup(train_ds)
         self.test_task_names = list(getattr(train_ds, "test_tasks", ()))
         dl_timeout = int(cfg.data.get("loader_timeout", 600))
 
@@ -1168,6 +1097,50 @@ class Trainer:
             if self.is_main:
                 log.info("wandb initialized.")
 
+    # --- Extension hooks (default = stage 1 behavior) ---
+
+    def _stage_tag(self) -> str:
+        return "1"
+
+    def _build_model_cfg(self) -> _CosmosConfig:
+        mcfg = self.cfg.model
+        config_kwargs = dict(
+            resolution=mcfg.resolution,
+            num_channels=mcfg.num_channels,
+            patch_size=mcfg.patch_size,
+            d_model=mcfg.d_model,
+            n_heads=mcfg.n_heads,
+            n_layers=mcfg.n_layers,
+            mlp_ratio=mcfg.mlp_ratio,
+            dropout=mcfg.dropout,
+            frames_in=mcfg.frames_in,
+            frames_out=mcfg.frames_out,
+            action_dim=self.cfg.data.get("action_dim", 7),
+        )
+        config_kwargs["qk_norm"] = mcfg.get("qk_norm", True)
+        config_kwargs["parallel_attn"] = mcfg.get("parallel_attn", False)
+        return _CosmosConfig(**config_kwargs)
+
+    def _build_raw_model(self) -> nn.Module:
+        return _CosmosModel(self.model_cfg).to(self.device)
+
+    def _build_trainable_model(self, raw_wm: nn.Module, has_goal: bool) -> nn.Module:
+        raw_wm.prebuild_mask(device=self.device, has_goal=has_goal)
+        return raw_wm
+
+    def _should_skip_compile(self) -> bool:
+        return False
+
+    def _ddp_broadcast_buffers(self) -> bool:
+        return True
+
+    def _post_data_setup(self, train_ds) -> None:
+        del train_ds
+
+    # Allow subclasses to swap in a different dataset construction.
+    def _build_datasets(self):
+        return build_datasets(self.cfg.data, self.cfg.model, self.is_main)
+
     # --- Checkpointing ---
 
     def _save_checkpoint(self, epoch, val_loss, tag="last"):
@@ -1203,18 +1176,11 @@ class Trainer:
         if self.is_main:
             log.info(f"Resumed from {path} | start_epoch={self.start_epoch}")
 
-    def _load_stage1_weights(self, model, path):
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        if "ema" in ckpt:
-            ema_state = ckpt["ema"]
-            raw_sd = ema_state["shadow"] if "shadow" in ema_state else ema_state
-            weight_source = "EMA"
-        else:
-            raw_sd = ckpt["model"]
-            weight_source = "live"
-        model.load_state_dict(_clean_state_dict(raw_sd))
-        if self.is_main:
-            log.info(f"Loaded Stage 1 ({weight_source} weights) from {path}")
+    # --- Forward hooks (stage 1) ---
+
+    def _forward(self, model, context, target, actions, goal):
+        pred, loss = model(context, target, goal)
+        return pred, loss
 
     # --- Epoch loop ---
 
@@ -1301,10 +1267,7 @@ class Trainer:
                         with sync_ctx, torch.amp.autocast(
                             "cuda", enabled=self.use_amp, dtype=self.amp_dtype
                         ):
-                            if self.stage == 1:
-                                _, loss = self.model(context, target, goal)
-                            else:
-                                _, _, loss = self.model(context, target, actions, goal=goal)
+                            _, loss = self._forward(self.model, context, target, actions, goal)
                             scaled = loss / self.grad_accum_steps
                         self.scaler.scale(scaled).backward()
                     except RuntimeError as e:
@@ -1321,7 +1284,11 @@ class Trainer:
                         if self.cfg.train.grad_clip > 0:
                             self.scaler.unscale_(self.optimizer)
                             nn.utils.clip_grad_norm_(
-                                unwrap_model(self.model).parameters(),
+                                [
+                                    p
+                                    for p in unwrap_model(self.model).parameters()
+                                    if p.requires_grad
+                                ],
                                 self.cfg.train.grad_clip,
                             )
 
@@ -1368,10 +1335,7 @@ class Trainer:
                         with torch.amp.autocast(
                             "cuda", enabled=self.use_amp, dtype=self.amp_dtype
                         ):
-                            if self.stage == 1:
-                                _, loss = self.model(context, target, goal)
-                            else:
-                                _, _, loss = self.model(context, target, actions, goal=goal)
+                            _, loss = self._forward(self.model, context, target, actions, goal)
                     except RuntimeError as e:
                         if self._is_fatal_dist_error(e):
                             log.error(f"[Rank {self.rank}] Eval error: {e}")
@@ -1414,13 +1378,11 @@ class Trainer:
     def _frames_to_uint8(frames):
         x = (frames.float().clamp(-1, 1) * 0.5 + 0.5) * 255.0
         arr = x.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
-        arr = np.rot90(arr, 2, axes=(1, 2)).copy()   # rotate 180 degrees
+        arr = np.rot90(arr, 2, axes=(1, 2)).copy()
         return arr
 
     def _sync_model_before_logging(self):
         if self.world_size <= 1:
-            return
-        if getattr(self, "_stage2_dp_ddp_safe_mode", False):
             return
         raw = unwrap_model(self.model)
         for p in raw.parameters():
@@ -1471,10 +1433,7 @@ class Trainer:
         goals = torch.stack(goal_list).to(self.device) if self.use_goal else None
 
         with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
-            if self.stage == 1:
-                pred_frames, _ = raw(context, target, goals)
-            else:
-                pred_frames, _, _ = raw(context, target, actions, goal=goals)
+            pred_frames, _ = self._forward(raw, context, target, actions, goals)
 
         if self.ema:
             self.ema.restore(raw)
@@ -1558,10 +1517,7 @@ class Trainer:
         goals = torch.stack(goal_list).to(self.device) if self.use_goal else None
 
         with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
-            if self.stage == 1:
-                pred_frames, _ = raw(context, target, goals)
-            else:
-                pred_frames, _, _ = raw(context, target, actions, goal=goals)
+            pred_frames, _ = self._forward(raw, context, target, actions, goals)
 
         if self.ema:
             self.ema.restore(raw)

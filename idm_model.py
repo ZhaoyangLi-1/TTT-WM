@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+from contextlib import nullcontext
 from typing import Optional, Tuple
 
 import numpy as np
@@ -79,6 +80,7 @@ class InverseDynamicsModel(nn.Module):
         stage1_model: ARVideoPatchTransformer,
         n_actions: int,
         stage1_micro_batch: Optional[int] = None,
+        freeze_stage1: bool = False,
     ):
         super().__init__()
         cfg = stage1_model.cfg
@@ -86,8 +88,13 @@ class InverseDynamicsModel(nn.Module):
         self.n_actions = n_actions
         self.stage1_micro_batch = _validate_stage1_micro_batch(stage1_micro_batch)
         self._auto_stage1_micro_batch_cache: dict[int, int] = {}
+        self.freeze_stage1 = bool(freeze_stage1)
 
         self.stage1 = stage1_model
+        if self.freeze_stage1:
+            for p in self.stage1.parameters():
+                p.requires_grad_(False)
+            self.stage1.eval()
 
         d_model = cfg.d_model
         self.action_head = nn.Sequential(
@@ -106,6 +113,8 @@ class InverseDynamicsModel(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
+        if self.freeze_stage1:
+            self.stage1.eval()
         return self
 
     def prebuild_mask(self, device: torch.device, has_goal: bool = False) -> None:
@@ -125,17 +134,19 @@ class InverseDynamicsModel(nn.Module):
 
         batch_size = input_frames.shape[0]
         n_patches = self.cfg.n_patches
-        pred_frames = self._predict_next_frame(input_frames, goal=goal)
-        all_frames = torch.cat([input_frames, pred_frames], dim=1)
+        stage1_ctx = torch.no_grad() if self.freeze_stage1 else nullcontext()
+        with stage1_ctx:
+            pred_frames = self._predict_next_frame(input_frames, goal=goal)
+            all_frames = torch.cat([input_frames, pred_frames], dim=1)
 
-        tokens = self.stage1._embed_frames(all_frames)
-        t_idx, s_idx = self.stage1._build_position_indices(
-            2, 0, tokens.device, has_goal=False,
-        )
-        block_mask = self.stage1._ensure_mask(
-            2, 0, tokens.device, has_goal=False,
-        )
-        hidden = self.stage1._run_transformer(tokens, t_idx, s_idx, block_mask)
+            tokens = self.stage1._embed_frames(all_frames)
+            t_idx, s_idx = self.stage1._build_position_indices(
+                2, 0, tokens.device, has_goal=False,
+            )
+            block_mask = self.stage1._ensure_mask(
+                2, 0, tokens.device, has_goal=False,
+            )
+            hidden = self.stage1._run_transformer(tokens, t_idx, s_idx, block_mask)
 
         input_feat = hidden[:, :n_patches].mean(dim=1)
         pred_feat = hidden[:, n_patches : 2 * n_patches].mean(dim=1)
@@ -256,6 +267,7 @@ class InverseDynamicsModelDP(nn.Module):
         obs_encoder_group_norm: bool = True,
         eval_fixed_crop: bool = True,
         stage1_micro_batch: Optional[int] = None,
+        freeze_stage1: bool = False,
     ):
         super().__init__()
         _configure_diffusion_policy_import_path()
@@ -285,8 +297,13 @@ class InverseDynamicsModelDP(nn.Module):
         self.n_obs_steps = int(n_obs_steps)
         self.stage1_micro_batch = _validate_stage1_micro_batch(stage1_micro_batch)
         self._auto_stage1_micro_batch_cache: dict[int, int] = {}
+        self.freeze_stage1 = bool(freeze_stage1)
 
         self.stage1 = stage1_model
+        if self.freeze_stage1:
+            for p in self.stage1.parameters():
+                p.requires_grad_(False)
+            self.stage1.eval()
 
         self.action_dim = cfg.action_dim
         self.obs_keys = ("image", "predicted_image")
@@ -344,6 +361,8 @@ class InverseDynamicsModelDP(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
+        if self.freeze_stage1:
+            self.stage1.eval()
         return self
 
     def prebuild_mask(self, device: torch.device, has_goal: bool = True) -> None:
@@ -451,7 +470,11 @@ class InverseDynamicsModelDP(nn.Module):
     ):
         del target_frames
 
-        pred_frames = self._predict_next_frame(input_frames, goal=goal)
+        if self.freeze_stage1:
+            with torch.no_grad():
+                pred_frames = self._predict_next_frame(input_frames, goal=goal)
+        else:
+            pred_frames = self._predict_next_frame(input_frames, goal=goal)
         obs_dict = self._build_obs_dict(input_frames, pred_frames)
 
         loss = None

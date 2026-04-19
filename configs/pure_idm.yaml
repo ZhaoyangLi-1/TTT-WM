@@ -1,0 +1,115 @@
+defaults:
+  - stage1_wm_config
+  - _self_
+
+name: pure_idm_${train.idm_type}
+experiment_name: ${name}_gap_${data.frame_gap}
+seed: 42
+
+data:
+  use_goal: false
+  image_resolution: 128  # optional override for model.resolution
+  frame_gap: 4
+  test_task_count: 1
+  selected_task: "KITCHEN_SCENE10: put the butter at the back in the top drawer of the cabinet and close it"
+  test_tasks: []  # auto-populated from data.selected_task by train_pure.py
+  stage2_val_fraction: 0.01
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+  loader_timeout: 600
+
+ema:
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 128
+  num_workers: 8
+  shuffle: true
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+
+val_dataloader:
+  batch_size: 128
+  num_workers: 8
+  shuffle: false
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+
+train:
+  compile: false
+  epochs: 300
+  gradient_accumulate_every: 1
+  idm_type: diffusion_policy
+  optimizer:
+    lr: 1.0e-4
+    weight_decay: 1.0e-6
+    betas: [0.95, 0.999]
+    eps: 1.0e-8
+    no_decay_norm: false
+  scheduler:
+    type: cosine
+    warmup_fraction: 0.0
+    min_lr: 0.0
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  checkpoint_every: 10
+  val_every: 1
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  grad_clip: 1.0
+  amp: true
+  amp_dtype: bf16
+  stage: pure_idm
+  resume: ""
+  find_unused_parameters: false
+  ckpt_dir: ${hydra:runtime.output_dir}/checkpoints
+  idm_dp:
+    horizon: ${data.frame_gap}
+    n_obs_steps: 1
+    n_action_steps: ${data.frame_gap}
+    num_train_timesteps: 100
+    num_inference_steps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    variance_type: fixed_small
+    clip_sample: true
+    prediction_type: epsilon
+    obs_as_global_cond: true
+    crop_shape: [112, 112]
+    obs_encoder_group_norm: true
+    eval_fixed_crop: true
+    diffusion_step_embed_dim: 128
+    down_dims: [512, 1024, 2048]
+    kernel_size: 5
+    n_groups: 8
+    cond_predict_scale: true
+
+wandb:
+  enabled: true
+  project: TTT-WM-diffusion
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${experiment_name}_${data.selected_task}
+  mode: online
+  resume: false
+  tags:
+    - pure_idm
+    - ttt_wm
+    - ${experiment_name}
+    - ${data.selected_task}
+  id: null
+  group: null
+
+hydra:
+  job:
+    override_dirname: ${experiment_name}
+  run:
+    dir: ${outputs_root}/pure_idm/${data.selected_task}/${now:%Y-%m-%d}/${now:%H-%M-%S}_${experiment_name}_${data.selected_task}

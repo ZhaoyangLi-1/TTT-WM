@@ -45,7 +45,7 @@ from eval import (
     frames_to_uint8,
     save_video,
 )
-from train import VideoFrameDataset
+from train_stage1 import VideoFrameDataset
 
 
 # ---------------------------------------------------------------------------
