@@ -21,7 +21,6 @@ import hydra
 import torch
 import torch.nn as nn
 import wandb
-from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf, open_dict
 
 from pure_idm import PureInverseDynamicsModel, PureInverseDynamicsModelDP
@@ -48,9 +47,24 @@ def _build_wandb_safe_task_tag(task_name: str, *, max_len: int = 64) -> str:
 
 
 def _build_task_dirname(task_name: str) -> str:
-    dirname = task_name.replace(":", "")
-    dirname = re.sub(r"\s+", "_", dirname).strip("_")
-    return dirname or "task"
+    normalized = task_name.replace(":", "")
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", normalized).strip("._-")
+    if not normalized:
+        return "task"
+    max_len = 40
+    if len(normalized) <= max_len:
+        return normalized
+
+    digest = hashlib.sha1(task_name.encode("utf-8")).hexdigest()[:8]
+    keep = max_len - len(digest) - 1
+    keep = max(keep, 12)
+    shortened = normalized[:keep].rstrip("._-")
+    if not shortened:
+        shortened = "task"
+    return f"{shortened}_{digest}"
+
+
+OmegaConf.register_new_resolver("task_slug", _build_task_dirname, replace=True)
 
 
 def _resolve_dataset_root(cfg: DictConfig) -> Path:
@@ -140,29 +154,6 @@ def _apply_selected_task_overrides(cfg: DictConfig) -> None:
             f"data.task_dirname={cfg.data.task_dirname!r}, "
             f"data.stage2_val_fraction={float(cfg.data.stage2_val_fraction):.3f}"
         )
-
-
-def _apply_checkpoint_dir_override(cfg: DictConfig) -> None:
-    selected_task = str(OmegaConf.select(cfg, "data.selected_task", default="")).strip()
-    if not selected_task:
-        return
-
-    task_dirname = str(
-        OmegaConf.select(
-            cfg,
-            "data.task_dirname",
-            default=_build_task_dirname(selected_task),
-        )
-    )
-    runtime_output_dir = HydraConfig.get().runtime.output_dir
-    ckpt_root = runtime_output_dir.replace(selected_task, task_dirname)
-
-    with open_dict(cfg.train):
-        cfg.train.ckpt_dir = str(Path(ckpt_root) / "checkpoints")
-
-    rank = int(os.environ.get("RANK", "0"))
-    if rank == 0:
-        log.info(f"Pure IDM checkpoint dir={cfg.train.ckpt_dir}")
 
 
 def _apply_image_resolution_overrides(cfg: DictConfig) -> None:
@@ -299,7 +290,6 @@ class PureIDMTrainer(Trainer):
             wandb.log(
                 {
                     "val/loss": float(val_loss),
-                    "val/epoch": int(self.current_epoch),
                 }
             )
         return val_loss
@@ -316,7 +306,6 @@ class PureIDMTrainer(Trainer):
 @hydra.main(config_path="configs", config_name="pure_idm", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     _apply_selected_task_overrides(cfg)
-    _apply_checkpoint_dir_override(cfg)
     _apply_image_resolution_overrides(cfg)
     OmegaConf.resolve(cfg)
     PureIDMTrainer(cfg).train()
