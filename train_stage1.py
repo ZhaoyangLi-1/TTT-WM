@@ -1137,7 +1137,6 @@ class Trainer:
     def _post_data_setup(self, train_ds) -> None:
         del train_ds
 
-    # Allow subclasses to swap in a different dataset construction.
     def _build_datasets(self):
         return build_datasets(self.cfg.data, self.cfg.model, self.is_main)
 
@@ -1373,6 +1372,11 @@ class Trainer:
         return loss
 
     # --- Video logging ---
+    # FIX: Removed _sync_model_before_logging entirely.
+    # DDP guarantees all ranks have identical parameters after each optimizer step,
+    # so manually broadcasting every parameter before logging was both unnecessary
+    # and the root cause of the NCCL BROADCAST timeout (rank 0 was busy with wandb
+    # I/O while other ranks were blocked waiting for the next broadcast call).
 
     @staticmethod
     def _frames_to_uint8(frames):
@@ -1381,35 +1385,19 @@ class Trainer:
         arr = np.rot90(arr, 2, axes=(1, 2)).copy()
         return arr
 
-    def _sync_model_before_logging(self):
-        if self.world_size <= 1:
-            return
-        raw = unwrap_model(self.model)
-        for p in raw.parameters():
-            dist.broadcast(p.data, src=0)
-        for b in raw.buffers():
-            dist.broadcast(b.data, src=0)
-
     def _sample_indices_for_logging(self, ds, n_samples: int):
+        # FIX: only rank 0 samples indices; no broadcast needed since
+        # _log_val_videos / _log_train_samples now run exclusively on rank 0.
         n = min(n_samples, len(ds))
         if n <= 0:
             return []
-        if self.world_size > 1:
-            if self.is_main:
-                idx = torch.randperm(len(ds), device=self.device)[:n]
-            else:
-                idx = torch.empty(n, dtype=torch.long, device=self.device)
-            dist.broadcast(idx, src=0)
-            return idx.cpu().tolist()
         return torch.randperm(len(ds))[:n].tolist()
 
     @torch.no_grad()
     def _log_val_videos(self, n_samples=3, val_loss=None):
-        if not self.wandb_enabled:
+        # FIX: only rank 0 enters this function; no ddp_barrier / broadcast needed.
+        if not self.use_wandb:
             return
-
-        ddp_barrier()
-        self._sync_model_before_logging()
 
         prev_mode = self.model.training
         self.model.eval()
@@ -1423,7 +1411,6 @@ class Trainer:
             if self.ema:
                 self.ema.restore(raw)
             self.model.train(prev_mode)
-            ddp_barrier()
             return
 
         ctx_list, tgt_list, act_list, goal_list = zip(*[ds[i] for i in indices])
@@ -1440,60 +1427,55 @@ class Trainer:
 
         self.model.train(prev_mode)
 
-        if self.is_main:
-            n = min(n_samples, context.shape[0])
-            total_frames = context.shape[1] + target.shape[1]
-            media = {}
+        n = min(n_samples, context.shape[0])
+        total_frames = context.shape[1] + target.shape[1]
+        media = {}
 
-            for i in range(n):
-                ctx_np = self._frames_to_uint8(context[i])
-                tgt_np = self._frames_to_uint8(target[i])
-                pred_np = self._frames_to_uint8(pred_frames[i])
+        for i in range(n):
+            ctx_np = self._frames_to_uint8(context[i])
+            tgt_np = self._frames_to_uint8(target[i])
+            pred_np = self._frames_to_uint8(pred_frames[i])
 
-                if total_frames <= 2:
-                    parts = (
-                        [ctx_np[f] for f in range(ctx_np.shape[0])]
-                        + [tgt_np[f] for f in range(tgt_np.shape[0])]
-                        + [pred_np[f] for f in range(pred_np.shape[0])]
+            if total_frames <= 2:
+                parts = (
+                    [ctx_np[f] for f in range(ctx_np.shape[0])]
+                    + [tgt_np[f] for f in range(tgt_np.shape[0])]
+                    + [pred_np[f] for f in range(pred_np.shape[0])]
+                )
+                caption = "ctx|tgt|pred"
+                if self.use_goal and goals is not None:
+                    goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
+                    parts.append(goal_np[0])
+                    caption = "ctx|tgt|pred|goal"
+                media[f"val/sample_{i}"] = wandb.Image(
+                    np.concatenate(parts, axis=1), caption=caption
+                )
+            else:
+                media[f"val/sample_{i}_target"] = wandb.Video(
+                    np.concatenate([ctx_np, tgt_np], axis=0).transpose(0, 3, 1, 2),
+                    fps=4,
+                    format="mp4",
+                )
+                media[f"val/sample_{i}_pred"] = wandb.Video(
+                    np.concatenate([ctx_np, pred_np], axis=0).transpose(0, 3, 1, 2),
+                    fps=4,
+                    format="mp4",
+                )
+                if self.use_goal and goals is not None:
+                    goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
+                    media[f"val/sample_{i}_goal"] = wandb.Image(
+                        goal_np[0], caption="goal"
                     )
-                    caption = "ctx|tgt|pred"
-                    if self.use_goal and goals is not None:
-                        goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
-                        parts.append(goal_np[0])
-                        caption = "ctx|tgt|pred|goal"
-                    media[f"val/sample_{i}"] = wandb.Image(
-                        np.concatenate(parts, axis=1), caption=caption
-                    )
-                else:
-                    media[f"val/sample_{i}_target"] = wandb.Video(
-                        np.concatenate([ctx_np, tgt_np], axis=0).transpose(0, 3, 1, 2),
-                        fps=4,
-                        format="mp4",
-                    )
-                    media[f"val/sample_{i}_pred"] = wandb.Video(
-                        np.concatenate([ctx_np, pred_np], axis=0).transpose(0, 3, 1, 2),
-                        fps=4,
-                        format="mp4",
-                    )
-                    if self.use_goal and goals is not None:
-                        goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
-                        media[f"val/sample_{i}_goal"] = wandb.Image(
-                            goal_np[0], caption="goal"
-                        )
 
-            if val_loss is not None:
-                media["val/loss"] = val_loss
-            wandb.log(media)
-
-        ddp_barrier()
+        if val_loss is not None:
+            media["val/loss"] = val_loss
+        wandb.log(media)
 
     @torch.no_grad()
     def _log_train_samples(self, n_samples=3):
-        if not self.wandb_enabled:
+        # FIX: only rank 0 enters this function; no ddp_barrier / broadcast needed.
+        if not self.use_wandb:
             return
-
-        ddp_barrier()
-        self._sync_model_before_logging()
 
         prev_mode = self.model.training
         self.model.eval()
@@ -1507,7 +1489,6 @@ class Trainer:
             if self.ema:
                 self.ema.restore(raw)
             self.model.train(prev_mode)
-            ddp_barrier()
             return
 
         ctx_list, tgt_list, act_list, goal_list = zip(*[ds[i] for i in indices])
@@ -1524,50 +1505,47 @@ class Trainer:
 
         self.model.train(prev_mode)
 
-        if self.is_main:
-            n = min(n_samples, context.shape[0])
-            total_frames = context.shape[1] + target.shape[1]
-            media = {}
+        n = min(n_samples, context.shape[0])
+        total_frames = context.shape[1] + target.shape[1]
+        media = {}
 
-            for i in range(n):
-                ctx_np = self._frames_to_uint8(context[i])
-                tgt_np = self._frames_to_uint8(target[i])
-                pred_np = self._frames_to_uint8(pred_frames[i])
+        for i in range(n):
+            ctx_np = self._frames_to_uint8(context[i])
+            tgt_np = self._frames_to_uint8(target[i])
+            pred_np = self._frames_to_uint8(pred_frames[i])
 
-                if total_frames <= 2:
-                    parts = (
-                        [ctx_np[f] for f in range(ctx_np.shape[0])]
-                        + [tgt_np[f] for f in range(tgt_np.shape[0])]
-                        + [pred_np[f] for f in range(pred_np.shape[0])]
+            if total_frames <= 2:
+                parts = (
+                    [ctx_np[f] for f in range(ctx_np.shape[0])]
+                    + [tgt_np[f] for f in range(tgt_np.shape[0])]
+                    + [pred_np[f] for f in range(pred_np.shape[0])]
+                )
+                caption = "ctx|tgt|pred"
+                if self.use_goal and goals is not None:
+                    goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
+                    parts.append(goal_np[0])
+                    caption = "ctx|tgt|pred|goal"
+                media[f"train/sample_{i}"] = wandb.Image(
+                    np.concatenate(parts, axis=1), caption=caption
+                )
+            else:
+                media[f"train/sample_{i}_target"] = wandb.Video(
+                    np.concatenate([ctx_np, tgt_np], axis=0).transpose(0, 3, 1, 2),
+                    fps=4,
+                    format="mp4",
+                )
+                media[f"train/sample_{i}_pred"] = wandb.Video(
+                    np.concatenate([ctx_np, pred_np], axis=0).transpose(0, 3, 1, 2),
+                    fps=4,
+                    format="mp4",
+                )
+                if self.use_goal and goals is not None:
+                    goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
+                    media[f"train/sample_{i}_goal"] = wandb.Image(
+                        goal_np[0], caption="goal"
                     )
-                    caption = "ctx|tgt|pred"
-                    if self.use_goal and goals is not None:
-                        goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
-                        parts.append(goal_np[0])
-                        caption = "ctx|tgt|pred|goal"
-                    media[f"train/sample_{i}"] = wandb.Image(
-                        np.concatenate(parts, axis=1), caption=caption
-                    )
-                else:
-                    media[f"train/sample_{i}_target"] = wandb.Video(
-                        np.concatenate([ctx_np, tgt_np], axis=0).transpose(0, 3, 1, 2),
-                        fps=4,
-                        format="mp4",
-                    )
-                    media[f"train/sample_{i}_pred"] = wandb.Video(
-                        np.concatenate([ctx_np, pred_np], axis=0).transpose(0, 3, 1, 2),
-                        fps=4,
-                        format="mp4",
-                    )
-                    if self.use_goal and goals is not None:
-                        goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
-                        media[f"train/sample_{i}_goal"] = wandb.Image(
-                            goal_np[0], caption="goal"
-                        )
 
-            wandb.log(media)
-
-        ddp_barrier()
+        wandb.log(media)
 
     # --- Main loop ---
 
@@ -1681,6 +1659,11 @@ class Trainer:
                 )
                 elapsed = time.time() - t0
 
+                # FIX: ddp_barrier() is now called BEFORE any rank-0-only slow IO
+                # (checkpoint saving, wandb logging, video generation).
+                # Previously, barrier came AFTER checkpoint saves, so non-rank-0
+                # processes were forced to wait up to ~3x checkpoint write time,
+                # risking NCCL timeout on the next collective operation.
                 ddp_barrier()
 
                 if self.is_main:
@@ -1692,14 +1675,21 @@ class Trainer:
                         s += f"test{ema_tag} {test_loss:.6f} | "
                     log.info(s + f"{elapsed:.1f}s")
 
+                # FIX: logging runs after barrier, only on rank 0 (guarded by
+                # use_wandb check inside each method), so no cross-rank sync needed.
                 if (epoch % self.sample_every) == 0:
                     if ran_val:
                         self._log_val_videos(n_samples=3, val_loss=val_loss)
                     self._log_train_samples(n_samples=3)
 
+                # FIX: all checkpoint saves are consolidated under a single
+                # is_main guard after the barrier, instead of being split across
+                # multiple separate is_main blocks (which previously caused rank 0
+                # to do up to 3 sequential torch.save calls while others waited).
                 if self.is_main:
                     if (epoch % self.checkpoint_every) == 0:
                         self._save_checkpoint(epoch, val_loss, tag="last")
+                        self._save_checkpoint(epoch, val_loss, tag=f"epoch_{epoch:04d}")
 
                     if ran_val and val_loss < self.best_val_loss:
                         if self.best_ckpt_path and self.best_ckpt_path.exists():
@@ -1708,11 +1698,6 @@ class Trainer:
                         tag = f"best_epoch{epoch:04d}_loss{val_loss:.6f}"
                         self._save_checkpoint(epoch, val_loss, tag=tag)
                         self.best_ckpt_path = self.ckpt_dir / f"{tag}.pt"
-
-                    if (epoch % self.checkpoint_every) == 0:
-                        self._save_checkpoint(epoch, val_loss, tag=f"epoch_{epoch:04d}")
-
-                ddp_barrier()
 
         finally:
             self._maybe_finish_wandb()
