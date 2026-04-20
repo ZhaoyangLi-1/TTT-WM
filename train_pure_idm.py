@@ -20,6 +20,7 @@ from pathlib import Path
 import hydra
 import torch
 import torch.nn as nn
+import wandb
 from omegaconf import DictConfig, OmegaConf, open_dict
 
 from pure_idm import PureInverseDynamicsModel, PureInverseDynamicsModelDP
@@ -43,6 +44,27 @@ def _build_wandb_safe_task_tag(task_name: str, *, max_len: int = 64) -> str:
     if not shortened:
         shortened = "task"
     return f"{shortened}_{digest}"
+
+
+def _build_task_dirname(task_name: str) -> str:
+    normalized = task_name.replace(":", "")
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", normalized).strip("._-")
+    if not normalized:
+        return "task"
+    max_len = 40
+    if len(normalized) <= max_len:
+        return normalized
+
+    digest = hashlib.sha1(task_name.encode("utf-8")).hexdigest()[:8]
+    keep = max_len - len(digest) - 1
+    keep = max(keep, 12)
+    shortened = normalized[:keep].rstrip("._-")
+    if not shortened:
+        shortened = "task"
+    return f"{shortened}_{digest}"
+
+
+OmegaConf.register_new_resolver("task_slug", _build_task_dirname, replace=True)
 
 
 def _resolve_dataset_root(cfg: DictConfig) -> Path:
@@ -118,6 +140,7 @@ def _apply_selected_task_overrides(cfg: DictConfig) -> None:
     with open_dict(cfg.data):
         cfg.data.selected_task = resolved_task
         cfg.data.task_tag = _build_wandb_safe_task_tag(resolved_task)
+        cfg.data.task_dirname = _build_task_dirname(resolved_task)
         cfg.data.test_tasks = [resolved_task]
         if int(OmegaConf.select(cfg, "data.test_task_count", default=1)) != 1:
             cfg.data.test_task_count = 1
@@ -128,6 +151,7 @@ def _apply_selected_task_overrides(cfg: DictConfig) -> None:
             "Using held-out task-filtered split for pure IDM training: "
             f"meta={meta_path}, data.selected_task={resolved_task!r}, "
             f"data.task_tag={cfg.data.task_tag!r}, "
+            f"data.task_dirname={cfg.data.task_dirname!r}, "
             f"data.stage2_val_fraction={float(cfg.data.stage2_val_fraction):.3f}"
         )
 
@@ -259,6 +283,16 @@ class PureIDMTrainer(Trainer):
     def _forward(self, model, context, target, actions, goal):
         pred, _, loss = model(context, target, actions, goal=goal)
         return pred, loss
+
+    def _val_loss(self):
+        val_loss = super()._val_loss()
+        if self.use_wandb:
+            wandb.log(
+                {
+                    "val/loss": float(val_loss),
+                }
+            )
+        return val_loss
 
     @torch.no_grad()
     def _log_val_videos(self, n_samples=3, val_loss=None):
