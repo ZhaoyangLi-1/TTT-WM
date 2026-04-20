@@ -20,6 +20,7 @@ from pathlib import Path
 import hydra
 import torch
 import torch.nn as nn
+import wandb
 from omegaconf import DictConfig, OmegaConf, open_dict
 
 from pure_idm import PureInverseDynamicsModel, PureInverseDynamicsModelDP
@@ -259,6 +260,17 @@ class PureIDMTrainer(Trainer):
     def _forward(self, model, context, target, actions, goal):
         pred, _, loss = model(context, target, actions, goal=goal)
         return pred, loss
+
+    def _val_loss(self):
+        val_loss = super()._val_loss()
+        if self.use_wandb:
+            wandb.log(
+                {
+                    "val/loss": float(val_loss),
+                    "val/epoch": int(self.current_epoch),
+                }
+            )
+        return val_loss
 
     @torch.no_grad()
     def _log_val_videos(self, n_samples=3, val_loss=None):
