@@ -6,55 +6,54 @@ outputs_root: ${oc.env:TTT_WM_OUTPUTS_ROOT,/ariesdv0/zhaoyang/data}
 model:
   resolution: 128
   num_channels: 3
-  patch_size: 8            # 8×8 patches → 256 patches/frame
+  patch_size: 8
 
-  # Cosmos-style causal transformer
   d_model: 768
   n_heads: 12
   n_layers: 12
-  mlp_ratio: 4.0           # standard GELU MLP
-  dropout: 0.1             # causal model benefits from dropout
-
-  # AR window
-  frames_in: 1             # context frames per step
-  frames_out: 1            # target frames to predict per step
+  mlp_ratio: 2.67        
+  dropout: 0.0           
+  frames_in: 1
+  frames_out: 1
 
 data:
-  type: real                           # "synthetic" | "real"
-  root: ${oc.env:TTT_WM_DATA_ROOT,/scr2/zhaoyang/libero_wm}  # parquet dataset root; LIBERO-90 HDF5 can be converted with scripts/prepare_libero90_hdf5.py
-  image_key: image                     # column name in parquet ("image" or "wrist_image")
-  action_key: actions                  # column name for actions in parquet
-  action_dim: 7                        # dimensionality of action vector
-  use_goal: true                      # condition on episode goal frame (last frame)
-  frame_gap: 4                         # m: number of action steps between input and target
-  val_split: 0.1                       # unused for real data; train uses all non-heldout tasks and val uses held-out tasks
-  test_task_count: 3                   # fallback only when meta/test_tasks.json and test_tasks are both absent
-  test_tasks: []                       # optional explicit task names; overrides meta/test_tasks.json when non-empty
-  extensions: [png, jpg, jpeg]         # unused for LeRobot data, kept for compat
-  n_train: 2000                        # only used when type=synthetic
-  n_val:   200
+  type: real
+  root: ${oc.env:TTT_WM_DATA_ROOT,/scr2/zhaoyang/libero_wm}
+  image_key: image
+  action_key: actions
+  action_dim: 7
+  use_goal: true
+  frame_gap: 4
+  val_split: 0.1
+  test_task_count: 3
+  test_tasks: []
+  extensions: [png, jpg, jpeg]
+  n_train: 2000
+  n_val: 200
   moving_dot: true
-  num_workers: 4
+  num_workers: 6         
   pin_memory: true
-  persistent_workers: true    # keep worker processes alive between epochs
-  prefetch_factor: 4          # prefetch batches per worker
+  persistent_workers: true
+  prefetch_factor: 4
   loader_timeout: 600
 
 train:
   max_dl_timeouts: 5
-  compile: true               # torch.compile — significant speedup on H100
+  compile: true
   epochs: 100
-  batch_size: 16             # H100 80G — 22M model @ 128x128, seq_len=512 tokens
+  batch_size: 64           
+
+  gradient_accumulate_every: 1  
   optimizer:
-    lr: 1.0e-4             # Cosmos / GPT training typically uses higher lr
+    lr: 1.0e-4             
     weight_decay: 1.0e-2
-    betas: [0.9, 0.98]
-    no_decay_norm: true    # bias & norm params get weight_decay=0
+    betas: [0.9, 0.98]    
+    no_decay_norm: true
   scheduler:
-    warmup_fraction: 0.02  # 3% warm-up, then cosine decay
+    warmup_fraction: 0.02
   ema:
     enabled: true
-    decay: 0.9999          # Cosmos uses very slow EMA (0.9999)
+    decay: 0.9999
     update_every: 1
   grad_clip: 1.0
   amp: true
@@ -63,8 +62,7 @@ train:
   checkpoint_every: 5
   stage: 1
   resume: ""
-  # test_every: 2          # No used
-  device: "auto"           # auto → cuda > mps > cpu
+  device: "auto"
   find_unused_parameters: false
 
 wandb:
