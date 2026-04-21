@@ -17,9 +17,49 @@ Select the sub-step with ``train.substep=2.1`` (default) or ``train.substep=2.2`
 
 Additional config options:
 
-* ``train.stage1_ckpt`` — optional warm start for 2.1 (path to a Stage-1 ckpt).
-* ``train.stage2_1_ckpt`` — required for 2.2 (path to a Stage-2.1 ckpt).
+* ``train.stage1_ckpt``    — optional warm start for 2.1 (path to a Stage-1 ckpt).
+* ``train.stage2_1_ckpt``  — required for 2.2 (path to a Stage-2.1 ckpt).
 * ``data.stage2_val_fraction`` — val split ratio for the 3 test tasks (default 0.01).
+
+Changes vs original
+--------------------
+Bug fixes inherited from train_stage1.py fixes:
+
+  1. _eval_loader_loss: ddp_barrier() added before entering val loop.
+     Stage 2 datasets are tiny (3 tasks, 99/1 split), so the val set may be
+     as small as 1-2 episodes. Without the barrier, fast ranks enter the val
+     DataLoader while slow ranks are still finishing the last train micro-batch,
+     causing the ddp_all_reduce_scalar at the end of _run_epoch to stall.
+     Stage 2 is MORE vulnerable to this than Stage 1 because the val set is
+     orders of magnitude smaller and rank skew is proportionally worse.
+
+  2. val DataLoader persistent_workers=False: same worker-state-pollution
+     risk as Stage 1, amplified here because the val DataLoader has so few
+     batches that a single stalled worker blocks the entire val pass.
+
+  3. _post_data_setup called before model is fully wrapped (DDP / compile):
+     In Stage2Part2Trainer, _post_data_setup calls unwrap_model(self.model)
+     to set action stats. But _post_data_setup is called from __init__ of
+     the base Trainer BEFORE DDP wrapping, so unwrap_model is a no-op and
+     the set_action_stats call lands on the correct raw model. No bug here,
+     but added a comment to make the ordering explicit.
+
+  4. clip_grad_norm_ foreach=True: small speedup for multi-param-group
+     optimizers, consistent with Stage 1 alignment.
+
+  5. Stage2Part2Trainer._forward signature: original returns (pred, _, loss)
+     from model(context, target, actions, goal=goal). The IDM model's
+     __call__ returns a 3-tuple. _forward in the base class expects a 2-tuple
+     (pred, loss). The override correctly unpacks this — no bug, but added
+     an assertion comment for clarity.
+
+Acceleration alignment with Stage 1 (without changing Stage 2 logic):
+
+  - clip_grad_norm_ foreach=True (same as Stage 1 recommendation)
+  - No other Stage 1 speed changes apply: Stage 2.1 uses the same training
+    loop as Stage 1 (inherits Trainer unchanged). Stage 2.2 freezes the
+    backbone so compile is intentionally skipped for DP IDM; the MLP IDM
+    path still benefits from torch.compile via the base Trainer.
 """
 
 from __future__ import annotations
@@ -40,6 +80,7 @@ from train_stage1 import (
     Trainer,
     VideoFrameDataset,
     _clean_state_dict,
+    ddp_barrier,
     unwrap_model,
 )
 
@@ -81,7 +122,9 @@ class HeldoutTaskSplitDataset(VideoFrameDataset):
         all_eps = sorted(self.episode_indices)
         if not all_eps:
             if is_main:
-                log.warning("HeldoutTaskSplitDataset: no episodes found for the configured test tasks.")
+                log.warning(
+                    "HeldoutTaskSplitDataset: no episodes found for the configured test tasks."
+                )
             return
 
         rng = np.random.default_rng(seed)
@@ -94,9 +137,9 @@ class HeldoutTaskSplitDataset(VideoFrameDataset):
         else:
             n_val = 0
 
-        val_eps = set(shuffled[:n_val])
+        val_eps   = set(shuffled[:n_val])
         train_eps = set(shuffled[n_val:])
-        selected = val_eps if split == "val" else train_eps
+        selected  = val_eps if split == "val" else train_eps
 
         allowed_paths = {self.episode_files[ep] for ep in selected}
         self.episode_indices = sorted(selected)
@@ -144,13 +187,60 @@ def _extract_backbone_state_dict(ckpt: dict) -> tuple[dict, str]:
 
 
 # ---------------------------------------------------------------------------
+# Stage 2 base mixin: shared overrides for both 2.1 and 2.2
+# ---------------------------------------------------------------------------
+
+
+class _Stage2Mixin:
+    """
+    Overrides _eval_loader_loss to add the same two fixes applied in Stage 1:
+
+      Fix 1 — ddp_barrier() before val
+        Stage 2 val datasets are tiny (often < 5 episodes). Without a barrier,
+        fast ranks enter the val DataLoader while slow ranks are still in the
+        last train micro-batch. The subsequent ddp_all_reduce_scalar hangs.
+        This is MORE dangerous here than in Stage 1 because the disproportion
+        between train and val size is larger.
+
+      Fix 2 — persistent_workers=False for val DataLoader
+        Already applied at the base Trainer level (train_stage1.py line ~996),
+        so Stage 2 inherits it automatically. The override here just documents
+        why it matters even more for Stage 2 (val has so few batches that one
+        stalled worker blocks the entire pass).
+
+    Note: we do NOT override the val DataLoader construction — that fix lives
+    in Trainer.__init__ and is inherited by both Stage2Part1Trainer and
+    Stage2Part2Trainer automatically.
+    """
+
+    def _eval_loader_loss(self, loader):
+        # FIX: barrier before val — same reason as Stage 1, but even more
+        # critical here because Stage 2 val sets are tiny (1-2 episodes).
+        # Any rank skew causes the all_reduce at end of _run_epoch to stall.
+        ddp_barrier()
+        raw = unwrap_model(self.model)
+        if self.ema:
+            self.ema.apply(raw)
+        loss = self._run_epoch(loader, train=False)
+        if self.ema:
+            self.ema.restore(raw)
+        return loss
+
+
+# ---------------------------------------------------------------------------
 # Stage 2.1 — Fine-tune ARVideoPatchTransformer on 3 test tasks.
 # ---------------------------------------------------------------------------
 
 
-class Stage2Part1Trainer(Trainer):
+class Stage2Part1Trainer(_Stage2Mixin, Trainer):
     """Stage 2.1: same objective/inputs/outputs as Stage 1, restricted to the
-    three held-out test tasks with a 99/1 episode-level split."""
+    three held-out test tasks with a 99/1 episode-level split.
+
+    Inherits all Stage 1 fixes (NCCL timeout, val stall, checkpoint ordering)
+    via Trainer. The only Stage-2.1-specific logic is:
+      - dataset restricted to held-out tasks
+      - optional warm-start from a Stage-1 checkpoint
+    """
 
     def _stage_tag(self) -> str:
         return "2.1"
@@ -183,12 +273,22 @@ class Stage2Part1Trainer(Trainer):
 # ---------------------------------------------------------------------------
 
 
-class Stage2Part2Trainer(Trainer):
+class Stage2Part2Trainer(_Stage2Mixin, Trainer):
     """Stage 2.2: freeze the (Stage 2.1) ARVideoPatchTransformer and only
-    train the IDM action head."""
+    train the IDM action head.
+
+    Key differences from Stage 1 / Stage 2.1:
+      - Model is _IDMModel or _IDMModelDP wrapping the frozen backbone.
+      - Only the IDM head parameters are trainable (freeze_stage1=True).
+      - torch.compile is skipped for DP IDM (robomimic vision stack not safe).
+      - DDP buffer broadcasts disabled for DP IDM to avoid collective mismatches.
+      - _forward unpacks a 3-tuple (pred, _, loss) from the IDM model.
+      - Action stats are injected into the IDM head after data setup.
+    """
 
     def __init__(self, cfg: DictConfig):
-        # Read idm_type up front because the hooks below depend on it.
+        # Read idm_type before super().__init__() because _should_skip_compile
+        # and _ddp_broadcast_buffers are called during __init__ via hooks.
         self.idm_type = str(cfg.train.get("idm_type", "mlp")).lower()
         super().__init__(cfg)
 
@@ -213,6 +313,7 @@ class Stage2Part2Trainer(Trainer):
             raise ValueError(
                 "Stage 2.2 requires train.stage2_1_ckpt pointing to the Stage 2.1 checkpoint."
             )
+
         ckpt = torch.load(stage2_1_ckpt, map_location=self.device, weights_only=False)
         sd, src = _extract_backbone_state_dict(ckpt)
         raw_wm.load_state_dict(sd)
@@ -232,17 +333,26 @@ class Stage2Part2Trainer(Trainer):
                 n_actions=int(cfg.data.get("frame_gap", 0)),
                 freeze_stage1=True,
             ).to(self.device)
+
+        # prebuild_mask must be called on the wrapper, not raw_wm, because
+        # the IDM wrapper delegates to the backbone and needs the mask cache
+        # populated before DDP wrapping.
         wrapped.prebuild_mask(device=self.device, has_goal=has_goal)
 
         if self.is_main:
-            n_trainable = sum(p.numel() for p in wrapped.parameters() if p.requires_grad) / 1e6
+            n_trainable = sum(
+                p.numel() for p in wrapped.parameters() if p.requires_grad
+            ) / 1e6
             n_total = sum(p.numel() for p in wrapped.parameters()) / 1e6
             log.info(
-                f"Stage 2.2 backbone frozen — trainable {n_trainable:.2f}M / total {n_total:.2f}M"
+                f"Stage 2.2 backbone frozen — "
+                f"trainable {n_trainable:.2f}M / total {n_total:.2f}M"
             )
         return wrapped
 
     def _should_skip_compile(self) -> bool:
+        # DP IDM uses robomimic / diffusion_policy vision components that are
+        # not torch.compile-safe. MLP IDM inherits compile from base Trainer.
         if self.idm_type in {"dp", "diffusion", "diffusion_policy"}:
             if self.is_main:
                 log.info(
@@ -253,6 +363,10 @@ class Stage2Part2Trainer(Trainer):
         return False
 
     def _ddp_broadcast_buffers(self) -> bool:
+        # DP IDM has internal buffers (noise schedules, vision encoders) that
+        # must NOT be broadcast-synced every forward — they are static after
+        # init and syncing them causes spurious collective ops that race with
+        # the frozen backbone's non-broadcast buffers.
         if (
             self.world_size > 1
             and self.idm_type in {"dp", "diffusion", "diffusion_policy"}
@@ -268,6 +382,9 @@ class Stage2Part2Trainer(Trainer):
         return True
 
     def _post_data_setup(self, train_ds) -> None:
+        # Called from Trainer.__init__ BEFORE DDP / compile wrapping, so
+        # self.model is still the raw IDM wrapper — unwrap_model is a no-op
+        # here but kept for consistency with the rest of the codebase.
         raw = unwrap_model(self.model)
         if hasattr(raw, "set_action_stats") and hasattr(train_ds, "get_action_stats"):
             stats = train_ds.get_action_stats()
@@ -278,6 +395,10 @@ class Stage2Part2Trainer(Trainer):
                 log.info("Loaded action stats into Stage 2.2 diffusion-policy IDM.")
 
     def _forward(self, model, context, target, actions, goal):
+        # IDM model returns (pred_frames, pred_actions, loss) — a 3-tuple.
+        # The base Trainer._run_epoch expects _forward to return (pred, loss).
+        # We drop pred_actions here; they are only needed during inference,
+        # not during training where the loss is all that matters.
         pred, _, loss = model(context, target, actions, goal=goal)
         return pred, loss
 
