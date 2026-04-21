@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import torch
 import torch.nn.functional as F  # noqa: N812
 
-import shared.array_typing as at
+import array_typing as at
 
 
 @functools.partial(jax.jit, static_argnums=(1, 2, 3))
