@@ -985,6 +985,15 @@ class Trainer:
             "val_dataloader",
             fallback_workers=train_loader_kw["num_workers"],
         )
+        # FIX: force persistent_workers=False for val loader.
+        # With persistent_workers=True, workers are kept alive across epochs.
+        # When the train epoch ends and we immediately switch to the val loader,
+        # the train workers may still be prefetching; the val workers inherit a
+        # dirty state. This causes some ranks' val DataLoader to stall, which
+        # blocks the ddp_all_reduce_scalar at the end of _run_epoch and hangs
+        # the entire job. Val is small (48 batches), so worker startup cost is
+        # negligible and correctness is more important than marginal IO speed.
+        val_loader_kw = {**val_loader_kw, "persistent_workers": False}
         if self.is_main:
             log.info(
                 f"Train DataLoader: workers={train_loader_kw['num_workers']}, "
@@ -1363,6 +1372,13 @@ class Trainer:
         return self._eval_loader_loss(self.test_loader) if self.test_loader else None
 
     def _eval_loader_loss(self, loader):
+        # FIX: barrier before entering val/test so every rank has fully exited
+        # the train epoch before any rank starts iterating the val DataLoader.
+        # Without this, fast ranks enter the val loop while slow ranks are still
+        # finishing the last train micro-batch; the slow rank's train DataLoader
+        # workers starve the val workers and the ddp_all_reduce_scalar at the
+        # end of _run_epoch(train=False) stalls indefinitely.
+        ddp_barrier()
         raw = unwrap_model(self.model)
         if self.ema:
             self.ema.apply(raw)
