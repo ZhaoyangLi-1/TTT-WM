@@ -137,46 +137,37 @@ def _build_idm_model_cfg(cfg: DictConfig) -> ARPatchConfig:
     return ARPatchConfig(**kwargs)
 
 
-def peek_idm_task(ckpt_path: Path) -> str:
+def read_idm_payload(ckpt_path: Path) -> tuple[dict, DictConfig, str]:
+    print(f"[compare] reading Pure IDM ckpt: {ckpt_path}", flush=True)
     payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg_dict = payload.get("cfg")
     if cfg_dict is None:
         raise KeyError(f"Pure IDM checkpoint {ckpt_path} is missing embedded `cfg`.")
-    task = OmegaConf.select(OmegaConf.create(cfg_dict), "data.selected_task", default=None)
+    cfg = OmegaConf.create(cfg_dict)
+    task = OmegaConf.select(cfg, "data.selected_task", default=None)
     if task in (None, "", "None"):
         raise ValueError(
             f"Pure IDM checkpoint {ckpt_path} does not record cfg.data.selected_task."
         )
-    return str(task)
+    return payload, cfg, str(task)
 
 
 def load_pure_idm(
-    ckpt_path: Path,
+    payload: dict,
+    cfg: DictConfig,
     device: torch.device,
     use_ema: bool,
     task: str,
     dataset_root_override: str,
 ) -> tuple[torch.nn.Module, DictConfig, str]:
-    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    cfg_dict = payload.get("cfg")
-    if cfg_dict is None:
-        raise KeyError(
-            f"Pure IDM checkpoint {ckpt_path} is missing the embedded `cfg`."
-        )
-    cfg = OmegaConf.create(cfg_dict)
 
-    trained_task = OmegaConf.select(cfg, "data.selected_task", default=None)
-    if trained_task not in (None, "", "None") and str(trained_task) != task:
-        raise ValueError(
-            f"Pure IDM ckpt was trained on {trained_task!r}, but --task is {task!r}. "
-            "Refusing to evaluate on a mismatched task."
-        )
-
+    cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
     cfg.data.root = str(dataset_root_override)
     cfg.data.selected_task = task
     cfg.data.test_tasks = [task]
     cfg.data.test_task_count = 1
 
+    print("[compare] building Pure IDM model", flush=True)
     arpatch_cfg = _build_idm_model_cfg(cfg)
     n_actions = int(cfg.data.get("frame_gap", 0))
     if n_actions <= 0:
@@ -201,6 +192,7 @@ def load_pure_idm(
         # Values will be overwritten by the checkpoint; we only need shape.
         from train_stage2 import HeldoutTaskSplitDataset  # local import for clarity
 
+        print("[compare] computing/loading IDM action stats", flush=True)
         val_fraction = float(
             OmegaConf.select(cfg, "data.stage2_val_fraction", default=0.02)
         )
@@ -227,6 +219,7 @@ def load_pure_idm(
         sd = payload["model"]
     sd = _clean_state_dict(sd)
 
+    print(f"[compare] loading Pure IDM weights ({source})", flush=True)
     missing, unexpected = model.load_state_dict(sd, strict=False)
     if missing:
         print(f"[pure_idm] missing keys ({len(missing)}): e.g. {missing[:3]}")
@@ -266,7 +259,8 @@ def build_idm_val_loader(
 # ---------------------------------------------------------------------------
 
 
-def peek_dp_task(ckpt_path: Path) -> str:
+def read_dp_payload(ckpt_path: Path) -> tuple[dict, Any, str]:
+    print(f"[compare] reading DP ckpt: {ckpt_path}", flush=True)
     payload = torch.load(
         ckpt_path, map_location="cpu", pickle_module=dill, weights_only=False
     )
@@ -281,32 +275,18 @@ def peek_dp_task(ckpt_path: Path) -> str:
             f"DP checkpoint {ckpt_path} does not record a training task "
             "(cfg.data.selected_task / cfg.task.dataset.task_filter)."
         )
-    return str(task)
+    return payload, cfg, str(task)
 
 
 def load_dp_policy(
-    ckpt_path: Path,
+    payload: dict,
+    cfg: Any,
     device: torch.device,
     use_ema: bool,
     task: str,
     dataset_root_override: str,
 ) -> tuple[Any, DictConfig, str]:
-    payload = torch.load(
-        ckpt_path, map_location="cpu", pickle_module=dill, weights_only=False
-    )
-    cfg = payload.get("cfg")
-    if cfg is None:
-        raise KeyError(f"DP checkpoint {ckpt_path} is missing the embedded `cfg`.")
     cfg = copy.deepcopy(cfg)
-
-    trained_task = OmegaConf.select(cfg, "data.selected_task", default=None)
-    if trained_task in (None, "", "None"):
-        trained_task = OmegaConf.select(cfg, "task.dataset.task_filter", default=None)
-    if trained_task not in (None, "", "None") and str(trained_task) != task:
-        raise ValueError(
-            f"DP ckpt was trained on {trained_task!r}, but --task is {task!r}. "
-            "Refusing to evaluate on a mismatched task."
-        )
 
     cfg.dataset_root = str(dataset_root_override)
     if OmegaConf.select(cfg, "task.dataset.dataset_root") is not None:
@@ -316,6 +296,7 @@ def load_dp_policy(
         cfg.task.dataset.task_filter = task
     OmegaConf.resolve(cfg)
 
+    print("[compare] building DP policy", flush=True)
     policy = hydra.utils.instantiate(cfg.policy)
 
     state_dicts = payload.get("state_dicts", {})
@@ -331,6 +312,7 @@ def load_dp_policy(
         raise KeyError(
             "DP checkpoint does not contain `state_dicts['model']` or `state_dicts['ema_model']`."
         )
+    print(f"[compare] loading DP weights ({source})", flush=True)
     load_state_dict_flexible(policy, strip_state_dict_prefixes(sd))
 
     policy.to(device)
@@ -501,17 +483,19 @@ def main() -> None:
     configure_diffusion_policy_path(args.diffusion_policy_src)
 
     device = resolve_device(args.device)
+    print(f"[compare] device = {device}", flush=True)
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     idm_ckpt = resolve_checkpoint_path(args.idm_checkpoint)
     dp_ckpt = resolve_checkpoint_path(args.dp_checkpoint)
 
-    # Resolve the held-out task: prefer --task, else peek from both ckpts and
-    # require they agree. This protects against accidentally pairing ckpts
-    # trained on different tasks.
-    idm_trained_task = peek_idm_task(idm_ckpt)
-    dp_trained_task = peek_dp_task(dp_ckpt)
+    # Read each ckpt ONCE (this is the slow part — several seconds each). The
+    # embedded cfg + recorded training task are extracted here; the same
+    # payload is then passed into the builders to avoid a second torch.load.
+    idm_payload, idm_cfg_raw, idm_trained_task = read_idm_payload(idm_ckpt)
+    dp_payload, dp_cfg_raw, dp_trained_task = read_dp_payload(dp_ckpt)
+
     if idm_trained_task != dp_trained_task:
         raise ValueError(
             f"Checkpoint task mismatch: Pure IDM trained on {idm_trained_task!r}, "
@@ -527,16 +511,16 @@ def main() -> None:
             )
         task = args.task
 
-    print(f"[compare] idm ckpt = {idm_ckpt}")
-    print(f"[compare]  dp ckpt = {dp_ckpt}")
-    print(f"[compare]    task  = {task}")
+    print(f"[compare] idm ckpt = {idm_ckpt}", flush=True)
+    print(f"[compare]  dp ckpt = {dp_ckpt}", flush=True)
+    print(f"[compare]    task  = {task}", flush=True)
 
     # --- Build models ---
     idm_model, idm_cfg, idm_source = load_pure_idm(
-        idm_ckpt, device, args.use_ema, task, args.dataset_root
+        idm_payload, idm_cfg_raw, device, args.use_ema, task, args.dataset_root
     )
     dp_policy, dp_cfg, dp_source = load_dp_policy(
-        dp_ckpt, device, args.use_ema, task, args.dataset_root
+        dp_payload, dp_cfg_raw, device, args.use_ema, task, args.dataset_root
     )
 
     # --- Cross-check alignment of the two val splits ---
@@ -565,8 +549,12 @@ def main() -> None:
         )
 
     # --- Build val loaders ---
+    print("[compare] building IDM val loader", flush=True)
     idm_loader = build_idm_val_loader(idm_cfg, args.batch_size, args.num_workers)
+    print(f"[compare]   IDM val: {len(idm_loader.dataset)} windows / {len(idm_loader)} batches", flush=True)
+    print("[compare] building DP val loader", flush=True)
     dp_loader = build_dp_val_loader(dp_cfg, args.batch_size, args.num_workers)
+    print(f"[compare]   DP  val: {len(dp_loader.dataset)} windows / {len(dp_loader)} batches", flush=True)
 
     if len(idm_loader.dataset) != len(dp_loader.dataset):
         print(
