@@ -48,6 +48,7 @@ import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from cosmos_model import ARPatchConfig
 from dp.common import (
@@ -581,10 +582,14 @@ def main() -> None:
 
     # --- Iterate (two loaders have identical sample order when splits match) ---
     max_batches = int(args.num_batches) if args.num_batches > 0 else None
+    loader_max = max(len(idm_loader), len(dp_loader))
+    total_batches = loader_max if max_batches is None else min(max_batches, loader_max)
+
     n_batches = 0
     idm_iter = iter(idm_loader)
     dp_iter = iter(dp_loader)
 
+    pbar = tqdm(total=total_batches, desc="[compare]", unit="batch", dynamic_ncols=True)
     while True:
         try:
             idm_batch = next(idm_iter)
@@ -607,14 +612,14 @@ def main() -> None:
             dp_acc.update(pred_dp, gt_dp)
 
         n_batches += 1
+        idm_running = idm_acc._se_step_dim.sum() / max(idm_acc._count_samples, 1) / (frame_gap_idm * action_dim)
+        dp_running = dp_acc._se_step_dim.sum() / max(dp_acc._count_samples, 1) / (frame_gap_dp * action_dim)
+        pbar.set_postfix(idm_mse=f"{idm_running:.4f}", dp_mse=f"{dp_running:.4f}")
+        pbar.update(1)
+
         if max_batches is not None and n_batches >= max_batches:
             break
-        if n_batches % 10 == 0:
-            print(
-                f"[compare] batch {n_batches}: "
-                f"idm_mse(running)={idm_acc._se_step_dim.sum() / max(idm_acc._count_samples, 1) / (frame_gap_idm * action_dim):.4f}  "
-                f"dp_mse(running)={dp_acc._se_step_dim.sum() / max(dp_acc._count_samples, 1) / (frame_gap_dp * action_dim):.4f}"
-            )
+    pbar.close()
 
     idm_metrics = idm_acc.compute()
     dp_metrics = dp_acc.compute()
