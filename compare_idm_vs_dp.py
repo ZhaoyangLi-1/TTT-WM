@@ -712,7 +712,7 @@ def plot_comparison(
     width = 0.35
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.bar(dims - width / 2, idm_metrics["per_dim_mse"], width, label="IDM")
-    ax.bar(dims + width / 2, dp_metrics["per_dim_mse"], width, label="Diffusion Policy")
+    ax.bar(dims + width / 2, dp_metrics["per_dim_mse"], width, label="DP")
     ax.set_xlabel("action dim")
     ax.set_ylabel("MSE")
     ax.set_title("Per-dim action MSE (lower is better)")
@@ -760,7 +760,7 @@ def plot_rollout_per_step(
 
     fig, ax = plt.subplots(figsize=(9, 4.5))
     _plot(ax, idm_roll, "tab:blue", "IDM")
-    _plot(ax, dp_roll, "tab:orange", "Diffusion Policy")
+    _plot(ax, dp_roll, "tab:orange", "DP")
     ax.set_xlabel("episode timestep (frame)")
     ax.set_ylabel("per-step action MSE")
     ax.set_title(f"Per-timestep action error along episode — {_task_title(task)}")
@@ -784,7 +784,7 @@ def plot_rollout_per_step(
         dp_vals = [dp_roll["per_episode"].get(e, {}).get("mean_mse", np.nan) for e in ep_ids]
         fig, ax = plt.subplots(figsize=(max(6, 0.6 * len(ep_ids) + 3), 4))
         ax.bar(x - width / 2, idm_vals, width, label="IDM", color="tab:blue")
-        ax.bar(x + width / 2, dp_vals, width, label="Diffusion Policy", color="tab:orange")
+        ax.bar(x + width / 2, dp_vals, width, label="DP", color="tab:orange")
         ax.set_xticks(x)
         ax.set_xticklabels([str(e) for e in ep_ids], rotation=45, ha="right")
         ax.set_xlabel("episode index")
@@ -823,7 +823,7 @@ def plot_combined_rollout(
     for ax, tr in zip(axes, per_task):
         for roll, color, label in (
             (tr["idm_rollout"], "tab:blue", "IDM"),
-            (tr["dp_rollout"], "tab:orange", "Diffusion Policy"),
+            (tr["dp_rollout"], "tab:orange", "DP"),
         ):
             mean = np.asarray(roll["per_step_mean_mse"], dtype=np.float64)
             std = np.asarray(roll["per_step_std_mse"], dtype=np.float64)
