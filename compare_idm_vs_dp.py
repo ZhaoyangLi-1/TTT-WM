@@ -117,6 +117,28 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="0 = iterate the full val split (recommended for small val splits).",
     )
+    parser.add_argument(
+        "--eval-val-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Override the val split fraction used for rollout. Overrides both "
+            "data.stage2_val_fraction (IDM) and task.dataset.val_ratio (DP); "
+            "both share seed+shuffle so the val sets stay nested and aligned. "
+            "E.g. 0.2 on a 50-episode task gives ~10 val episodes. WARNING: the "
+            "extra episodes were in the model's training set — numbers will be "
+            "optimistic compared to the default held-out val split. Default: "
+            "inherit from ckpt cfg."
+        ),
+    )
+    parser.add_argument(
+        "--eval-all-episodes",
+        action="store_true",
+        help=(
+            "Shortcut: set --eval-val-fraction to 1.0 so every episode of the "
+            "task is rolled out (includes training episodes)."
+        ),
+    )
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--use-ema", dest="use_ema", action="store_true")
     parser.add_argument("--no-ema", dest="use_ema", action="store_false")
@@ -255,10 +277,13 @@ def build_idm_val_loader(
     cfg: DictConfig,
     batch_size: int,
     num_workers: int,
+    val_fraction_override: float | None = None,
 ) -> DataLoader:
     val_fraction = float(
         OmegaConf.select(cfg, "data.stage2_val_fraction", default=0.02)
     )
+    if val_fraction_override is not None:
+        val_fraction = float(val_fraction_override)
     seed = int(OmegaConf.select(cfg, "seed", default=42))
     _train_ds, val_ds, _ = build_heldout_task_datasets(
         cfg.data, cfg.model, is_main=True, val_fraction=val_fraction, seed=seed
@@ -345,7 +370,14 @@ def build_dp_val_loader(
     cfg: DictConfig,
     batch_size: int,
     num_workers: int,
+    val_ratio_override: float | None = None,
 ) -> DataLoader:
+    if val_ratio_override is not None:
+        cfg = copy.deepcopy(cfg)
+        if OmegaConf.select(cfg, "task.dataset.val_ratio") is not None:
+            cfg.task.dataset.val_ratio = float(val_ratio_override)
+        if OmegaConf.select(cfg, "data.val_ratio") is not None:
+            cfg.data.val_ratio = float(val_ratio_override)
     dataset = hydra.utils.instantiate(cfg.task.dataset)
     dataset = dataset.get_validation_dataset()
     loader = DataLoader(
@@ -468,14 +500,26 @@ def rollout_per_episode(
     max_batches: int | None,
     desc: str,
 ) -> dict[int, dict[str, np.ndarray]]:
-    """Run model over each window in loader order (shuffle=False assumed) and
-    return {episode_idx: {"starts": np.ndarray[N], "mse": np.ndarray[N],
-                          "l1": np.ndarray[N]}} where windows are sorted by start.
+    """Run model over each window in loader order (shuffle=False assumed).
+
+    For each chunk prediction we keep the full per-chunk-step MSE vector (not
+    averaged over the chunk) so downstream aggregation can produce a true
+    per-timestep curve where overlapping chunks get averaged.
+
+    Returns
+    -------
+    {episode_idx: {
+        "starts":     np.ndarray[N]       window start frame in the episode
+        "chunk_mse":  np.ndarray[N, T]    per-chunk-step MSE, dim-averaged
+        "chunk_l1":   np.ndarray[N, T]    per-chunk-step L1, dim-averaged
+    }} sorted by start.
     """
     dataset = loader.dataset
     samples = dataset.samples  # list of tuples, matches DataLoader iteration order
 
-    per_ep = defaultdict(lambda: {"starts": [], "mse": [], "l1": []})
+    per_ep: dict[int, dict[str, list]] = defaultdict(
+        lambda: {"starts": [], "chunk_mse": [], "chunk_l1": []}
+    )
     sample_cursor = 0
     batches_done = 0
     total_batches = len(loader) if max_batches is None else min(max_batches, len(loader))
@@ -484,15 +528,15 @@ def rollout_per_episode(
         for batch in loader:
             pred, gt = predict_fn(batch, device)  # (B, T, D)
             diff = (pred.float() - gt.float()).detach().cpu().double().numpy()
-            win_mse = (diff ** 2).mean(axis=(1, 2))  # (B,)
-            win_l1 = np.abs(diff).mean(axis=(1, 2))
-            B = win_mse.shape[0]
+            chunk_mse = (diff ** 2).mean(axis=2)  # (B, T)
+            chunk_l1 = np.abs(diff).mean(axis=2)  # (B, T)
+            B = chunk_mse.shape[0]
             for i in range(B):
                 s = samples[sample_cursor + i]
                 ep = _ep_idx_from_sample(s)
                 per_ep[ep]["starts"].append(_sample_start(s))
-                per_ep[ep]["mse"].append(float(win_mse[i]))
-                per_ep[ep]["l1"].append(float(win_l1[i]))
+                per_ep[ep]["chunk_mse"].append(chunk_mse[i])
+                per_ep[ep]["chunk_l1"].append(chunk_l1[i])
             sample_cursor += B
             batches_done += 1
             pbar.update(1)
@@ -505,16 +549,50 @@ def rollout_per_episode(
         order = np.argsort(rec["starts"])
         out[ep] = {
             "starts": np.asarray(rec["starts"], dtype=np.int64)[order],
-            "mse": np.asarray(rec["mse"], dtype=np.float64)[order],
-            "l1": np.asarray(rec["l1"], dtype=np.float64)[order],
+            "chunk_mse": np.stack(rec["chunk_mse"], axis=0)[order],  # (N, T)
+            "chunk_l1": np.stack(rec["chunk_l1"], axis=0)[order],    # (N, T)
         }
     return out
+
+
+def _scatter_chunks_to_timesteps(
+    starts: np.ndarray,
+    chunk_vals: np.ndarray,  # (N, T)
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Place each chunk's per-step values at their absolute episode timesteps
+    (s, s+1, ..., s+T-1). Overlapping chunks at the same timestep are averaged.
+
+    Returns (timesteps, mean, count) where timesteps is 0..max_t inclusive,
+    and mean entries for uncovered timesteps are NaN.
+    """
+    N, T = chunk_vals.shape
+    if N == 0:
+        return np.array([], dtype=np.int64), np.array([], dtype=np.float64), np.array([], dtype=np.int64)
+    max_t = int(starts[-1] + T - 1)
+    if max_t < 0:
+        max_t = 0
+    length = max_t + 1
+    vsum = np.zeros(length, dtype=np.float64)
+    vcount = np.zeros(length, dtype=np.int64)
+    # vectorised scatter-add
+    for j in range(T):
+        idx = starts + j
+        # clip in the unlikely case of padding beyond episode end
+        mask = (idx >= 0) & (idx < length)
+        np.add.at(vsum, idx[mask], chunk_vals[:, j][mask])
+        np.add.at(vcount, idx[mask], 1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = np.where(vcount > 0, vsum / np.maximum(vcount, 1), np.nan)
+    return np.arange(length, dtype=np.int64), mean, vcount
 
 
 def summarize_rollout(
     per_ep: dict[int, dict[str, np.ndarray]],
 ) -> dict[str, Any]:
-    """Aggregate per-episode rollout into episode-level scalars + per-step curve."""
+    """Aggregate per-episode rollout into per-timestep curves (averaged over
+    overlapping chunks), episode-level scalars, and a cross-episode per-step
+    mean ± std curve.
+    """
     if not per_ep:
         return {
             "num_episodes": 0,
@@ -526,27 +604,51 @@ def summarize_rollout(
             "per_step_std_mse": [],
             "per_step_counts": [],
         }
-    per_ep_stats = {}
+    per_ep_stats: dict[int, dict[str, Any]] = {}
+    per_ep_timestep_mse: dict[int, np.ndarray] = {}
     max_len = 0
+    all_mse_vals: list[float] = []
+    all_l1_vals: list[float] = []
+    total_windows = 0
     for ep, rec in per_ep.items():
-        per_ep_stats[int(ep)] = {
-            "num_windows": int(rec["mse"].size),
-            "mean_mse": float(rec["mse"].mean()),
-            "mean_l1": float(rec["l1"].mean()),
-            "per_step_mse": rec["mse"].tolist(),
-            "per_step_l1": rec["l1"].tolist(),
-            "starts": rec["starts"].tolist(),
-        }
-        max_len = max(max_len, rec["mse"].size)
+        starts = rec["starts"]
+        chunk_mse = rec["chunk_mse"]  # (N, T)
+        chunk_l1 = rec["chunk_l1"]
+        total_windows += chunk_mse.shape[0]
+        _, mse_curve, _ = _scatter_chunks_to_timesteps(starts, chunk_mse)
+        _, l1_curve, _ = _scatter_chunks_to_timesteps(starts, chunk_l1)
+        per_ep_timestep_mse[int(ep)] = mse_curve
 
+        # per-episode scalar = mean over covered timesteps
+        valid = ~np.isnan(mse_curve)
+        ep_mse_mean = float(mse_curve[valid].mean()) if valid.any() else float("nan")
+        ep_l1_mean = float(l1_curve[~np.isnan(l1_curve)].mean()) if np.any(~np.isnan(l1_curve)) else float("nan")
+
+        per_ep_stats[int(ep)] = {
+            "num_windows": int(chunk_mse.shape[0]),
+            "num_timesteps": int(valid.sum()),
+            "mean_mse": ep_mse_mean,
+            "mean_l1": ep_l1_mean,
+            "per_step_mse": mse_curve.tolist(),
+            "per_step_l1": l1_curve.tolist(),
+            "window_starts": starts.tolist(),
+        }
+        if valid.any():
+            all_mse_vals.extend(mse_curve[valid].tolist())
+            valid_l1 = ~np.isnan(l1_curve)
+            all_l1_vals.extend(l1_curve[valid_l1].tolist())
+        max_len = max(max_len, mse_curve.size)
+
+    # Cross-episode per-timestep mean ± std (aligned to t=0..max_len-1).
     step_sum = np.zeros(max_len, dtype=np.float64)
     step_sqsum = np.zeros(max_len, dtype=np.float64)
     step_count = np.zeros(max_len, dtype=np.int64)
-    for rec in per_ep.values():
-        n = rec["mse"].size
-        step_sum[:n] += rec["mse"]
-        step_sqsum[:n] += rec["mse"] ** 2
-        step_count[:n] += 1
+    for mse_curve in per_ep_timestep_mse.values():
+        n = mse_curve.size
+        valid = ~np.isnan(mse_curve)
+        step_sum[:n][valid] += mse_curve[valid]
+        step_sqsum[:n][valid] += mse_curve[valid] ** 2
+        step_count[:n][valid] += 1
     with np.errstate(invalid="ignore", divide="ignore"):
         step_mean = np.where(step_count > 0, step_sum / np.maximum(step_count, 1), np.nan)
         step_var = np.where(
@@ -556,13 +658,11 @@ def summarize_rollout(
         )
         step_std = np.sqrt(np.maximum(step_var, 0.0))
 
-    all_mse = np.concatenate([rec["mse"] for rec in per_ep.values()])
-    all_l1 = np.concatenate([rec["l1"] for rec in per_ep.values()])
     return {
         "num_episodes": len(per_ep),
-        "num_windows": int(all_mse.size),
-        "mean_mse": float(all_mse.mean()),
-        "mean_l1": float(all_l1.mean()),
+        "num_windows": int(total_windows),
+        "mean_mse": float(np.mean(all_mse_vals)) if all_mse_vals else float("nan"),
+        "mean_l1": float(np.mean(all_l1_vals)) if all_l1_vals else float("nan"),
         "per_episode": per_ep_stats,
         "per_step_mean_mse": step_mean.tolist(),
         "per_step_std_mse": step_std.tolist(),
@@ -573,6 +673,12 @@ def summarize_rollout(
 # ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
+
+
+def _task_title(task: str) -> str:
+    """Strip the `SCENE_NAME:` prefix from a task string for plot titles."""
+    _, _, rest = task.partition(":")
+    return rest.strip() if rest else task.strip()
 
 
 def plot_comparison(
@@ -594,7 +700,7 @@ def plot_comparison(
     # Per-step MSE
     steps = np.arange(len(idm_metrics["per_step_mse"]))
     fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(steps, idm_metrics["per_step_mse"], "o-", label="Pure IDM (oracle upper bound)")
+    ax.plot(steps, idm_metrics["per_step_mse"], "o-", label="IDM (oracle upper bound)")
     ax.plot(steps, dp_metrics["per_step_mse"], "s-", label="Diffusion Policy")
     ax.set_xlabel("action chunk index")
     ax.set_ylabel("MSE")
@@ -611,7 +717,7 @@ def plot_comparison(
     dims = np.arange(len(idm_metrics["per_dim_mse"]))
     width = 0.35
     fig, ax = plt.subplots(figsize=(8, 4))
-    ax.bar(dims - width / 2, idm_metrics["per_dim_mse"], width, label="Pure IDM")
+    ax.bar(dims - width / 2, idm_metrics["per_dim_mse"], width, label="IDM")
     ax.bar(dims + width / 2, dp_metrics["per_dim_mse"], width, label="Diffusion Policy")
     ax.set_xlabel("action dim")
     ax.set_ylabel("MSE")
@@ -659,11 +765,11 @@ def plot_rollout_per_step(
             ax.plot(np.arange(y.size), y, "-", color=color, alpha=0.25, linewidth=0.8)
 
     fig, ax = plt.subplots(figsize=(9, 4.5))
-    _plot(ax, idm_roll, "tab:blue", "Pure IDM")
+    _plot(ax, idm_roll, "tab:blue", "IDM")
     _plot(ax, dp_roll, "tab:orange", "Diffusion Policy")
-    ax.set_xlabel("episode step (window index)")
-    ax.set_ylabel("window MSE (chunk-mean)")
-    ax.set_title(f"Per-episode rollout — {task}")
+    ax.set_xlabel("episode timestep (frame)")
+    ax.set_ylabel("per-step action MSE")
+    ax.set_title(f"Per-timestep action error along episode — {_task_title(task)}")
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()
@@ -683,13 +789,13 @@ def plot_rollout_per_step(
         idm_vals = [idm_roll["per_episode"].get(e, {}).get("mean_mse", np.nan) for e in ep_ids]
         dp_vals = [dp_roll["per_episode"].get(e, {}).get("mean_mse", np.nan) for e in ep_ids]
         fig, ax = plt.subplots(figsize=(max(6, 0.6 * len(ep_ids) + 3), 4))
-        ax.bar(x - width / 2, idm_vals, width, label="Pure IDM", color="tab:blue")
+        ax.bar(x - width / 2, idm_vals, width, label="IDM", color="tab:blue")
         ax.bar(x + width / 2, dp_vals, width, label="Diffusion Policy", color="tab:orange")
         ax.set_xticks(x)
         ax.set_xticklabels([str(e) for e in ep_ids], rotation=45, ha="right")
         ax.set_xlabel("episode index")
         ax.set_ylabel("episode-level mean MSE")
-        ax.set_title(f"Episode-level MSE — {task}")
+        ax.set_title(f"Episode-level MSE — {_task_title(task)}")
         ax.grid(True, alpha=0.3, axis="y")
         ax.legend()
         fig.tight_layout()
@@ -722,7 +828,7 @@ def plot_combined_rollout(
         axes = [axes]
     for ax, tr in zip(axes, per_task):
         for roll, color, label in (
-            (tr["idm_rollout"], "tab:blue", "Pure IDM"),
+            (tr["idm_rollout"], "tab:blue", "IDM"),
             (tr["dp_rollout"], "tab:orange", "Diffusion Policy"),
         ):
             mean = np.asarray(roll["per_step_mean_mse"], dtype=np.float64)
@@ -732,9 +838,9 @@ def plot_combined_rollout(
             x = np.arange(mean.size)
             ax.plot(x, mean, "-", color=color, label=label)
             ax.fill_between(x, mean - std, mean + std, color=color, alpha=0.15)
-        ax.set_xlabel("episode step (window index)")
-        ax.set_ylabel("window MSE")
-        title = tr["task"]
+        ax.set_xlabel("episode timestep (frame)")
+        ax.set_ylabel("per-step action MSE")
+        title = _task_title(tr["task"])
         if len(title) > 60:
             title = title[:57] + "..."
         ax.set_title(title, fontsize=9)
@@ -818,14 +924,32 @@ def evaluate_task(
             "val episode shuffles may not match."
         )
 
+    val_fraction_override: float | None = None
+    if args.eval_all_episodes:
+        val_fraction_override = 1.0
+    elif args.eval_val_fraction is not None:
+        val_fraction_override = float(args.eval_val_fraction)
+    if val_fraction_override is not None:
+        print(
+            f"[compare] overriding val fraction -> {val_fraction_override} "
+            "(expands rollout set; includes episodes the model trained on)",
+            flush=True,
+        )
+
     print("[compare] building IDM val loader", flush=True)
-    idm_loader = build_idm_val_loader(idm_cfg, args.batch_size, args.num_workers)
+    idm_loader = build_idm_val_loader(
+        idm_cfg, args.batch_size, args.num_workers,
+        val_fraction_override=val_fraction_override,
+    )
     print(
         f"[compare]   IDM val: {len(idm_loader.dataset)} windows / {len(idm_loader)} batches",
         flush=True,
     )
     print("[compare] building DP val loader", flush=True)
-    dp_loader = build_dp_val_loader(dp_cfg, args.batch_size, args.num_workers)
+    dp_loader = build_dp_val_loader(
+        dp_cfg, args.batch_size, args.num_workers,
+        val_ratio_override=val_fraction_override,
+    )
     print(
         f"[compare]   DP  val: {len(dp_loader.dataset)} windows / {len(dp_loader)} batches",
         flush=True,
