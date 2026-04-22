@@ -490,8 +490,7 @@ def main() -> None:
 
     device = resolve_device(args.device)
     print(f"[compare] device = {device}", flush=True)
-    output_dir = Path(args.output_dir).expanduser()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_root = Path(args.output_dir).expanduser()
 
     idm_ckpt = resolve_checkpoint_path(args.idm_checkpoint)
     dp_ckpt = resolve_checkpoint_path(args.dp_checkpoint)
@@ -517,9 +516,14 @@ def main() -> None:
             )
         task = args.task
 
+    task_slug = task.replace(":", "").replace(" ", "_")
+    output_dir = output_root / task_slug
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     print(f"[compare] idm ckpt = {idm_ckpt}", flush=True)
     print(f"[compare]  dp ckpt = {dp_ckpt}", flush=True)
     print(f"[compare]    task  = {task}", flush=True)
+    print(f"[compare] output   = {output_dir}", flush=True)
 
     # --- Build models ---
     idm_model, idm_cfg, idm_source = load_pure_idm(
