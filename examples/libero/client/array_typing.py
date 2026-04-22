@@ -10,7 +10,7 @@ import jax._src.tree_util as private_tree_util
 import jax.core
 from jaxtyping import ArrayLike
 from jaxtyping import Bool  # noqa: F401
-from jaxtyping import DTypeLike  # noqa: F401
+from numpy.typing import DTypeLike  # noqa: F401
 from jaxtyping import Float
 from jaxtyping import Int  # noqa: F401
 from jaxtyping import Key  # noqa: F401
