@@ -37,9 +37,11 @@ from __future__ import annotations
 import argparse
 import copy
 import json
-from datetime import datetime
+import re
+from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import dill
 import hydra
@@ -76,8 +78,20 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Offline action-error comparison between Pure IDM and DP."
     )
-    parser.add_argument("--idm-checkpoint", type=str, required=True)
-    parser.add_argument("--dp-checkpoint", type=str, required=True)
+    parser.add_argument(
+        "--idm-checkpoint",
+        type=str,
+        nargs="+",
+        required=True,
+        help="One or more Pure IDM checkpoints (one per held-out task).",
+    )
+    parser.add_argument(
+        "--dp-checkpoint",
+        type=str,
+        nargs="+",
+        required=True,
+        help="DP checkpoints matching --idm-checkpoint 1:1 by position.",
+    )
     parser.add_argument(
         "--dataset-root",
         type=str,
@@ -87,10 +101,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--task",
         type=str,
+        nargs="+",
         default=None,
         help=(
-            "Held-out task name. If omitted, auto-read from both ckpts' cfg.data.selected_task "
-            "(must agree). If passed, must match the task both ckpts were trained on."
+            "Held-out task names (optional). If omitted, auto-read from each ckpt's "
+            "cfg.data.selected_task. If supplied, length must match --idm-checkpoint."
         ),
     )
     parser.add_argument("--output-dir", type=str, required=True)
@@ -421,6 +436,141 @@ class ActionMetricAccumulator:
 
 
 # ---------------------------------------------------------------------------
+# Episode-level rollout
+# ---------------------------------------------------------------------------
+
+
+_EP_IDX_RE = re.compile(r"episode_(\d+)\.parquet")
+
+
+def _ep_idx_from_sample(sample: Any) -> int:
+    """Normalize IDM (ep_path, start, length) / DP (ep_idx, start) to ep_idx."""
+    if isinstance(sample, tuple) and len(sample) == 2:
+        return int(sample[0])
+    if isinstance(sample, tuple) and len(sample) >= 3:
+        m = _EP_IDX_RE.search(str(sample[0]))
+        if m is None:
+            raise ValueError(f"Cannot parse episode idx from IDM sample {sample!r}")
+        return int(m.group(1))
+    raise ValueError(f"Unexpected sample structure: {sample!r}")
+
+
+def _sample_start(sample: Any) -> int:
+    if isinstance(sample, tuple) and len(sample) >= 2:
+        return int(sample[1])
+    raise ValueError(f"Unexpected sample structure: {sample!r}")
+
+
+def rollout_per_episode(
+    loader: DataLoader,
+    predict_fn: Callable[[Any, torch.device], tuple[torch.Tensor, torch.Tensor]],
+    device: torch.device,
+    max_batches: int | None,
+    desc: str,
+) -> dict[int, dict[str, np.ndarray]]:
+    """Run model over each window in loader order (shuffle=False assumed) and
+    return {episode_idx: {"starts": np.ndarray[N], "mse": np.ndarray[N],
+                          "l1": np.ndarray[N]}} where windows are sorted by start.
+    """
+    dataset = loader.dataset
+    samples = dataset.samples  # list of tuples, matches DataLoader iteration order
+
+    per_ep = defaultdict(lambda: {"starts": [], "mse": [], "l1": []})
+    sample_cursor = 0
+    batches_done = 0
+    total_batches = len(loader) if max_batches is None else min(max_batches, len(loader))
+    pbar = tqdm(total=total_batches, desc=desc, unit="batch", dynamic_ncols=True)
+    with torch.no_grad():
+        for batch in loader:
+            pred, gt = predict_fn(batch, device)  # (B, T, D)
+            diff = (pred.float() - gt.float()).detach().cpu().double().numpy()
+            win_mse = (diff ** 2).mean(axis=(1, 2))  # (B,)
+            win_l1 = np.abs(diff).mean(axis=(1, 2))
+            B = win_mse.shape[0]
+            for i in range(B):
+                s = samples[sample_cursor + i]
+                ep = _ep_idx_from_sample(s)
+                per_ep[ep]["starts"].append(_sample_start(s))
+                per_ep[ep]["mse"].append(float(win_mse[i]))
+                per_ep[ep]["l1"].append(float(win_l1[i]))
+            sample_cursor += B
+            batches_done += 1
+            pbar.update(1)
+            if max_batches is not None and batches_done >= max_batches:
+                break
+    pbar.close()
+
+    out: dict[int, dict[str, np.ndarray]] = {}
+    for ep, rec in per_ep.items():
+        order = np.argsort(rec["starts"])
+        out[ep] = {
+            "starts": np.asarray(rec["starts"], dtype=np.int64)[order],
+            "mse": np.asarray(rec["mse"], dtype=np.float64)[order],
+            "l1": np.asarray(rec["l1"], dtype=np.float64)[order],
+        }
+    return out
+
+
+def summarize_rollout(
+    per_ep: dict[int, dict[str, np.ndarray]],
+) -> dict[str, Any]:
+    """Aggregate per-episode rollout into episode-level scalars + per-step curve."""
+    if not per_ep:
+        return {
+            "num_episodes": 0,
+            "num_windows": 0,
+            "mean_mse": float("nan"),
+            "mean_l1": float("nan"),
+            "per_episode": {},
+            "per_step_mean_mse": [],
+            "per_step_std_mse": [],
+            "per_step_counts": [],
+        }
+    per_ep_stats = {}
+    max_len = 0
+    for ep, rec in per_ep.items():
+        per_ep_stats[int(ep)] = {
+            "num_windows": int(rec["mse"].size),
+            "mean_mse": float(rec["mse"].mean()),
+            "mean_l1": float(rec["l1"].mean()),
+            "per_step_mse": rec["mse"].tolist(),
+            "per_step_l1": rec["l1"].tolist(),
+            "starts": rec["starts"].tolist(),
+        }
+        max_len = max(max_len, rec["mse"].size)
+
+    step_sum = np.zeros(max_len, dtype=np.float64)
+    step_sqsum = np.zeros(max_len, dtype=np.float64)
+    step_count = np.zeros(max_len, dtype=np.int64)
+    for rec in per_ep.values():
+        n = rec["mse"].size
+        step_sum[:n] += rec["mse"]
+        step_sqsum[:n] += rec["mse"] ** 2
+        step_count[:n] += 1
+    with np.errstate(invalid="ignore", divide="ignore"):
+        step_mean = np.where(step_count > 0, step_sum / np.maximum(step_count, 1), np.nan)
+        step_var = np.where(
+            step_count > 0,
+            step_sqsum / np.maximum(step_count, 1) - step_mean ** 2,
+            np.nan,
+        )
+        step_std = np.sqrt(np.maximum(step_var, 0.0))
+
+    all_mse = np.concatenate([rec["mse"] for rec in per_ep.values()])
+    all_l1 = np.concatenate([rec["l1"] for rec in per_ep.values()])
+    return {
+        "num_episodes": len(per_ep),
+        "num_windows": int(all_mse.size),
+        "mean_mse": float(all_mse.mean()),
+        "mean_l1": float(all_l1.mean()),
+        "per_episode": per_ep_stats,
+        "per_step_mean_mse": step_mean.tolist(),
+        "per_step_std_mse": step_std.tolist(),
+        "per_step_counts": step_count.tolist(),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
 
@@ -478,26 +628,141 @@ def plot_comparison(
     return saved
 
 
+def plot_rollout_per_step(
+    task: str,
+    idm_roll: dict[str, Any],
+    dp_roll: dict[str, Any],
+    output_dir: Path,
+) -> list[str]:
+    """Per-task figure: x=window index in episode, y=MSE; mean ± std across eps."""
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"[WARN] skipping rollout plot: {exc}")
+        return []
+
+    saved: list[str] = []
+
+    def _plot(ax, roll, color, label):
+        mean = np.asarray(roll["per_step_mean_mse"], dtype=np.float64)
+        std = np.asarray(roll["per_step_std_mse"], dtype=np.float64)
+        if mean.size == 0:
+            return
+        x = np.arange(mean.size)
+        ax.plot(x, mean, "-", color=color, label=f"{label} (mean)")
+        ax.fill_between(x, mean - std, mean + std, color=color, alpha=0.15)
+        for ep_id, ep_stat in roll.get("per_episode", {}).items():
+            y = np.asarray(ep_stat["per_step_mse"], dtype=np.float64)
+            ax.plot(np.arange(y.size), y, "-", color=color, alpha=0.25, linewidth=0.8)
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    _plot(ax, idm_roll, "tab:blue", "Pure IDM")
+    _plot(ax, dp_roll, "tab:orange", "Diffusion Policy")
+    ax.set_xlabel("episode step (window index)")
+    ax.set_ylabel("window MSE (chunk-mean)")
+    ax.set_title(f"Per-episode rollout — {task}")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    p = output_dir / "rollout_per_step.png"
+    fig.savefig(p, dpi=150)
+    plt.close(fig)
+    saved.append(str(p))
+
+    # Per-episode bar chart
+    ep_ids = sorted(
+        set(idm_roll.get("per_episode", {}).keys())
+        | set(dp_roll.get("per_episode", {}).keys())
+    )
+    if ep_ids:
+        width = 0.4
+        x = np.arange(len(ep_ids))
+        idm_vals = [idm_roll["per_episode"].get(e, {}).get("mean_mse", np.nan) for e in ep_ids]
+        dp_vals = [dp_roll["per_episode"].get(e, {}).get("mean_mse", np.nan) for e in ep_ids]
+        fig, ax = plt.subplots(figsize=(max(6, 0.6 * len(ep_ids) + 3), 4))
+        ax.bar(x - width / 2, idm_vals, width, label="Pure IDM", color="tab:blue")
+        ax.bar(x + width / 2, dp_vals, width, label="Diffusion Policy", color="tab:orange")
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(e) for e in ep_ids], rotation=45, ha="right")
+        ax.set_xlabel("episode index")
+        ax.set_ylabel("episode-level mean MSE")
+        ax.set_title(f"Episode-level MSE — {task}")
+        ax.grid(True, alpha=0.3, axis="y")
+        ax.legend()
+        fig.tight_layout()
+        p2 = output_dir / "rollout_per_episode.png"
+        fig.savefig(p2, dpi=150)
+        plt.close(fig)
+        saved.append(str(p2))
+
+    return saved
+
+
+def plot_combined_rollout(
+    per_task: list[dict[str, Any]],
+    output_path: Path,
+) -> str | None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"[WARN] skipping combined rollout plot: {exc}")
+        return None
+    if not per_task:
+        return None
+
+    n = len(per_task)
+    fig, axes = plt.subplots(1, n, figsize=(5.5 * n, 4.2), sharey=False)
+    if n == 1:
+        axes = [axes]
+    for ax, tr in zip(axes, per_task):
+        for roll, color, label in (
+            (tr["idm_rollout"], "tab:blue", "Pure IDM"),
+            (tr["dp_rollout"], "tab:orange", "Diffusion Policy"),
+        ):
+            mean = np.asarray(roll["per_step_mean_mse"], dtype=np.float64)
+            std = np.asarray(roll["per_step_std_mse"], dtype=np.float64)
+            if mean.size == 0:
+                continue
+            x = np.arange(mean.size)
+            ax.plot(x, mean, "-", color=color, label=label)
+            ax.fill_between(x, mean - std, mean + std, color=color, alpha=0.15)
+        ax.set_xlabel("episode step (window index)")
+        ax.set_ylabel("window MSE")
+        title = tr["task"]
+        if len(title) > 60:
+            title = title[:57] + "..."
+        ax.set_title(title, fontsize=9)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+    fig.suptitle("Per-episode rollout across held-out tasks")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return str(output_path)
+
+
 # ---------------------------------------------------------------------------
-# Main
+# Per-task evaluation
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    args = parse_args()
+def evaluate_task(
+    idm_ckpt_arg: str,
+    dp_ckpt_arg: str,
+    task_override: str | None,
+    args: argparse.Namespace,
+    device: torch.device,
+    output_root: Path,
+) -> dict[str, Any]:
+    idm_ckpt = resolve_checkpoint_path(idm_ckpt_arg)
+    dp_ckpt = resolve_checkpoint_path(dp_ckpt_arg)
 
-    configure_diffusion_policy_path(args.diffusion_policy_src)
-
-    device = resolve_device(args.device)
-    print(f"[compare] device = {device}", flush=True)
-    output_root = Path(args.output_dir).expanduser()
-
-    idm_ckpt = resolve_checkpoint_path(args.idm_checkpoint)
-    dp_ckpt = resolve_checkpoint_path(args.dp_checkpoint)
-
-    # Read each ckpt ONCE (this is the slow part — several seconds each). The
-    # embedded cfg + recorded training task are extracted here; the same
-    # payload is then passed into the builders to avoid a second torch.load.
     idm_payload, idm_cfg_raw, idm_trained_task = read_idm_payload(idm_ckpt)
     dp_payload, dp_cfg_raw, dp_trained_task = read_dp_payload(dp_ckpt)
 
@@ -506,15 +771,12 @@ def main() -> None:
             f"Checkpoint task mismatch: Pure IDM trained on {idm_trained_task!r}, "
             f"DP trained on {dp_trained_task!r}. Pair ckpts from the same task."
         )
-    if args.task is None:
-        task = idm_trained_task
-    else:
-        if args.task != idm_trained_task:
-            raise ValueError(
-                f"--task={args.task!r} does not match the task both ckpts were "
-                f"trained on ({idm_trained_task!r})."
-            )
-        task = args.task
+    if task_override is not None and task_override != idm_trained_task:
+        raise ValueError(
+            f"--task={task_override!r} does not match the task both ckpts were "
+            f"trained on ({idm_trained_task!r})."
+        )
+    task = idm_trained_task
 
     task_slug = task.replace(":", "").replace(" ", "_")
     output_dir = output_root / task_slug
@@ -525,7 +787,6 @@ def main() -> None:
     print(f"[compare]    task  = {task}", flush=True)
     print(f"[compare] output   = {output_dir}", flush=True)
 
-    # --- Build models ---
     idm_model, idm_cfg, idm_source = load_pure_idm(
         idm_payload, idm_cfg_raw, device, args.use_ema, task, args.dataset_root
     )
@@ -533,7 +794,6 @@ def main() -> None:
         dp_payload, dp_cfg_raw, device, args.use_ema, task, args.dataset_root
     )
 
-    # --- Cross-check alignment of the two val splits ---
     frame_gap_idm = int(idm_cfg.data.get("frame_gap", 0))
     frame_gap_dp = int(OmegaConf.select(dp_cfg, "horizon", default=0))
     if frame_gap_idm != frame_gap_dp:
@@ -558,77 +818,70 @@ def main() -> None:
             "val episode shuffles may not match."
         )
 
-    # --- Build val loaders ---
     print("[compare] building IDM val loader", flush=True)
     idm_loader = build_idm_val_loader(idm_cfg, args.batch_size, args.num_workers)
-    print(f"[compare]   IDM val: {len(idm_loader.dataset)} windows / {len(idm_loader)} batches", flush=True)
+    print(
+        f"[compare]   IDM val: {len(idm_loader.dataset)} windows / {len(idm_loader)} batches",
+        flush=True,
+    )
     print("[compare] building DP val loader", flush=True)
     dp_loader = build_dp_val_loader(dp_cfg, args.batch_size, args.num_workers)
-    print(f"[compare]   DP  val: {len(dp_loader.dataset)} windows / {len(dp_loader)} batches", flush=True)
-
+    print(
+        f"[compare]   DP  val: {len(dp_loader.dataset)} windows / {len(dp_loader)} batches",
+        flush=True,
+    )
     if len(idm_loader.dataset) != len(dp_loader.dataset):
         print(
             f"[WARN] val size mismatch — IDM windows={len(idm_loader.dataset)}, "
-            f"DP windows={len(dp_loader.dataset)}. Metrics are still computed "
-            "independently per model but sample-level alignment is broken."
+            f"DP windows={len(dp_loader.dataset)}. Metrics computed independently."
         )
 
     action_dim = int(idm_cfg.data.get("action_dim", 7))
+    n_obs_steps_dp = int(OmegaConf.select(dp_cfg, "n_obs_steps", default=1))
+    max_batches = int(args.num_batches) if args.num_batches > 0 else None
+
+    # --- Aggregate per-step-within-chunk metrics (original behaviour) ---
     idm_acc = ActionMetricAccumulator(frame_gap_idm, action_dim)
     dp_acc = ActionMetricAccumulator(frame_gap_dp, action_dim)
-    n_obs_steps_dp = int(OmegaConf.select(dp_cfg, "n_obs_steps", default=1))
 
-    # --- Iterate (two loaders have identical sample order when splits match) ---
-    max_batches = int(args.num_batches) if args.num_batches > 0 else None
-    loader_max = max(len(idm_loader), len(dp_loader))
-    total_batches = loader_max if max_batches is None else min(max_batches, loader_max)
+    # --- Per-episode rollout: group windows by episode, track per-step MSE ---
+    def _idm_pred_fn(batch, dev):
+        pred, gt = idm_predict(idm_model, batch, dev)
+        idm_acc.update(pred, gt)
+        return pred, gt
 
-    n_batches = 0
-    idm_iter = iter(idm_loader)
-    dp_iter = iter(dp_loader)
+    def _dp_pred_fn(batch, dev):
+        pred, gt = dp_predict(dp_policy, batch, dev, n_obs_steps_dp)
+        dp_acc.update(pred, gt)
+        return pred, gt
 
-    pbar = tqdm(total=total_batches, desc="[compare]", unit="batch", dynamic_ncols=True)
-    while True:
-        try:
-            idm_batch = next(idm_iter)
-        except StopIteration:
-            idm_batch = None
-        try:
-            dp_batch = next(dp_iter)
-        except StopIteration:
-            dp_batch = None
+    idm_per_ep = rollout_per_episode(
+        idm_loader, _idm_pred_fn, device, max_batches, "[compare:IDM rollout]"
+    )
+    dp_per_ep = rollout_per_episode(
+        dp_loader, _dp_pred_fn, device, max_batches, "[compare:DP  rollout]"
+    )
 
-        if idm_batch is None and dp_batch is None:
-            break
+    idm_metrics = idm_acc.compute() if idm_acc._count_samples else None
+    dp_metrics = dp_acc.compute() if dp_acc._count_samples else None
+    idm_rollout = summarize_rollout(idm_per_ep)
+    dp_rollout = summarize_rollout(dp_per_ep)
 
-        if idm_batch is not None:
-            pred_idm, gt_idm = idm_predict(idm_model, idm_batch, device)
-            idm_acc.update(pred_idm, gt_idm)
+    gap = None
+    if idm_metrics is not None and dp_metrics is not None:
+        gap_mse = [d - i for d, i in zip(dp_metrics["per_step_mse"], idm_metrics["per_step_mse"])]
+        gap_l1 = [d - i for d, i in zip(dp_metrics["per_step_l1"], idm_metrics["per_step_l1"])]
+        gap_dim_mse = [d - i for d, i in zip(dp_metrics["per_dim_mse"], idm_metrics["per_dim_mse"])]
+        gap = {
+            "mean_mse": dp_metrics["mean_mse"] - idm_metrics["mean_mse"],
+            "mean_l1": dp_metrics["mean_l1"] - idm_metrics["mean_l1"],
+            "per_step_mse": gap_mse,
+            "per_step_l1": gap_l1,
+            "per_dim_mse": gap_dim_mse,
+        }
 
-        if dp_batch is not None:
-            pred_dp, gt_dp = dp_predict(dp_policy, dp_batch, device, n_obs_steps_dp)
-            dp_acc.update(pred_dp, gt_dp)
-
-        n_batches += 1
-        idm_running = idm_acc._se_step_dim.sum() / max(idm_acc._count_samples, 1) / (frame_gap_idm * action_dim)
-        dp_running = dp_acc._se_step_dim.sum() / max(dp_acc._count_samples, 1) / (frame_gap_dp * action_dim)
-        pbar.set_postfix(idm_mse=f"{idm_running:.4f}", dp_mse=f"{dp_running:.4f}")
-        pbar.update(1)
-
-        if max_batches is not None and n_batches >= max_batches:
-            break
-    pbar.close()
-
-    idm_metrics = idm_acc.compute()
-    dp_metrics = dp_acc.compute()
-
-    # --- Gap = DP − IDM (headroom for a perfect world model) ---
-    gap_mse = [d - i for d, i in zip(dp_metrics["per_step_mse"], idm_metrics["per_step_mse"])]
-    gap_l1 = [d - i for d, i in zip(dp_metrics["per_step_l1"], idm_metrics["per_step_l1"])]
-    gap_dim_mse = [d - i for d, i in zip(dp_metrics["per_dim_mse"], idm_metrics["per_dim_mse"])]
-
-    summary = {
-        "timestamp_utc": datetime.utcnow().isoformat(timespec="seconds"),
+    summary: dict[str, Any] = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "task": task,
         "dataset_root": args.dataset_root,
         "frame_gap": frame_gap_idm,
@@ -639,17 +892,17 @@ def main() -> None:
         "dp_weight_source": dp_source,
         "idm": idm_metrics,
         "dp": dp_metrics,
-        "gap_dp_minus_idm": {
-            "mean_mse": dp_metrics["mean_mse"] - idm_metrics["mean_mse"],
-            "mean_l1": dp_metrics["mean_l1"] - idm_metrics["mean_l1"],
-            "per_step_mse": gap_mse,
-            "per_step_l1": gap_l1,
-            "per_dim_mse": gap_dim_mse,
-        },
+        "gap_dp_minus_idm": gap,
+        "idm_rollout": idm_rollout,
+        "dp_rollout": dp_rollout,
         "visualizations": [],
     }
 
-    summary["visualizations"] = plot_comparison(idm_metrics, dp_metrics, output_dir)
+    vis = []
+    if idm_metrics is not None and dp_metrics is not None:
+        vis.extend(plot_comparison(idm_metrics, dp_metrics, output_dir))
+    vis.extend(plot_rollout_per_step(task, idm_rollout, dp_rollout, output_dir))
+    summary["visualizations"] = vis
 
     out_json = output_dir / "summary.json"
     out_json.write_text(json.dumps(summary, indent=2))
@@ -657,21 +910,108 @@ def main() -> None:
     print()
     print("=" * 70)
     print(f"task: {task}")
-    print(f"samples: IDM={idm_metrics['num_samples']}  DP={dp_metrics['num_samples']}")
+    if idm_metrics is not None and dp_metrics is not None:
+        print(f"samples: IDM={idm_metrics['num_samples']}  DP={dp_metrics['num_samples']}")
+        print(
+            f"chunk-mean MSE: IDM={idm_metrics['mean_mse']:.6f}  "
+            f"DP={dp_metrics['mean_mse']:.6f}  "
+            f"gap={gap['mean_mse']:+.6f}"
+        )
     print(
-        f"mean MSE: IDM={idm_metrics['mean_mse']:.6f}  "
-        f"DP={dp_metrics['mean_mse']:.6f}  "
-        f"gap={summary['gap_dp_minus_idm']['mean_mse']:+.6f}"
-    )
-    print(
-        f"mean L1:  IDM={idm_metrics['mean_l1']:.6f}  "
-        f"DP={dp_metrics['mean_l1']:.6f}  "
-        f"gap={summary['gap_dp_minus_idm']['mean_l1']:+.6f}"
+        f"episode rollout: IDM eps={idm_rollout['num_episodes']} windows={idm_rollout['num_windows']} "
+        f"meanMSE={idm_rollout['mean_mse']:.6f}  |  "
+        f"DP eps={dp_rollout['num_episodes']} windows={dp_rollout['num_windows']} "
+        f"meanMSE={dp_rollout['mean_mse']:.6f}"
     )
     print(f"wrote: {out_json}")
-    for vis in summary["visualizations"]:
-        print(f"wrote: {vis}")
+    for v in vis:
+        print(f"wrote: {v}")
     print("=" * 70)
+
+    # Free GPU memory before moving on to next task.
+    del idm_model, dp_policy, idm_payload, dp_payload
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    args = parse_args()
+    configure_diffusion_policy_path(args.diffusion_policy_src)
+
+    device = resolve_device(args.device)
+    print(f"[compare] device = {device}", flush=True)
+
+    output_root = Path(args.output_dir).expanduser()
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    idm_ckpts = list(args.idm_checkpoint)
+    dp_ckpts = list(args.dp_checkpoint)
+    if len(idm_ckpts) != len(dp_ckpts):
+        raise ValueError(
+            f"--idm-checkpoint ({len(idm_ckpts)}) and --dp-checkpoint "
+            f"({len(dp_ckpts)}) must have the same number of entries."
+        )
+    task_overrides: list[str | None]
+    if args.task is None:
+        task_overrides = [None] * len(idm_ckpts)
+    else:
+        if len(args.task) != len(idm_ckpts):
+            raise ValueError(
+                f"--task has {len(args.task)} entries but {len(idm_ckpts)} ckpt pairs."
+            )
+        task_overrides = list(args.task)
+
+    print(f"[compare] evaluating {len(idm_ckpts)} task(s)", flush=True)
+
+    per_task_summaries: list[dict[str, Any]] = []
+    for i, (idm_c, dp_c, task_ov) in enumerate(zip(idm_ckpts, dp_ckpts, task_overrides)):
+        print()
+        print("#" * 70)
+        print(f"# Task {i + 1}/{len(idm_ckpts)}")
+        print("#" * 70)
+        summary = evaluate_task(idm_c, dp_c, task_ov, args, device, output_root)
+        per_task_summaries.append(summary)
+
+    combined_path = plot_combined_rollout(
+        per_task_summaries, output_root / "combined_rollout.png"
+    )
+    overall = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "dataset_root": args.dataset_root,
+        "num_tasks": len(per_task_summaries),
+        "tasks": [s["task"] for s in per_task_summaries],
+        "per_task": [
+            {
+                "task": s["task"],
+                "idm_checkpoint": s["idm_checkpoint"],
+                "dp_checkpoint": s["dp_checkpoint"],
+                "chunk_mean_mse": {
+                    "idm": (s["idm"] or {}).get("mean_mse"),
+                    "dp": (s["dp"] or {}).get("mean_mse"),
+                },
+                "rollout_mean_mse": {
+                    "idm": s["idm_rollout"]["mean_mse"],
+                    "dp": s["dp_rollout"]["mean_mse"],
+                    "num_episodes_idm": s["idm_rollout"]["num_episodes"],
+                    "num_episodes_dp": s["dp_rollout"]["num_episodes"],
+                },
+            }
+            for s in per_task_summaries
+        ],
+        "combined_plot": combined_path,
+    }
+    overall_path = output_root / "overall_summary.json"
+    overall_path.write_text(json.dumps(overall, indent=2))
+    print(f"\nwrote: {overall_path}")
+    if combined_path:
+        print(f"wrote: {combined_path}")
 
 
 if __name__ == "__main__":
