@@ -14,14 +14,21 @@ from numpy.typing import DTypeLike  # noqa: F401
 from jaxtyping import Float
 from jaxtyping import Int  # noqa: F401
 from jaxtyping import Key  # noqa: F401
-from jaxtyping import Num  # noqa: F401
 from jaxtyping import PyTree
-from jaxtyping import Real  # noqa: F401
 from jaxtyping import UInt8  # noqa: F401
 from jaxtyping import config
 from jaxtyping import jaxtyped
-import jaxtyping._decorator
-import torch
+
+# Shims for symbols missing in jaxtyping 0.2.19 (last version supporting Python 3.8).
+# These are used only as type annotations; at runtime they behave like Any.
+try:
+    from jaxtyping import Num  # noqa: F401
+except ImportError:
+    from typing import Any as Num  # noqa: F401
+try:
+    from jaxtyping import Real  # noqa: F401
+except ImportError:
+    from typing import Any as Real  # noqa: F401
 
 # patch jaxtyping to handle https://github.com/patrick-kidger/jaxtyping/issues/277.
 # the problem is that custom PyTree nodes are sometimes initialized with arbitrary types (e.g., `jax.ShapeDtypeStruct`,
