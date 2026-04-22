@@ -1,7 +1,8 @@
 import contextlib
 import functools as ft
 import inspect
-from typing import TypeAlias, TypeVar, cast
+from typing import TypeVar, cast
+from typing_extensions import TypeAlias
 
 import beartype
 import jax
