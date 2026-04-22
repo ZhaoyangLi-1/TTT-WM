@@ -15,11 +15,17 @@ Metrics reported per model
   * per-dim MSE / L1 (shape = [action_dim])
   * per-step MSE / L1 across the action chunk (shape = [n_action_steps])
 
-Outputs
--------
-  * <output-dir>/summary.json         — all scalar + per-dim + per-step metrics
-  * <output-dir>/per_step.png         — per-step MSE curve (chunk index)
-  * <output-dir>/per_dim.png          — per-dim MSE bars
+Outputs (per task, under <output-dir>/<task_slug>/)
+---------------------------------------------------
+  * summary.json              — scalar + per-dim + per-episode rollout metrics
+  * per_dim.png               — per-action-dim MSE bars (IDM vs DP)
+  * rollout_per_step.png      — per-episode-timestep MSE curve (IDM vs DP)
+  * rollout_per_episode.png   — per-episode mean-MSE bars (IDM vs DP)
+
+Root-level outputs
+------------------
+  * overall_summary.json      — cross-task aggregate
+  * combined_rollout.png      — per-task rollout curves side-by-side
 
 Example
 -------
@@ -697,21 +703,9 @@ def plot_comparison(
 
     saved: list[str] = []
 
-    # Per-step MSE
-    steps = np.arange(len(idm_metrics["per_step_mse"]))
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(steps, idm_metrics["per_step_mse"], "o-", label="IDM (oracle upper bound)")
-    ax.plot(steps, dp_metrics["per_step_mse"], "s-", label="Diffusion Policy")
-    ax.set_xlabel("action chunk index")
-    ax.set_ylabel("MSE")
-    ax.set_title("Per-step action MSE (lower is better)")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    step_path = output_dir / "per_step.png"
-    fig.savefig(step_path, dpi=150)
-    plt.close(fig)
-    saved.append(str(step_path))
+    # NOTE: the chunk-indexed per-step plot is superseded by
+    # `rollout_per_step.png`, which plots per episode timestep. Only the
+    # per-dim plot is still emitted here.
 
     # Per-dim MSE
     dims = np.arange(len(idm_metrics["per_dim_mse"]))
