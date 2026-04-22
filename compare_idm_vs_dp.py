@@ -226,6 +226,12 @@ def load_pure_idm(
     if unexpected:
         print(f"[pure_idm] unexpected keys ({len(unexpected)}): e.g. {unexpected[:3]}")
 
+    # The DP policy's normalizer uses a custom _load_from_state_dict that REPLACES
+    # its internal ParameterDict with tensors read from the checkpoint (which was
+    # loaded with map_location="cpu"). This silently reverts the prior .to(device)
+    # on the normalizer, causing obs to be pulled back to CPU inside _normalize
+    # and crashing at the first GPU conv. Re-apply .to(device) to recover.
+    model.to(device)
     model.eval()
     return model, cfg, source
 
