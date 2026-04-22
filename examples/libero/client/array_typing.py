@@ -36,7 +36,8 @@ except ImportError:
 # contains `jax._src.tree_util`, which should only be the case during tree unflattening.
 _original_check_dataclass_annotations = jaxtyping._decorator._check_dataclass_annotations  # noqa: SLF001
 # Redefine Array to include both JAX arrays and PyTorch tensors
-Array = jax.Array | torch.Tensor
+from typing import Union
+Array = Union[jax.Array, torch.Tensor]
 
 
 def _check_dataclass_annotations(self, typechecker):
