@@ -20,8 +20,8 @@ set -euo pipefail
 DATASET="${DATASET:-/linting-fast-vol/libero_wm}"
 NGPU="${NGPU:-6}"
 MASTER_PORT="${MASTER_PORT:-29504}"
-BATCH_SIZE="${BATCH_SIZE:-84}"
-NUM_WORKERS="${NUM_WORKERS:-2}"
+BATCH_SIZE="${BATCH_SIZE:-64}"
+NUM_WORKERS="${NUM_WORKERS:-12}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-2}"
 
 # 1) Shared run timestamp — set once, inherited by all ranks forked by torchrun
