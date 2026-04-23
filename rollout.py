@@ -261,7 +261,7 @@ def rollout_episode(
     with torch.no_grad():
         for k in range(n_steps):
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-                pred, _ = model(ctx)  # (1,1,C,H,W)
+                pred = model.generate(ctx)  # (1,1,C,H,W)
 
             gt_t = gt_tensors[k + 1].unsqueeze(0).unsqueeze(0).to(device)
             step_mse.append(F.mse_loss(pred, gt_t).item())

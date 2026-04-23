@@ -525,7 +525,7 @@ def rollout_episode(
     with torch.no_grad():
         for step_idx in range(n_steps):
             with torch.amp.autocast("cuda", enabled=(use_amp and device.type == "cuda")):
-                pred_frames, _ = model(window, goal=goal_batch)
+                pred_frames = model.generate(window, goal=goal_batch)
 
             gt_frame = frames[(step_idx + 1) * frame_gap].unsqueeze(0).unsqueeze(0).to(device)
             mse = F.mse_loss(pred_frames.float(), gt_frame.float()).item()

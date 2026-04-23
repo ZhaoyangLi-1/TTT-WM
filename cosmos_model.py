@@ -47,8 +47,7 @@ Changes vs original
          Phase 2 (decode)   — for each target frame run only the N_p new
                               query tokens; all history served from cache.
        Training forward is unchanged (still uses FlexAttention for the
-       block-causal mask). Falls back to the original full-recompute loop
-       when flash_attn is not installed.
+       block-causal mask).
 """
 
 from __future__ import annotations
@@ -64,12 +63,7 @@ from torch.nn.attention.flex_attention import (
     BlockMask,
 )
 
-# flash_attn is optional — used only in generate()
-try:
-    from flash_attn import flash_attn_with_kvcache  # type: ignore
-    _FLASH_ATTN_AVAILABLE = True
-except ImportError:
-    _FLASH_ATTN_AVAILABLE = False
+from flash_attn import flash_attn_with_kvcache
 
 
 # ---------------------------------------------------------------------------
@@ -161,35 +155,25 @@ def make_sequence_mask(
     device: torch.device,
     has_goal: bool = True,
 ) -> BlockMask:
-    """
-    Block-causal mask for the mixed sequence:
+    """Strict token-causal mask for the mixed sequence
         [(goal(N_p)) | ctx(fin*N_p) | actions(m) | tgt(fout*N_p)]
+
+    Previous implementation was block-causal (bidirectional within each
+    frame block). That let the model trivially echo tgt[j+1]'s input
+    embedding into hidden[prefix_len+j] via attention inside the target
+    block — exactly the path shift-by-1 loss was supposed to reward.
+    Diagnostic `diagnose_cheating.py` confirmed this: the trained model
+    reproduced any in-distribution target with ~zero residual, regardless
+    of whether it matched the real future. Strict token-causal removes the
+    echo path and matches the flash_attn(causal=True) inference mask.
     """
     goal_end = N_p if has_goal else 0
     ctx_end  = goal_end + n_ctx_frames * N_p
     act_end  = ctx_end + n_actions
     seq_len  = act_end + n_tgt_frames * N_p
 
-    _fin = n_ctx_frames
-    _m   = n_actions
-    _Np  = N_p
-
     def mask_mod(b, h, q_idx, kv_idx):
-        def _block(idx):
-            return torch.where(
-                idx < goal_end,
-                torch.zeros_like(idx),
-                torch.where(
-                    idx < ctx_end,
-                    1 + (idx - goal_end) // _Np,
-                    torch.where(
-                        idx < act_end,
-                        1 + _fin + (idx - ctx_end),
-                        1 + _fin + _m + (idx - act_end) // _Np,
-                    ),
-                ),
-            )
-        return _block(q_idx) >= _block(kv_idx)
+        return q_idx >= kv_idx
 
     return create_block_mask(
         mask_mod, B=1, H=1, Q_LEN=seq_len, KV_LEN=seq_len, device=device,
@@ -197,11 +181,16 @@ def make_sequence_mask(
 
 
 def make_frames_only_mask(N_p: int, T: int, device: torch.device) -> BlockMask:
-    """Simple block-causal mask for a pure-frame sequence (no actions)."""
+    """Strict token-causal mask for a pure-frame sequence (no actions).
+
+    Used for kvcache prefill — must match `make_sequence_mask`'s semantics
+    on the prefix region so prefix hidden states at inference equal those
+    seen during training.
+    """
     seq_len = T * N_p
 
     def mask_mod(b, h, q_idx, kv_idx):
-        return q_idx // N_p >= kv_idx // N_p
+        return q_idx >= kv_idx
 
     return create_block_mask(
         mask_mod, B=1, H=1, Q_LEN=seq_len, KV_LEN=seq_len, device=device,
@@ -596,13 +585,8 @@ class ARVideoPatchTransformer(nn.Module):
         context_frames: torch.Tensor,
         goal: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Dispatch to KV-cache generate (flash_attn) or fallback.
-        KV-cache path is O(T) per step; fallback is O(T^2).
-        """
-        if _FLASH_ATTN_AVAILABLE:
-            return self._generate_kvcache(context_frames, goal)
-        return self._generate_no_cache(context_frames, goal)
+        """Two-phase KV-cache autoregressive generation (O(T) per step)."""
+        return self._generate_kvcache(context_frames, goal)
 
     @torch.no_grad()
     def _generate_kvcache(
@@ -610,26 +594,35 @@ class ARVideoPatchTransformer(nn.Module):
         context_frames: torch.Tensor,
         goal: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Two-phase KV-cache generation.
+        """Patch-level autoregressive KV-cache generation.
 
-        Phase 1 — Prefill
-          Run goal + context through the standard FlexAttention forward.
-          After each layer we extract the K and V projections from the
-          prefix and write them into the per-layer cache tensors.
+        Mirrors the strict token-causal shift-by-1 setup used in training:
 
-        Phase 2 — Decode loop
-          For each of the `frames_out` target frames, run only the N_p
-          new query tokens through each layer using forward_kvcache_step.
-          flash_attn_with_kvcache appends the new K/V to the cache and
-          attends over the full history — no re-computation of past tokens.
+          * Prefill [goal, ctx] once. At each layer, extract K (post k_norm,
+            post RoPE) and V (raw) and write to the per-layer cache so that
+            decode-time queries see the same rotated keys as training.
+          * `pred[0]` is decoded from the prefill's last-position hidden
+            state (position `prefix_len - 1`, the last ctx patch — the same
+            position supervised to predict tgt[0] during training).
+          * For j = 1..fout*N_p - 1:
+              - Input at absolute position `prefix_len + j - 1` is
+                embed(pred[j-1]), with t/s indices of tgt patch (j-1).
+              - Its hidden state is decoded as pred[j].
+
+        Total cost: one multi-token prefill + `fout*N_p - 1` single-token
+        decode steps. Single-token steps are cheap with
+        `flash_attn_with_kvcache` — the sequence-length cost is only in
+        the cache read, not recomputation.
 
         Cache layout: (B, max_seqlen, n_heads, head_dim) per layer,
-        matching the flash_attn_with_kvcache signature.
+        matching the flash_attn_with_kvcache signature. max_seqlen =
+        prefix_len + fout*N_p - 1 (we only append `fout*N_p - 1` keys
+        because the last decoded patch has no successor to condition on).
         """
         cfg      = self.cfg
         N_p      = cfg.n_patches
         fin      = cfg.frames_in
+        fout     = cfg.frames_out
         has_goal = goal is not None
         B        = context_frames.shape[0]
         device   = context_frames.device
@@ -641,9 +634,11 @@ class ARVideoPatchTransformer(nn.Module):
         prefix_frames = torch.cat([goal.unsqueeze(1), ctx], dim=1) if has_goal else ctx
         prefix_tokens = self._embed_frames(prefix_frames)
         prefix_len    = prefix_tokens.shape[1]
+        n_tgt_total   = fout * N_p
+        assert n_tgt_total >= 1, "generate() requires frames_out*n_patches >= 1"
 
         # ── Allocate KV caches ────────────────────────────────────────
-        max_seqlen = prefix_len + cfg.frames_out * N_p
+        max_seqlen = prefix_len + n_tgt_total - 1
         k_caches = [
             torch.zeros(B, max_seqlen, cfg.n_heads, cfg.head_dim, device=device, dtype=dtype)
             for _ in range(cfg.n_layers)
@@ -653,89 +648,68 @@ class ARVideoPatchTransformer(nn.Module):
             for _ in range(cfg.n_layers)
         ]
 
-        # ── Phase 1: Prefill ──────────────────────────────────────────
-        # Run through FlexAttention to get correct hidden states,
-        # simultaneously populate KV caches for each layer.
+        # ── Phase 1: Prefill with RoPE-aware cache population ─────────
         t_idx_pre, s_idx_pre = self._build_position_indices(fin, 0, device, has_goal)
         block_mask_pre = self._ensure_mask(fin, 0, device, has_goal)
 
         x = prefix_tokens
         for layer_idx, block in enumerate(self.blocks):
-            # Extract K and V for the cache before the residual update
             h_norm = block.norm1(x)
             qkv = block.attn.qkv(h_norm).reshape(B, prefix_len, 3, cfg.n_heads, cfg.head_dim)
-            _, k_pre, v_pre = qkv.unbind(dim=2)   # (B, L, n_heads, head_dim)
+            _, k_pre, v_pre = qkv.unbind(dim=2)     # (B, L, n_heads, head_dim)
+
+            # k_norm operates on (B, n_heads, L, head_dim)
             k_pre = block.attn.k_norm(k_pre.transpose(1, 2)).transpose(1, 2)
 
-            # Write into cache at positions 0..prefix_len-1
-            k_caches[layer_idx][:, :prefix_len].copy_(k_pre)
+            # Apply RoPE to K so cached keys match the rotated K produced
+            # during training's full forward. rope() rotates both inputs;
+            # we only need the k output (duplicate as dummy q).
+            k_rope_in = k_pre.transpose(1, 2)       # (B, n_heads, L, head_dim)
+            _, k_pre_rope = block.attn.rope(
+                k_rope_in, k_rope_in, t_idx_pre, s_idx_pre,
+            )
+            k_pre_rope = k_pre_rope.transpose(1, 2)  # (B, L, n_heads, head_dim)
+
+            k_caches[layer_idx][:, :prefix_len].copy_(k_pre_rope)
             v_caches[layer_idx][:, :prefix_len].copy_(v_pre)
 
-            # Continue with the normal forward
             x = block(x, t_idx_pre, s_idx_pre, block_mask_pre)
 
-        # ── Phase 2: Decode loop ──────────────────────────────────────
-        # cache_seqlens: how many valid tokens are in the cache per sample
+        # pred[0] comes from the last prefill hidden state (last ctx patch).
+        pred_patches: list[torch.Tensor] = [self._decode(self.out_norm(x[:, -1:]))]
+
+        # ── Phase 2: Patch-level AR decode ────────────────────────────
         cache_seqlens = torch.full((B,), prefix_len, dtype=torch.int32, device=device)
+        tgt_t_offset  = (1 if has_goal else 0) + fin
 
-        # Start decoding from the last N_p prefix tokens (re-embedded)
-        current_tokens = prefix_tokens[:, -N_p:]
-        tgt_t_offset   = (1 if has_goal else 0) + fin
+        for j in range(1, n_tgt_total):
+            # At this step we feed embed(pred[j-1]) as the query token at
+            # absolute position prefix_len + j - 1. In training, that
+            # position held tgt[j-1]; its RoPE indices are:
+            tgt_idx   = j - 1
+            frame_idx = tgt_idx // N_p
+            patch_idx = tgt_idx % N_p
+            t_idx = torch.tensor([tgt_t_offset + frame_idx], dtype=torch.long, device=device)
+            s_idx = torch.tensor([patch_idx],                 dtype=torch.long, device=device)
 
-        gen_patches = []
-        for k in range(cfg.frames_out):
-            frame_t = tgt_t_offset + k
-            t_idx_new, s_idx_new = self._frame_position_indices(frame_t, device)
+            token_in = self.embed_norm(self.patch_embed(pred_patches[-1]))  # (B, 1, D)
 
-            x = current_tokens
+            x = token_in
             for layer_idx, block in enumerate(self.blocks):
                 x = block.forward_kvcache_step(
-                    x, t_idx_new, s_idx_new,
+                    x, t_idx, s_idx,
                     k_caches[layer_idx], v_caches[layer_idx],
                     cache_seqlens,
                 )
 
-            pred_p = self._decode(self.out_norm(x))    # (B, N_p, patch_dim)
-            gen_patches.append(pred_p)
+            # Hidden state at position prefix_len + j - 1 → pred[j]
+            pred_patches.append(self._decode(self.out_norm(x)))
+            cache_seqlens = cache_seqlens + 1
 
-            cache_seqlens = cache_seqlens + N_p
-            current_tokens = self.embed_norm(self.patch_embed(pred_p))
-
-        gen_frames = unpatchify(
-            torch.cat(gen_patches, dim=1),
-            cfg.patch_size, cfg.resolution, cfg.num_channels,
-        ).clamp(-1, 1)
-        return gen_frames
-
-    @torch.no_grad()
-    def _generate_no_cache(
-        self,
-        context_frames: torch.Tensor,
-        goal: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Original O(T^2) fallback — used when flash_attn is not installed."""
-        cfg      = self.cfg
-        N_p      = cfg.n_patches
-        fin      = cfg.frames_in
-        has_goal = goal is not None
-
-        ctx = context_frames[:, -fin:]
-        tokens = self._embed_frames(
-            torch.cat([goal.unsqueeze(1), ctx], dim=1) if has_goal else ctx
-        )
-
-        gen_patches = []
-        for k in range(cfg.frames_out):
-            t_idx, s_idx = self._build_position_indices(fin, k, tokens.device, has_goal)
-            mask   = self._ensure_mask(fin, k, tokens.device, has_goal)
-            hidden = self._run_transformer(tokens, t_idx, s_idx, mask)
-            pred_p = self._decode(hidden[:, -N_p:])
-            gen_patches.append(pred_p)
-            tokens = torch.cat([tokens, self.embed_norm(self.patch_embed(pred_p))], dim=1)
-
+        # ── Stack and unpatchify ──────────────────────────────────────
+        all_patches = torch.cat(pred_patches, dim=1)  # (B, n_tgt_total, patch_dim)
         return unpatchify(
-            torch.cat(gen_patches, dim=1),
-            cfg.patch_size, cfg.resolution, cfg.num_channels,
+            all_patches, cfg.patch_size, cfg.resolution, cfg.num_channels,
         ).clamp(-1, 1)
 
 
@@ -759,7 +733,6 @@ if __name__ == "__main__":
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Patches/frame  : {cfg.n_patches}")
     print(f"Parameters     : {n_params:.2f} M")
-    print(f"flash_attn     : {'available — KV-cache generate active' if _FLASH_ATTN_AVAILABLE else 'NOT installed — fallback active'}")
 
     B      = 2
     ctx    = torch.randn(B, cfg.frames_in,  3, cfg.resolution, cfg.resolution, device=device, dtype=dtype)
@@ -772,7 +745,7 @@ if __name__ == "__main__":
     print(f"pred : {pred.shape}  loss : {loss.item():.4f}")
 
     gen_f = model.generate(ctx, goal_f)
-    print(f"\n=== generate (frames_out={cfg.frames_out}, KV-cache={'yes' if _FLASH_ATTN_AVAILABLE else 'no'}) ===")
+    print(f"\n=== generate (frames_out={cfg.frames_out}, KV-cache) ===")
     print(f"gen  : {gen_f.shape}")
 
     model.prebuild_mask(device, has_goal=False)
