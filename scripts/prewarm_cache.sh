@@ -38,11 +38,37 @@ fi
 echo "Prewarming page cache for .pt files under ${DATASET_ROOT}/data ..."
 n=$(find "${DATASET_ROOT}/data" -name "*.pt" | wc -l)
 echo "Found ${n} .pt files; streaming with ${PARALLELISM}-way parallelism"
+echo "Expected wall time: ~1-3 min on local NVMe, longer on network storage."
+echo
 
 t_start=$(date +%s)
 
-find "${DATASET_ROOT}/data" -name "*.pt" -print0 \
-    | xargs -0 -P "${PARALLELISM}" -n 50 cat > /dev/null
+# Background the xargs pipeline so we can poll progress while it runs.
+LOG=$(mktemp)
+( find "${DATASET_ROOT}/data" -name "*.pt" -print0 \
+    | xargs -0 -P "${PARALLELISM}" -n 50 sh -c 'cat "$@" > /dev/null; echo $# >> "$1".done 2>/dev/null; echo $#' _ \
+    > "${LOG}" 2>&1 ) &
+PID=$!
+
+# Poll every 3 seconds and print throughput + page-cache growth.
+last_bytes=0
+while kill -0 "${PID}" 2>/dev/null; do
+    sleep 3
+    files_done=$(awk '{s+=$1} END{print s+0}' "${LOG}" 2>/dev/null || echo 0)
+    if command -v free >/dev/null 2>&1; then
+        cached=$(free -b | awk '/^Mem:/ {print $6}')
+        delta_mb=$(( (cached - last_bytes) / 1024 / 1024 ))
+        last_bytes=$cached
+        cached_h=$(free -h | awk '/^Mem:/ {print $6}')
+        printf "  progress: %6d / %d files; page-cache: %s (+%d MB/3s)\n" \
+            "${files_done}" "${n}" "${cached_h}" "${delta_mb}"
+    else
+        printf "  progress: %d / %d files\n" "${files_done}" "${n}"
+    fi
+done
+
+wait "${PID}" || true
+rm -f "${LOG}"
 
 t_end=$(date +%s)
 echo "done in $((t_end - t_start)) seconds."
