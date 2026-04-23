@@ -64,13 +64,18 @@ Acceleration alignment with Stage 1 (without changing Stage 2 logic):
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import os
+import re
+from pathlib import Path
 
 import hydra
 import numpy as np
 import torch
 import torch.nn as nn
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 from idm_model import (
     InverseDynamicsModel as _IDMModel,
@@ -85,6 +90,113 @@ from train_stage1 import (
 )
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Single-task selection helpers (mirrors train_pure_idm.py)
+# ---------------------------------------------------------------------------
+
+
+def _build_wandb_safe_task_tag(task_name: str, *, max_len: int = 64) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", task_name).strip("._-")
+    if not normalized:
+        normalized = "task"
+    if len(normalized) <= max_len:
+        return normalized
+    digest = hashlib.sha1(task_name.encode("utf-8")).hexdigest()[:8]
+    keep = max(max_len - len(digest) - 1, 8)
+    shortened = normalized[:keep].rstrip("._-") or "task"
+    return f"{shortened}_{digest}"
+
+
+def _build_task_dirname(task_name: str) -> str:
+    normalized = task_name.replace(":", "").replace(" ", "_").strip("_")
+    return normalized or "task"
+
+
+OmegaConf.register_new_resolver("task_slug", _build_task_dirname, replace=True)
+
+
+def _resolve_dataset_root(cfg: DictConfig) -> Path:
+    dataset_root = OmegaConf.select(cfg, "data.root", default=None)
+    if dataset_root in (None, "", "None"):
+        raise ValueError("Dataset root is missing. Set `data.root`.")
+    return Path(str(dataset_root)).expanduser()
+
+
+def _load_heldout_tasks(dataset_root: Path) -> tuple[Path, list[str]]:
+    meta_path = dataset_root / "meta" / "test_tasks.json"
+    if not meta_path.is_file():
+        raise FileNotFoundError(f"Held-out task metadata not found: {meta_path}")
+    with meta_path.open() as f:
+        payload = json.load(f)
+
+    heldout: list[str] = []
+    if isinstance(payload, dict):
+        if isinstance(payload.get("tasks"), list):
+            heldout.extend(str(t) for t in payload["tasks"] if t not in (None, ""))
+        if isinstance(payload.get("records"), list):
+            heldout.extend(
+                str(r["task"]) for r in payload["records"]
+                if isinstance(r, dict) and r.get("task") not in (None, "")
+            )
+    elif isinstance(payload, list):
+        heldout.extend(str(t) for t in payload if t not in (None, ""))
+
+    seen: set[str] = set()
+    heldout = [t for t in heldout if not (t in seen or seen.add(t))]
+    if not heldout:
+        raise ValueError(f"No held-out tasks were found in {meta_path}.")
+    return meta_path, heldout
+
+
+def _resolve_selected_heldout_task(selected_task: object, heldout_tasks: list[str]) -> str:
+    selector = str(selected_task).strip()
+    if selector in ("", "None"):
+        raise ValueError("`data.selected_task` must not be empty.")
+    if selector in heldout_tasks:
+        return selector
+    raise ValueError(
+        "Configured `data.selected_task` does not match any held-out task in "
+        f"meta/test_tasks.json: {selector!r}. Available: {heldout_tasks}"
+    )
+
+
+def _apply_selected_task_overrides(cfg: DictConfig) -> None:
+    """Enforce that Stage 2 trains on exactly one held-out task.
+
+    Populates ``data.test_tasks``/``task_tag``/``task_dirname`` from
+    ``data.selected_task`` so the downstream dataset filter (which keys off
+    ``data.test_tasks``) restricts training to that single task, and so wandb
+    / hydra output paths carry the task name.
+    """
+    selected_task = OmegaConf.select(cfg, "data.selected_task", default=None)
+    if selected_task in (None, "", "None"):
+        raise ValueError(
+            "Stage 2 training requires `data.selected_task` (one of the 3 "
+            "held-out tasks from meta/test_tasks.json)."
+        )
+
+    dataset_root = _resolve_dataset_root(cfg)
+    meta_path, heldout_tasks = _load_heldout_tasks(dataset_root)
+    resolved_task = _resolve_selected_heldout_task(selected_task, heldout_tasks)
+
+    with open_dict(cfg.data):
+        cfg.data.selected_task = resolved_task
+        cfg.data.task_tag = _build_wandb_safe_task_tag(resolved_task)
+        cfg.data.task_dirname = _build_task_dirname(resolved_task)
+        cfg.data.test_tasks = [resolved_task]
+        cfg.data.test_task_count = 1
+
+    rank = int(os.environ.get("RANK", "0"))
+    if rank == 0:
+        log.info(
+            "Stage 2 single-task filter: "
+            f"meta={meta_path}, data.selected_task={resolved_task!r}, "
+            f"data.task_tag={cfg.data.task_tag!r}, "
+            f"data.task_dirname={cfg.data.task_dirname!r}, "
+            f"data.stage2_val_fraction={float(OmegaConf.select(cfg, 'data.stage2_val_fraction', default=0.01)):.3f}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +522,9 @@ class Stage2Part2Trainer(_Stage2Mixin, Trainer):
 
 @hydra.main(config_path="configs", config_name="stage2_idm_config", version_base="1.3")
 def main(cfg: DictConfig) -> None:
+    _apply_selected_task_overrides(cfg)
+    OmegaConf.resolve(cfg)
+
     substep = str(cfg.train.get("substep", "2.1")).strip()
     if substep in {"2.1", "1", "part1"}:
         Stage2Part1Trainer(cfg).train()
