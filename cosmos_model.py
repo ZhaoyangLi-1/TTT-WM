@@ -59,6 +59,11 @@ import torch.nn.functional as F
 
 from flash_attn import flash_attn_func, flash_attn_with_kvcache
 
+# F.rms_norm (PyTorch 2.4+) dispatches to a fused ATen kernel that uses
+# fp32 accumulation internally and returns the input dtype — same numerics
+# as the manual impl below but without the intermediate fp32 tensors.
+_HAS_F_RMS_NORM = hasattr(F, "rms_norm")
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -143,10 +148,13 @@ def unpatchify(tokens: torch.Tensor, patch_size: int,
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        self.eps   = eps
+        self.eps = eps
+        self.normalized_shape = (dim,)
         self.scale = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _HAS_F_RMS_NORM:
+            return F.rms_norm(x, self.normalized_shape, self.scale, self.eps)
         rms = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
         y = (x.float() * rms) * self.scale.float()
         return y.to(x.dtype)
@@ -176,9 +184,9 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """x: (B, H, L, D).  cos/sin: (L, D)."""
-    cos = cos.to(dtype=x.dtype)[None, None, :, :]
-    sin = sin.to(dtype=x.dtype)[None, None, :, :]
+    """x: (B, L, H, D).  cos/sin: (L, D)."""
+    cos = cos.to(dtype=x.dtype)[None, :, None, :]
+    sin = sin.to(dtype=x.dtype)[None, :, None, :]
     return x * cos + rotate_half(x) * sin
 
 
@@ -204,7 +212,7 @@ class RoPEEmbedding(nn.Module):
         self, q: torch.Tensor, k: torch.Tensor,
         t_idx: torch.Tensor, s_idx: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """q, k: (B, n_heads, L, head_dim). t_idx, s_idx: (L,)."""
+        """q, k: (B, L, n_heads, head_dim). t_idx, s_idx: (L,)."""
         q_t, q_s = q.chunk(2, dim=-1)
         k_t, k_s = k.chunk(2, dim=-1)
         t_cos = self.temporal_cos.index_select(0, t_idx)
@@ -277,14 +285,15 @@ class CausalAttention(nn.Module):
         qkv = self.qkv(x).reshape(B, L, 3, self.n_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)  # each (B, L, n_heads, head_dim)
 
-        # Norms / RoPE operate on (B, n_heads, L, head_dim)
-        q = self.q_norm(q.transpose(1, 2))
-        k = self.k_norm(k.transpose(1, 2))
+        # RMSNorm + RoPE both act on head_dim (last axis); keeping the
+        # (B, L, H, D) layout that flash-attn already wants avoids two
+        # transposes per branch and keeps tensors contiguous.
+        q = self.q_norm(q)
+        k = self.k_norm(k)
         q, k = self.rope(q, k, t_idx, s_idx)
 
-        # Back to flash-attn layout (B, L, n_heads, head_dim)
-        q = q.transpose(1, 2).to(v.dtype)
-        k = k.transpose(1, 2).to(v.dtype)
+        q = q.to(v.dtype)
+        k = k.to(v.dtype)
 
         out = flash_attn_func(q, k, v, causal=True)  # (B, L, H, D)
         return self.out(out.reshape(B, L, D))
@@ -303,11 +312,11 @@ class CausalAttention(nn.Module):
         qkv = self.qkv(x).reshape(B, L_new, 3, self.n_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
 
-        q = self.q_norm(q.transpose(1, 2))
-        k = self.k_norm(k.transpose(1, 2))
+        q = self.q_norm(q)
+        k = self.k_norm(k)
         q, k = self.rope(q, k, t_idx, s_idx)
-        q = q.transpose(1, 2).to(v.dtype)
-        k = k.transpose(1, 2).to(v.dtype)
+        q = q.to(v.dtype)
+        k = k.to(v.dtype)
 
         # flash_attn_with_kvcache: appends (k, v) into the cache starting
         # at cache_seqlens per batch, and returns attended output.
@@ -570,14 +579,14 @@ class ARVideoPatchTransformer(nn.Module):
             )
             _, k_pre, v_pre = qkv.unbind(dim=2)  # (B, L, H, D) each
 
-            # k_norm operates on (B, H, L, D)
-            k_pre_hlhd = block.attn.k_norm(k_pre.transpose(1, 2))
-
-            # RoPE both inputs (we only consume k_rot)
+            # k_norm / RoPE now operate directly on (B, L, H, D) — must
+            # match the training path in CausalAttention.forward so the
+            # cached keys equal the rotated keys seen during training.
+            k_pre_normed = block.attn.k_norm(k_pre)
             _, k_rot = block.attn.rope(
-                k_pre_hlhd, k_pre_hlhd, t_idx_pre, s_idx_pre,
+                k_pre_normed, k_pre_normed, t_idx_pre, s_idx_pre,
             )
-            k_pre_final = k_rot.transpose(1, 2).to(v_pre.dtype)  # (B, L, H, D)
+            k_pre_final = k_rot.to(v_pre.dtype)  # (B, L, H, D)
 
             k_caches[layer_idx][:, :prefix_len].copy_(k_pre_final)
             v_caches[layer_idx][:, :prefix_len].copy_(v_pre)

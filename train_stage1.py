@@ -301,6 +301,10 @@ def build_optimizer(
     model_or_params, opt_cfg: DictConfig, is_main: bool
 ) -> torch.optim.Optimizer:
     eps = float(opt_cfg.get("eps", 1.0e-8))
+    # Fused AdamW runs the per-parameter update as a single CUDA kernel
+    # instead of one kernel per tensor — significant win on models with
+    # many small tensors. Only supported on CUDA.
+    fused = bool(torch.cuda.is_available())
 
     if isinstance(model_or_params, nn.Module):
         if not opt_cfg.no_decay_norm:
@@ -311,6 +315,7 @@ def build_optimizer(
                 weight_decay=opt_cfg.weight_decay,
                 betas=tuple(opt_cfg.betas),
                 eps=eps,
+                fused=fused,
             )
 
         no_decay_types = (nn.LayerNorm, nn.GroupNorm, nn.Embedding)
@@ -337,6 +342,7 @@ def build_optimizer(
             lr=opt_cfg.lr,
             betas=tuple(opt_cfg.betas),
             eps=eps,
+            fused=fused,
         )
 
     params = [p for p in model_or_params if p.requires_grad]
@@ -346,6 +352,7 @@ def build_optimizer(
         weight_decay=opt_cfg.weight_decay,
         betas=tuple(opt_cfg.betas),
         eps=eps,
+        fused=fused,
     )
 
 
@@ -1209,7 +1216,11 @@ class Trainer:
         return False
 
     def _ddp_broadcast_buffers(self) -> bool:
-        return True
+        # Model only has RoPE cos/sin as buffers; they are deterministic
+        # non-persistent buffers constructed identically on every rank and
+        # never mutated during training. Skipping the per-forward buffer
+        # broadcast removes one NCCL collective per step.
+        return False
 
     def _post_data_setup(self, train_ds) -> None:
         del train_ds
@@ -1297,7 +1308,6 @@ class Trainer:
 
     def _run_epoch(self, loader, train):
         self.model.train(train)
-        total_loss, n_opt_steps = 0.0, 0
 
         pbar = tqdm(
             loader,
@@ -1308,7 +1318,19 @@ class Trainer:
         )
 
         grad_ctx = torch.enable_grad() if train else torch.no_grad()
-        accum_loss, accum_step = 0.0, 0
+
+        # Keep loss accumulators on GPU to avoid per-step device->host
+        # syncs: `.item()` blocks the CPU until the backward kernels are
+        # done, which kills kernel overlap across iterations. We sync at
+        # most once per optimizer step (train) and once at epoch end (val).
+        if train:
+            accum_loss_t = torch.zeros((), device=self.device)
+            total_loss_sum = 0.0
+            n_opt_steps = 0
+            accum_step = 0
+        else:
+            val_loss_sum_t = torch.zeros((), device=self.device)
+            n_val_batches = 0
 
         with grad_ctx:
             for batch_idx, (context, target, actions, goal) in enumerate(pbar):
@@ -1353,7 +1375,7 @@ class Trainer:
                             )
                         raise
 
-                    accum_loss += loss.detach().item()
+                    accum_loss_t.add_(loss.detach())
                     accum_step += 1
 
                     if is_last:
@@ -1377,8 +1399,11 @@ class Trainer:
                         if self.ema and self.global_step % self.ema_update_every == 0:
                             self.ema.update(unwrap_model(self.model))
 
-                        avg = accum_loss / self.grad_accum_steps
-                        total_loss += avg
+                        # Single device->host sync per optimizer step, issued
+                        # AFTER all other CPU-side work (optim/scheduler/ema)
+                        # is queued so the GPU has maximum time to finish.
+                        avg = (accum_loss_t / self.grad_accum_steps).item()
+                        total_loss_sum += avg
                         n_opt_steps += 1
 
                         if self.is_main:
@@ -1401,7 +1426,8 @@ class Trainer:
 
                         if n_opt_steps == 1 and self.is_main:
                             log.info(f"First optimizer step done (loss={avg:.4f}), training is running normally.")
-                        accum_loss, accum_step = 0.0, 0
+                        accum_loss_t.zero_()
+                        accum_step = 0
 
                         if self.max_train_steps is not None and (batch_idx + 1) >= int(self.max_train_steps):
                             break
@@ -1417,19 +1443,19 @@ class Trainer:
                             log.error(f"[Rank {self.rank}] Eval error: {e}")
                         raise
 
-                    if self.is_main:
-                        pbar.set_postfix(
-                            loss=f"{loss.item():.4f}", epoch=self.current_epoch
-                        )
+                    val_loss_sum_t.add_(loss.detach())
+                    n_val_batches += 1
 
-                    total_loss += loss.item()
-                    n_opt_steps += 1
+                    if self.is_main:
+                        pbar.set_postfix(epoch=self.current_epoch)
 
                     if self.max_val_steps is not None and (batch_idx + 1) >= int(self.max_val_steps):
                         break
 
-        avg = total_loss / max(n_opt_steps, 1)
-        if self.world_size > 1 and not train:
+        if train:
+            return total_loss_sum / max(n_opt_steps, 1)
+        avg = (val_loss_sum_t / max(n_val_batches, 1)).item()
+        if self.world_size > 1:
             avg = ddp_all_reduce_scalar(avg, op=dist.ReduceOp.AVG)
         return avg
 
