@@ -19,7 +19,6 @@ from cosmos_model import (
     ARPatchConfig,
     CosmosBlock,
     RMSNorm,
-    make_frames_only_mask,
     patchify,
 )
 from idm_model import _configure_diffusion_policy_import_path
@@ -66,7 +65,6 @@ class PureInverseDynamicsModel(nn.Module):
             nn.Linear(cfg.d_model, self.n_actions * cfg.action_dim),
         )
 
-        self._mask_cache: dict[tuple[int, torch.device], object] = {}
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -92,11 +90,10 @@ class PureInverseDynamicsModel(nn.Module):
         tokens: torch.Tensor,
         t_idx: torch.Tensor,
         s_idx: torch.Tensor,
-        block_mask,
     ) -> torch.Tensor:
         x = tokens
         for block in self.blocks:
-            x = block(x, t_idx, s_idx, block_mask)
+            x = block(x, t_idx, s_idx)
         return self.out_norm(x)
 
     def _build_position_indices(
@@ -114,17 +111,9 @@ class PureInverseDynamicsModel(nn.Module):
         ).repeat(n_frames)
         return t_idx, s_idx
 
-    def _ensure_mask(self, n_frames: int, device: torch.device):
-        key = (n_frames, device)
-        if key not in self._mask_cache:
-            self._mask_cache[key] = make_frames_only_mask(
-                self.cfg.n_patches, n_frames, device
-            )
-        return self._mask_cache[key]
-
     def prebuild_mask(self, device: torch.device, has_goal: bool = False) -> None:
-        del has_goal
-        self._ensure_mask(2, device)
+        """No-op. flash_attn applies causal masking at the kernel level."""
+        del device, has_goal
 
     def forward(
         self,
@@ -140,8 +129,7 @@ class PureInverseDynamicsModel(nn.Module):
 
         tokens = self._embed_frames(frame_pair)
         t_idx, s_idx = self._build_position_indices(2, tokens.device)
-        block_mask = self._ensure_mask(2, tokens.device)
-        hidden = self._run_transformer(tokens, t_idx, s_idx, block_mask)
+        hidden = self._run_transformer(tokens, t_idx, s_idx)
 
         n_patches = self.cfg.n_patches
         current_feat = hidden[:, :n_patches].mean(dim=1)

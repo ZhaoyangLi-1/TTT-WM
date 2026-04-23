@@ -40,16 +40,23 @@ def _run_stage1_in_chunks(
     goal: Optional[torch.Tensor],
     micro_batch: int,
 ) -> torch.Tensor:
+    """Run Stage 1 to predict the next frame(s) for every element of the batch.
+
+    Uses `stage1.generate(...)` (patch-level AR with flash_attn kv-cache) to
+    match the token-causal training setup. The old code called
+    `stage1(input_frames, goal=goal)` which went through the now-removed
+    "decode hidden[-N_p:]" else branch — that branch produced garbage under
+    token-causal shift-by-1 training because only one ctx position is
+    supervised to predict tgt[0].
+    """
     if micro_batch >= input_frames.shape[0]:
-        pred_frames, _ = stage1(input_frames, goal=goal)
-        return pred_frames
+        return stage1.generate(input_frames, goal=goal)
 
     pred_chunks = []
     for start in range(0, input_frames.shape[0], micro_batch):
         end = start + micro_batch
         goal_chunk = goal[start:end] if goal is not None else None
-        pred_chunk, _ = stage1(input_frames[start:end], goal=goal_chunk)
-        pred_chunks.append(pred_chunk)
+        pred_chunks.append(stage1.generate(input_frames[start:end], goal=goal_chunk))
     return torch.cat(pred_chunks, dim=0)
 
 
@@ -118,10 +125,8 @@ class InverseDynamicsModel(nn.Module):
         return self
 
     def prebuild_mask(self, device: torch.device, has_goal: bool = False) -> None:
-        self.stage1._ensure_mask(
-            self.cfg.frames_in, 0, device, has_goal=has_goal,
-        )
-        self.stage1._ensure_mask(2, 0, device, has_goal=False)
+        """No-op. flash_attn applies causal masking at the kernel level."""
+        del device, has_goal
 
     def forward(
         self,
@@ -143,10 +148,7 @@ class InverseDynamicsModel(nn.Module):
             t_idx, s_idx = self.stage1._build_position_indices(
                 2, 0, tokens.device, has_goal=False,
             )
-            block_mask = self.stage1._ensure_mask(
-                2, 0, tokens.device, has_goal=False,
-            )
-            hidden = self.stage1._run_transformer(tokens, t_idx, s_idx, block_mask)
+            hidden = self.stage1._run_transformer(tokens, t_idx, s_idx)
 
         input_feat = hidden[:, :n_patches].mean(dim=1)
         pred_feat = hidden[:, n_patches : 2 * n_patches].mean(dim=1)
@@ -366,9 +368,8 @@ class InverseDynamicsModelDP(nn.Module):
         return self
 
     def prebuild_mask(self, device: torch.device, has_goal: bool = True) -> None:
-        self.stage1._ensure_mask(
-            self.cfg.frames_in, 0, device, has_goal=has_goal,
-        )
+        """No-op. flash_attn applies causal masking at the kernel level."""
+        del device, has_goal
 
     def set_action_stats(
         self, action_stats: dict[str, np.ndarray | torch.Tensor]
