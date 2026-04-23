@@ -2,7 +2,7 @@ defaults:
   - stage1_wm_config
   - _self_
 
-experiment_name: cosmos_stage2_idm_dp_stage${train.substep}_${data.task_dirname}_gap_${data.frame_gap}
+experiment_name: cosmos_stage2_idm_stage${train.substep}_${data.task_dirname}_gap_${data.frame_gap}
 seed: 42
 
 data:
@@ -71,10 +71,9 @@ train:
   substep: "2.1"
   stage1_ckpt: ""
   stage2_1_ckpt: ""
-  idm_type: diffusion_policy
   find_unused_parameters: false
   ckpt_dir: ${hydra:runtime.output_dir}/checkpoints
-  idm_dp:
+  idm:
     horizon: 4
     n_obs_steps: 1
     n_action_steps: 4
@@ -115,6 +114,6 @@ wandb:
 
 hydra:
   job:
-    override_dirname: stage${train.substep}_${train.idm_type}_g${data.frame_gap}
+    override_dirname: stage${train.substep}_g${data.frame_gap}
   run:
-    dir: ${outputs_root}/stage2_idm/${data.task_dirname}/stage${train.substep}/${now:%Y-%m-%d}/${now:%H-%M-%S}_${train.idm_type}_g${data.frame_gap}
+    dir: ${outputs_root}/stage2_idm/${data.task_dirname}/stage${train.substep}/${now:%Y-%m-%d}/${now:%H-%M-%S}_g${data.frame_gap}

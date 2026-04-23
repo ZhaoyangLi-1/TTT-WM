@@ -2,7 +2,7 @@ defaults:
   - stage1_wm_config
   - _self_
 
-name: pure_idm_${train.idm_type}
+name: pure_idm
 experiment_name: ${name}_gap_${data.frame_gap}
 seed: 42
 
@@ -48,7 +48,6 @@ train:
   compile: false
   epochs: 100
   gradient_accumulate_every: 1
-  idm_type: diffusion_policy
   optimizer:
     lr: 1.0e-4
     weight_decay: 1.0e-6
@@ -73,7 +72,7 @@ train:
   resume: ""
   find_unused_parameters: false
   ckpt_dir: ${hydra:runtime.output_dir}/checkpoints
-  idm_dp:
+  idm:
     horizon: ${data.frame_gap}
     n_obs_steps: 1
     n_action_steps: ${data.frame_gap}
@@ -110,6 +109,6 @@ wandb:
 
 hydra:
   job:
-    override_dirname: ${train.idm_type}_g${data.frame_gap}
+    override_dirname: g${data.frame_gap}
   run:
-    dir: ${outputs_root}/pure_idm/${data.task_dirname}/${now:%Y-%m-%d}/${now:%H-%M-%S}_${train.idm_type}_g${data.frame_gap}
+    dir: ${outputs_root}/pure_idm/${data.task_dirname}/${now:%Y-%m-%d}/${now:%H-%M-%S}_g${data.frame_gap}

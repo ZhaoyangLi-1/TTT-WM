@@ -10,8 +10,8 @@ Two sub-steps, both driven by Hydra config ``configs/stage2_idm_config.yaml``:
   Stage 1 training.
 
 * **2.2** — freeze the Stage-2.1 backbone (``ARVideoPatchTransformer``) and
-  train **only** the IDM action head (``InverseDynamicsModel`` or
-  ``InverseDynamicsModelDP`` from ``idm_model.py``, with ``freeze_stage1=True``).
+  train **only** the IDM action head (``InverseDynamicsModelDP`` from
+  ``idm_model.py``, with ``freeze_stage1=True``).
 
 Select the sub-step with ``train.substep=2.1`` (default) or ``train.substep=2.2``.
 
@@ -58,8 +58,8 @@ Acceleration alignment with Stage 1 (without changing Stage 2 logic):
   - clip_grad_norm_ foreach=True (same as Stage 1 recommendation)
   - No other Stage 1 speed changes apply: Stage 2.1 uses the same training
     loop as Stage 1 (inherits Trainer unchanged). Stage 2.2 freezes the
-    backbone so compile is intentionally skipped for DP IDM; the MLP IDM
-    path still benefits from torch.compile via the base Trainer.
+    backbone so compile is intentionally skipped (the diffusion_policy
+    vision stack is not torch.compile-safe).
 """
 
 from __future__ import annotations
@@ -77,10 +77,7 @@ import torch
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf, open_dict
 
-from idm_model import (
-    InverseDynamicsModel as _IDMModel,
-    InverseDynamicsModelDP as _IDMModelDP,
-)
+from idm_model import InverseDynamicsModelDP as _IDMModelDP
 from train_stage1 import (
     Trainer,
     VideoFrameDataset,
@@ -390,19 +387,13 @@ class Stage2Part2Trainer(_Stage2Mixin, Trainer):
     train the IDM action head.
 
     Key differences from Stage 1 / Stage 2.1:
-      - Model is _IDMModel or _IDMModelDP wrapping the frozen backbone.
+      - Model is _IDMModelDP wrapping the frozen backbone.
       - Only the IDM head parameters are trainable (freeze_stage1=True).
-      - torch.compile is skipped for DP IDM (robomimic vision stack not safe).
-      - DDP buffer broadcasts disabled for DP IDM to avoid collective mismatches.
+      - torch.compile is skipped (diffusion_policy vision stack not safe).
+      - DDP buffer broadcasts disabled to avoid collective mismatches.
       - _forward unpacks a 3-tuple (pred, _, loss) from the IDM model.
       - Action stats are injected into the IDM head after data setup.
     """
-
-    def __init__(self, cfg: DictConfig):
-        # Read idm_type before super().__init__() because _should_skip_compile
-        # and _ddp_broadcast_buffers are called during __init__ via hooks.
-        self.idm_type = str(cfg.train.get("idm_type", "mlp")).lower()
-        super().__init__(cfg)
 
     def _stage_tag(self) -> str:
         return "2.2"
@@ -432,19 +423,12 @@ class Stage2Part2Trainer(_Stage2Mixin, Trainer):
         if self.is_main:
             log.info(f"Stage 2.2 loaded backbone from {stage2_1_ckpt} ({src} weights)")
 
-        if self.idm_type in {"dp", "diffusion", "diffusion_policy"}:
-            wrapped = _IDMModelDP(
-                raw_wm,
-                n_actions=int(cfg.data.get("frame_gap", 0)),
-                freeze_stage1=True,
-                **OmegaConf.to_container(cfg.train.get("idm_dp", {}), resolve=True),
-            ).to(self.device)
-        else:
-            wrapped = _IDMModel(
-                raw_wm,
-                n_actions=int(cfg.data.get("frame_gap", 0)),
-                freeze_stage1=True,
-            ).to(self.device)
+        wrapped = _IDMModelDP(
+            raw_wm,
+            n_actions=int(cfg.data.get("frame_gap", 0)),
+            freeze_stage1=True,
+            **OmegaConf.to_container(cfg.train.get("idm", {}), resolve=True),
+        ).to(self.device)
 
         # prebuild_mask must be called on the wrapper, not raw_wm, because
         # the IDM wrapper delegates to the backbone and needs the mask cache
@@ -463,31 +447,24 @@ class Stage2Part2Trainer(_Stage2Mixin, Trainer):
         return wrapped
 
     def _should_skip_compile(self) -> bool:
-        # DP IDM uses robomimic / diffusion_policy vision components that are
-        # not torch.compile-safe. MLP IDM inherits compile from base Trainer.
-        if self.idm_type in {"dp", "diffusion", "diffusion_policy"}:
-            if self.is_main:
-                log.info(
-                    "Skipping torch.compile for stage 2.2 diffusion_policy IDM "
-                    "(robomimic/diffusion_policy vision stack is not compile-safe)."
-                )
-            return True
-        return False
+        if self.is_main:
+            log.info(
+                "Skipping torch.compile for stage 2.2 "
+                "(robomimic/diffusion_policy vision stack is not compile-safe)."
+            )
+        return True
 
     def _ddp_broadcast_buffers(self) -> bool:
         # DP IDM has internal buffers (noise schedules, vision encoders) that
         # must NOT be broadcast-synced every forward — they are static after
         # init and syncing them causes spurious collective ops that race with
         # the frozen backbone's non-broadcast buffers.
-        if (
-            self.world_size > 1
-            and self.idm_type in {"dp", "diffusion", "diffusion_policy"}
-        ):
+        if self.world_size > 1:
             if hasattr(torch, "_dynamo"):
                 torch._dynamo.config.optimize_ddp = False
             if self.is_main:
                 log.info(
-                    "Stage 2.2 DP IDM: disabling DDP buffer broadcasts and "
+                    "Stage 2.2: disabling DDP buffer broadcasts and "
                     "TorchDynamo DDP optimizer to avoid collective/compile mismatches."
                 )
             return False

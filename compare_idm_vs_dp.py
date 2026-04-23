@@ -68,7 +68,7 @@ from dp.common import (
     strip_state_dict_prefixes,
 )
 from dp.runtime import configure_diffusion_policy_path, register_omegaconf_resolvers
-from pure_idm import PureInverseDynamicsModel, PureInverseDynamicsModelDP
+from pure_idm import PureInverseDynamicsModelDP
 from train_stage1 import _clean_state_dict
 from train_stage2 import build_heldout_task_datasets
 
@@ -216,40 +216,32 @@ def load_pure_idm(
     if n_actions <= 0:
         raise ValueError(f"cfg.data.frame_gap must be positive, got {n_actions}.")
 
-    idm_type = str(cfg.train.get("idm_type", "mlp")).lower()
-    is_dp = idm_type in {"dp", "diffusion", "diffusion_policy"}
-    if is_dp:
-        idm_dp_kwargs = OmegaConf.to_container(
-            cfg.train.get("idm_dp", {}), resolve=True
-        )
-        model = PureInverseDynamicsModelDP(
-            arpatch_cfg, n_actions=n_actions, **idm_dp_kwargs
-        )
-    else:
-        model = PureInverseDynamicsModel(arpatch_cfg, n_actions=n_actions)
+    idm_kwargs = OmegaConf.to_container(cfg.train.get("idm", {}), resolve=True)
+    model = PureInverseDynamicsModelDP(
+        arpatch_cfg, n_actions=n_actions, **idm_kwargs
+    )
     model.to(device)
     model.prebuild_mask(device=device, has_goal=False)
 
-    if is_dp:
-        # Register normalizer parameters so load_state_dict can populate them.
-        # Values will be overwritten by the checkpoint; we only need shape.
-        from train_stage2 import HeldoutTaskSplitDataset  # local import for clarity
+    # Register normalizer parameters so load_state_dict can populate them.
+    # Values will be overwritten by the checkpoint; we only need shape.
+    from train_stage2 import HeldoutTaskSplitDataset  # local import for clarity
 
-        print("[compare] computing/loading IDM action stats", flush=True)
-        val_fraction = float(
-            OmegaConf.select(cfg, "data.stage2_val_fraction", default=0.02)
-        )
-        seed = int(OmegaConf.select(cfg, "seed", default=42))
-        train_ds = HeldoutTaskSplitDataset(
-            cfg.data,
-            cfg.model,
-            "train",
-            val_fraction=val_fraction,
-            seed=seed,
-            is_main=True,
-        )
-        stats = train_ds.get_action_stats()
-        model.set_action_stats(stats)
+    print("[compare] computing/loading IDM action stats", flush=True)
+    val_fraction = float(
+        OmegaConf.select(cfg, "data.stage2_val_fraction", default=0.02)
+    )
+    seed = int(OmegaConf.select(cfg, "seed", default=42))
+    train_ds = HeldoutTaskSplitDataset(
+        cfg.data,
+        cfg.model,
+        "train",
+        val_fraction=val_fraction,
+        seed=seed,
+        is_main=True,
+    )
+    stats = train_ds.get_action_stats()
+    model.set_action_stats(stats)
 
     source = "live"
     sd = None

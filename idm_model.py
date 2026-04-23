@@ -10,13 +10,11 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
-from contextlib import nullcontext
 from typing import Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from cosmos_model import ARVideoPatchTransformer
 
@@ -58,152 +56,6 @@ def _run_stage1_in_chunks(
         goal_chunk = goal[start:end] if goal is not None else None
         pred_chunks.append(stage1.generate(input_frames[start:end], goal=goal_chunk))
     return torch.cat(pred_chunks, dim=0)
-
-
-class InverseDynamicsModel(nn.Module):
-    """
-    Stage 2 — Inverse Dynamics Model.
-
-    Uses a Stage 1 video predictor to generate goal-conditioned next frames,
-    then predicts intermediate actions from (input_frames, predicted_frames).
-    Stage 1 remains trainable during Stage 2 training.
-
-    Forward flow
-    -------------
-        1. Frozen Stage 1: (input_frames, goal) → predicted_frames
-        2. Encode [input | predicted] through Stage 1 backbone
-        3. Mean-pool per-frame hidden states, concatenate
-        4. Trainable MLP head: (2 × d_model) → (n_actions × action_dim)
-
-    Interface
-    ----------
-        Training:   pred_frames, pred_actions, loss = model(input, target, actions)
-                    (target_frames is ignored; Stage 1 predictions used instead)
-        Inference:  pred_frames, pred_actions = model.generate(input)
-    """
-
-    def __init__(
-        self,
-        stage1_model: ARVideoPatchTransformer,
-        n_actions: int,
-        stage1_micro_batch: Optional[int] = None,
-        freeze_stage1: bool = False,
-    ):
-        super().__init__()
-        cfg = stage1_model.cfg
-        self.cfg = cfg
-        self.n_actions = n_actions
-        self.stage1_micro_batch = _validate_stage1_micro_batch(stage1_micro_batch)
-        self._auto_stage1_micro_batch_cache: dict[int, int] = {}
-        self.freeze_stage1 = bool(freeze_stage1)
-
-        self.stage1 = stage1_model
-        if self.freeze_stage1:
-            for p in self.stage1.parameters():
-                p.requires_grad_(False)
-            self.stage1.eval()
-
-        d_model = cfg.d_model
-        self.action_head = nn.Sequential(
-            nn.Linear(2 * d_model, d_model),
-            nn.SiLU(),
-            nn.Linear(d_model, n_actions * cfg.action_dim),
-        )
-        self._init_action_head()
-
-    def _init_action_head(self) -> None:
-        for module in self.action_head.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.trunc_normal_(module.weight, std=0.02)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
-    def train(self, mode: bool = True):
-        super().train(mode)
-        if self.freeze_stage1:
-            self.stage1.eval()
-        return self
-
-    def prebuild_mask(self, device: torch.device, has_goal: bool = False) -> None:
-        """No-op. flash_attn applies causal masking at the kernel level."""
-        del device, has_goal
-
-    def forward(
-        self,
-        input_frames: torch.Tensor,
-        target_frames: Optional[torch.Tensor] = None,
-        actions: Optional[torch.Tensor] = None,
-        goal: Optional[torch.Tensor] = None,
-    ):
-        del target_frames
-
-        batch_size = input_frames.shape[0]
-        n_patches = self.cfg.n_patches
-        stage1_ctx = torch.no_grad() if self.freeze_stage1 else nullcontext()
-        with stage1_ctx:
-            pred_frames = self._predict_next_frame(input_frames, goal=goal)
-            all_frames = torch.cat([input_frames, pred_frames], dim=1)
-
-            tokens = self.stage1._embed_frames(all_frames)
-            t_idx, s_idx = self.stage1._build_position_indices(
-                2, 0, tokens.device, has_goal=False,
-            )
-            hidden = self.stage1._run_transformer(tokens, t_idx, s_idx)
-
-        input_feat = hidden[:, :n_patches].mean(dim=1)
-        pred_feat = hidden[:, n_patches : 2 * n_patches].mean(dim=1)
-        combined = torch.cat([input_feat, pred_feat], dim=-1)
-
-        pred_actions = self.action_head(combined).reshape(
-            batch_size, self.n_actions, self.cfg.action_dim,
-        )
-
-        loss = None
-        if actions is not None:
-            loss = F.mse_loss(pred_actions, actions)
-
-        return pred_frames, pred_actions, loss
-
-    def _predict_next_frame(
-        self,
-        input_frames: torch.Tensor,
-        goal: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        micro_batch = self.stage1_micro_batch
-        if micro_batch is not None:
-            return _run_stage1_in_chunks(
-                self.stage1, input_frames, goal, micro_batch,
-            )
-
-        batch_size = int(input_frames.shape[0])
-        cached_micro_batch = self._auto_stage1_micro_batch_cache.get(batch_size)
-        trial_micro_batch = cached_micro_batch or batch_size
-
-        while True:
-            try:
-                pred_frames = _run_stage1_in_chunks(
-                    self.stage1, input_frames, goal, trial_micro_batch,
-                )
-                self._auto_stage1_micro_batch_cache[batch_size] = trial_micro_batch
-                return pred_frames
-            except torch.OutOfMemoryError:
-                if not torch.cuda.is_available() or trial_micro_batch <= 1:
-                    raise
-                torch.cuda.empty_cache()
-                trial_micro_batch = max(1, trial_micro_batch // 2)
-
-    @torch.no_grad()
-    def generate(
-        self,
-        input_frames: torch.Tensor,
-        goal: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        pred_frames, pred_actions, _ = self.forward(
-            input_frames,
-            actions=None,
-            goal=goal,
-        )
-        return pred_frames, pred_actions
 
 
 def _configure_diffusion_policy_import_path() -> None:

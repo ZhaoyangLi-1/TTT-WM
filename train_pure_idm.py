@@ -23,7 +23,7 @@ import torch.nn as nn
 import wandb
 from omegaconf import DictConfig, OmegaConf, open_dict
 
-from pure_idm import PureInverseDynamicsModel, PureInverseDynamicsModelDP
+from pure_idm import PureInverseDynamicsModelDP
 from train_stage1 import Trainer, unwrap_model
 from train_stage2 import build_heldout_task_datasets
 
@@ -174,7 +174,7 @@ def _apply_image_resolution_overrides(cfg: DictConfig) -> None:
             f"`model.patch_size` ({patch_size})."
         )
 
-    crop_shape = OmegaConf.select(cfg, "train.idm_dp.crop_shape", default=None)
+    crop_shape = OmegaConf.select(cfg, "train.idm.crop_shape", default=None)
     if crop_shape not in (None, "", "None"):
         crop_h, crop_w = (int(crop_shape[0]), int(crop_shape[1]))
         if crop_h > resolution or crop_w > resolution:
@@ -191,10 +191,6 @@ def _apply_image_resolution_overrides(cfg: DictConfig) -> None:
 
 
 class PureIDMTrainer(Trainer):
-    def __init__(self, cfg: DictConfig):
-        self.idm_type = str(cfg.train.get("idm_type", "mlp")).lower()
-        super().__init__(cfg)
-
     def _stage_tag(self) -> str:
         return "pure_idm"
 
@@ -222,7 +218,7 @@ class PureIDMTrainer(Trainer):
         n_actions = int(self.cfg.data.get("frame_gap", 0))
         if n_actions <= 0:
             raise ValueError(
-                f"data.frame_gap must be positive for PureInverseDynamicsModel, got {n_actions}."
+                f"data.frame_gap must be positive for PureInverseDynamicsModelDP, got {n_actions}."
             )
 
         if self.is_main and bool(self.cfg.data.get("use_goal", False)):
@@ -231,35 +227,25 @@ class PureIDMTrainer(Trainer):
                 "loading unused goal frames."
             )
 
-        if self.idm_type in {"dp", "diffusion", "diffusion_policy"}:
-            return PureInverseDynamicsModelDP(
-                self.model_cfg,
-                n_actions=n_actions,
-                **OmegaConf.to_container(
-                    self.cfg.train.get("idm_dp", {}),
-                    resolve=True,
-                ),
-            ).to(self.device)
-
-        return PureInverseDynamicsModel(self.model_cfg, n_actions=n_actions).to(
-            self.device
-        )
+        return PureInverseDynamicsModelDP(
+            self.model_cfg,
+            n_actions=n_actions,
+            **OmegaConf.to_container(
+                self.cfg.train.get("idm", {}),
+                resolve=True,
+            ),
+        ).to(self.device)
 
     def _should_skip_compile(self) -> bool:
-        if self.idm_type in {"dp", "diffusion", "diffusion_policy"}:
-            if self.is_main:
-                log.info(
-                    "Skipping torch.compile for pure diffusion-policy IDM "
-                    "(robomimic/diffusion_policy vision stack is not compile-safe)."
-                )
-            return True
-        return False
+        if self.is_main:
+            log.info(
+                "Skipping torch.compile for pure diffusion-policy IDM "
+                "(robomimic/diffusion_policy vision stack is not compile-safe)."
+            )
+        return True
 
     def _ddp_broadcast_buffers(self) -> bool:
-        if (
-            self.world_size > 1
-            and self.idm_type in {"dp", "diffusion", "diffusion_policy"}
-        ):
+        if self.world_size > 1:
             if hasattr(torch, "_dynamo"):
                 torch._dynamo.config.optimize_ddp = False
             if self.is_main:

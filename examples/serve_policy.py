@@ -35,8 +35,8 @@ from cosmos_model import ARPatchConfig, ARVideoPatchTransformer
 from dp.common import resolve_checkpoint_path as resolve_dp_checkpoint_path
 from dp.common import resolve_device
 from dp.runtime import configure_diffusion_policy_path, register_omegaconf_resolvers
-from idm_model import InverseDynamicsModel, InverseDynamicsModelDP
-from pure_idm import PureInverseDynamicsModel, PureInverseDynamicsModelDP
+from idm_model import InverseDynamicsModelDP
+from pure_idm import PureInverseDynamicsModelDP
 
 
 logger = logging.getLogger(__name__)
@@ -613,26 +613,18 @@ def load_stage2_adapter(
 
     model_cfg = build_world_model_cfg(cfg)
     raw_wm = ARVideoPatchTransformer(model_cfg).to(device)
-    idm_type = str(cfg.get("train", {}).get("idm_type", "mlp")).lower()
-    if idm_type in {"dp", "diffusion", "diffusion_policy"}:
-        maybe_configure_diffusion_policy(diffusion_policy_src)
-        model = InverseDynamicsModelDP(
-            raw_wm,
-            n_actions=int(cfg["data"].get("frame_gap", 1)),
-            freeze_stage1=True,
-            **cfg["train"].get("idm_dp", {}),
-        ).to(device)
-    else:
-        model = InverseDynamicsModel(
-            raw_wm,
-            n_actions=int(cfg["data"].get("frame_gap", 1)),
-            freeze_stage1=True,
-        ).to(device)
+    maybe_configure_diffusion_policy(diffusion_policy_src)
+    model = InverseDynamicsModelDP(
+        raw_wm,
+        n_actions=int(cfg["data"].get("frame_gap", 1)),
+        freeze_stage1=True,
+        **cfg["train"].get("idm", {}),
+    ).to(device)
 
     state_dict, weight_source = select_stage_weights(ckpt, use_ema=use_ema)
     load_state_dict_flexible(model, state_dict)
     model.eval()
-    logger.info("Loaded stage2 checkpoint %s (%s, idm_type=%s)", checkpoint_path, weight_source, idm_type)
+    logger.info("Loaded stage2 checkpoint %s (%s)", checkpoint_path, weight_source)
     return Stage2PolicyAdapter(
         model,
         cfg,
@@ -652,24 +644,17 @@ def load_pure_idm_adapter(
     ckpt = load_checkpoint_payload(checkpoint_path, map_location="cpu")
     cfg = ckpt["cfg"]
     model_cfg = build_world_model_cfg(cfg)
-    idm_type = str(cfg.get("train", {}).get("idm_type", "mlp")).lower()
-    if idm_type in {"dp", "diffusion", "diffusion_policy"}:
-        maybe_configure_diffusion_policy(diffusion_policy_src)
-        model = PureInverseDynamicsModelDP(
-            model_cfg,
-            n_actions=int(cfg["data"].get("frame_gap", 1)),
-            **cfg["train"].get("idm_dp", {}),
-        ).to(device)
-    else:
-        model = PureInverseDynamicsModel(
-            model_cfg,
-            n_actions=int(cfg["data"].get("frame_gap", 1)),
-        ).to(device)
+    maybe_configure_diffusion_policy(diffusion_policy_src)
+    model = PureInverseDynamicsModelDP(
+        model_cfg,
+        n_actions=int(cfg["data"].get("frame_gap", 1)),
+        **cfg["train"].get("idm", {}),
+    ).to(device)
 
     state_dict, weight_source = select_stage_weights(ckpt, use_ema=use_ema)
     load_state_dict_flexible(model, state_dict)
     model.eval()
-    logger.info("Loaded pure_idm checkpoint %s (%s, idm_type=%s)", checkpoint_path, weight_source, idm_type)
+    logger.info("Loaded pure_idm checkpoint %s (%s)", checkpoint_path, weight_source)
     return PureIDMPolicyAdapter(
         model,
         cfg,
