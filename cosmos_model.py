@@ -391,6 +391,22 @@ class ARVideoPatchTransformer(nn.Module):
 
         self._init_weights()
 
+        # Pre-build position-index buffers for all (has_goal, n_tgt) combos
+        # used in training-forward (n_tgt = frames_out) and in generate()'s
+        # prefill (n_tgt = 0). These are fixed given cfg, so caching avoids
+        # reallocating + torch.cat'ing on every forward (which would cause
+        # torch.compile mode="reduce-overhead" to miss its CUDA graph).
+        # persistent=False → not serialized into checkpoints, stays .to()-ed
+        # with the module.
+        for has_goal in (True, False):
+            for n_tgt in (cfg.frames_out, 0):
+                t_idx, s_idx = self._compute_position_indices(
+                    cfg.frames_in, n_tgt, torch.device("cpu"), has_goal,
+                )
+                tag = f"{int(has_goal)}_{cfg.frames_in}_{n_tgt}"
+                self.register_buffer(f"_tidx_{tag}", t_idx, persistent=False)
+                self.register_buffer(f"_sidx_{tag}", s_idx, persistent=False)
+
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
@@ -408,10 +424,12 @@ class ARVideoPatchTransformer(nn.Module):
     # Position indices
     # ------------------------------------------------------------------
 
-    def _build_position_indices(
+    def _compute_position_indices(
         self, n_ctx: int, n_tgt_frames: int,
-        device: torch.device, has_goal: bool = True,
+        device: torch.device, has_goal: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Raw builder — used once per (has_goal, n_ctx, n_tgt) combo to
+        populate the cached buffers, or as a fallback for unknown configs."""
         N_p = self.cfg.n_patches
         t_list: List[torch.Tensor] = []
         s_list: List[torch.Tensor] = []
@@ -428,6 +446,22 @@ class ARVideoPatchTransformer(nn.Module):
             t_list.append(torch.full((N_p,), tgt_t + k, dtype=torch.long, device=device))
             s_list.append(torch.arange(N_p, dtype=torch.long, device=device))
         return torch.cat(t_list), torch.cat(s_list)
+
+    def _build_position_indices(
+        self, n_ctx: int, n_tgt_frames: int,
+        device: torch.device, has_goal: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (t_idx, s_idx) for the given sequence layout, reusing
+        pre-registered buffers when possible so torch.compile doesn't see
+        fresh tensor allocations every step."""
+        tag = f"{int(has_goal)}_{n_ctx}_{n_tgt_frames}"
+        t_name = f"_tidx_{tag}"
+        s_name = f"_sidx_{tag}"
+        if hasattr(self, t_name):
+            return getattr(self, t_name), getattr(self, s_name)
+        # Fallback for unexpected configs (e.g. a Stage-2 subclass calling
+        # with a different n_ctx/n_tgt). Slow path — still correct.
+        return self._compute_position_indices(n_ctx, n_tgt_frames, device, has_goal)
 
     # ------------------------------------------------------------------
     # Helpers

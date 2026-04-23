@@ -931,6 +931,12 @@ class Trainer:
         else:
             self.model = raw_model
 
+        # Keep a direct reference to the DDP wrapper (if any) BEFORE
+        # torch.compile wraps self.model in an OptimizedModule. After
+        # compile, `isinstance(self.model, DDP)` becomes False, which
+        # would silently disable no_sync() during gradient accumulation.
+        self._ddp_handle = self.model if isinstance(self.model, DDP) else None
+
         # --- torch.compile ---
         compile_requested = bool(cfg.train.get("compile", False))
         if compile_requested and hasattr(torch, "compile") and not self._should_skip_compile():
@@ -1355,10 +1361,12 @@ class Trainer:
                     is_last = (accum_step == self.grad_accum_steps - 1) or (
                         batch_idx == len(loader) - 1
                     )
+                    # B1: use the cached DDP handle so no_sync() still applies
+                    # when self.model has been wrapped by torch.compile.
                     sync_ctx = (
-                        nullcontext()
-                        if (not isinstance(self.model, DDP) or is_last)
-                        else self.model.no_sync()
+                        self._ddp_handle.no_sync()
+                        if (self._ddp_handle is not None and not is_last)
+                        else nullcontext()
                     )
 
                     try:
@@ -1402,7 +1410,9 @@ class Trainer:
                         # Single device->host sync per optimizer step, issued
                         # AFTER all other CPU-side work (optim/scheduler/ema)
                         # is queued so the GPU has maximum time to finish.
-                        avg = (accum_loss_t / self.grad_accum_steps).item()
+                        # B2: divide by the actual number of micro-steps that
+                        # contributed; at the epoch tail this may be < grad_accum_steps.
+                        avg = (accum_loss_t / max(accum_step, 1)).item()
                         total_loss_sum += avg
                         n_opt_steps += 1
 
@@ -1429,7 +1439,10 @@ class Trainer:
                         accum_loss_t.zero_()
                         accum_step = 0
 
-                        if self.max_train_steps is not None and (batch_idx + 1) >= int(self.max_train_steps):
+                        # B4: max_train_steps is a cap on optimizer steps,
+                        # not micro-batches. Count n_opt_steps here so the
+                        # semantics match when grad_accum_steps > 1.
+                        if self.max_train_steps is not None and n_opt_steps >= int(self.max_train_steps):
                             break
 
                 else:
