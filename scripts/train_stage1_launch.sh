@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-DATASET="${DATASET:-/scr2/zhaoyang/libero_wm}"
+DATASET="${DATASET:-/linting-fast-vol/libero_wm}"
 NGPU="${NGPU:-4}"
 MASTER_PORT="${MASTER_PORT:-29504}"
 BATCH_SIZE="${BATCH_SIZE:-72}"
