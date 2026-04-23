@@ -1271,8 +1271,16 @@ class Trainer:
 
     # --- Forward hooks (stage 1) ---
 
-    def _forward(self, model, context, target, actions, goal):
-        pred, loss = model(context, target, goal)
+    def _forward(
+        self, model, context, target, actions, goal, *,
+        return_pred_frames=True, cached_pred_frames=None,
+    ):
+        # return_pred_frames=False lets the model skip unpatchify/clamp in
+        # the training path where the decoded frames are discarded.
+        # cached_pred_frames is consumed only by IDM subclasses (Stage 2.2,
+        # pure-IDM); the ARVideoPatchTransformer forward ignores it.
+        del cached_pred_frames
+        pred, loss = model(context, target, goal, return_pred_frames=return_pred_frames)
         return pred, loss
 
     # --- Epoch loop ---
@@ -1339,7 +1347,15 @@ class Trainer:
             n_val_batches = 0
 
         with grad_ctx:
-            for batch_idx, (context, target, actions, goal) in enumerate(pbar):
+            for batch_idx, batch in enumerate(pbar):
+                # Dataset may return a 4-tuple (default) or a 5-tuple with a
+                # prebaked stage1 prediction (Stage 2.2 + cache path).
+                if len(batch) == 5:
+                    context, target, actions, goal, cached_pred = batch
+                else:
+                    context, target, actions, goal = batch
+                    cached_pred = None
+
                 if batch_idx == 0 and self.is_main:
                     warmup_note = (
                         "compiling if first epoch"
@@ -1356,6 +1372,8 @@ class Trainer:
                 goal = (
                     goal.to(self.device, non_blocking=True) if self.use_goal else None
                 )
+                if cached_pred is not None:
+                    cached_pred = cached_pred.to(self.device, non_blocking=True)
 
                 if train:
                     is_last = (accum_step == self.grad_accum_steps - 1) or (
@@ -1373,7 +1391,11 @@ class Trainer:
                         with sync_ctx, torch.amp.autocast(
                             "cuda", enabled=self.use_amp, dtype=self.amp_dtype
                         ):
-                            _, loss = self._forward(self.model, context, target, actions, goal)
+                            _, loss = self._forward(
+                                self.model, context, target, actions, goal,
+                                return_pred_frames=False,
+                                cached_pred_frames=cached_pred,
+                            )
                             scaled = loss / self.grad_accum_steps
                         self.scaler.scale(scaled).backward()
                     except RuntimeError as e:
@@ -1450,7 +1472,11 @@ class Trainer:
                         with torch.amp.autocast(
                             "cuda", enabled=self.use_amp, dtype=self.amp_dtype
                         ):
-                            _, loss = self._forward(self.model, context, target, actions, goal)
+                            _, loss = self._forward(
+                                self.model, context, target, actions, goal,
+                                return_pred_frames=False,
+                                cached_pred_frames=cached_pred,
+                            )
                     except RuntimeError as e:
                         if self._is_fatal_dist_error(e):
                             log.error(f"[Rank {self.rank}] Eval error: {e}")
@@ -1536,7 +1562,14 @@ class Trainer:
             self.model.train(prev_mode)
             return
 
-        ctx_list, tgt_list, act_list, goal_list = zip(*[ds[i] for i in indices])
+        # Slice first 4 items so we also accept datasets that return
+        # 5-tuples (Stage 2.2 + cached-stage1-pred path). Logging doesn't
+        # need the prebaked pred_frames.
+        items = [ds[i] for i in indices]
+        ctx_list = [it[0] for it in items]
+        tgt_list = [it[1] for it in items]
+        act_list = [it[2] for it in items]
+        goal_list = [it[3] for it in items]
         context = torch.stack(ctx_list).to(self.device)
         target = torch.stack(tgt_list).to(self.device)
         actions = torch.stack(act_list).to(self.device)
@@ -1614,7 +1647,14 @@ class Trainer:
             self.model.train(prev_mode)
             return
 
-        ctx_list, tgt_list, act_list, goal_list = zip(*[ds[i] for i in indices])
+        # Slice first 4 items so we also accept datasets that return
+        # 5-tuples (Stage 2.2 + cached-stage1-pred path). Logging doesn't
+        # need the prebaked pred_frames.
+        items = [ds[i] for i in indices]
+        ctx_list = [it[0] for it in items]
+        tgt_list = [it[1] for it in items]
+        act_list = [it[2] for it in items]
+        goal_list = [it[3] for it in items]
         context = torch.stack(ctx_list).to(self.device)
         target = torch.stack(tgt_list).to(self.device)
         actions = torch.stack(act_list).to(self.device)

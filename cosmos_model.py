@@ -497,6 +497,8 @@ class ARVideoPatchTransformer(nn.Module):
         input_frames:  torch.Tensor,
         target_frames: Optional[torch.Tensor] = None,
         goal:          Optional[torch.Tensor] = None,
+        *,
+        return_pred_frames: bool = True,
     ):
         cfg = self.cfg
         N_p = cfg.n_patches
@@ -521,6 +523,10 @@ class ARVideoPatchTransformer(nn.Module):
             pred_patches = self._decode(hidden[:, t_start : t_start + fout * N_p])
             tgt_patches  = patchify(target_frames, cfg.patch_size)
             loss         = F.mse_loss(pred_patches, tgt_patches)
+            # Training path discards pred_frames, so skip unpatchify/clamp
+            # when the caller only wants the loss.
+            if not return_pred_frames:
+                return None, loss
             pred_frames  = unpatchify(
                 pred_patches.detach(),
                 cfg.patch_size, cfg.resolution, cfg.num_channels,

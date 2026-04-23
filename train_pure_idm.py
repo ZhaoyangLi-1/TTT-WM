@@ -266,8 +266,19 @@ class PureIDMTrainer(Trainer):
             if self.is_main:
                 log.info("Loaded action stats into pure diffusion-policy IDM.")
 
-    def _forward(self, model, context, target, actions, goal):
-        pred, _, loss = model(context, target, actions, goal=goal)
+    def _forward(
+        self, model, context, target, actions, goal, *,
+        return_pred_frames=True, cached_pred_frames=None,
+    ):
+        # return_pred_frames / cached_pred_frames are part of the base-class
+        # interface. pure-IDM datasets are 4-tuple → cached_pred_frames will
+        # always be None here; still pass it through so InverseDynamicsModelDP
+        # sees a consistent call site.
+        del return_pred_frames
+        pred, _, loss = model(
+            context, target, actions, goal=goal,
+            cached_pred_frames=cached_pred_frames,
+        )
         return pred, loss
 
     def _val_loss(self):

@@ -320,11 +320,22 @@ class InverseDynamicsModelDP(nn.Module):
         target_frames: Optional[torch.Tensor] = None,
         actions: Optional[torch.Tensor] = None,
         goal: Optional[torch.Tensor] = None,
+        *,
+        cached_pred_frames: Optional[torch.Tensor] = None,
     ):
         del target_frames
 
-        if self.freeze_stage1:
-            with torch.no_grad():
+        if cached_pred_frames is not None:
+            # Cache path: pred was prebaked by scripts/prebake_stage1_pred.py
+            # using the exact same frozen backbone, so the in-line AR decode
+            # would produce the same values — skip it entirely.
+            pred_frames = cached_pred_frames
+        elif self.freeze_stage1:
+            # inference_mode is slightly cheaper than no_grad (skips version
+            # counter bookkeeping). pred_frames only flows into out-of-place
+            # ops downstream (clamp/add/mul in _build_obs_dict), so the
+            # inference-mode flag is safe to propagate.
+            with torch.inference_mode():
                 pred_frames = self._predict_next_frame(input_frames, goal=goal)
         else:
             pred_frames = self._predict_next_frame(input_frames, goal=goal)

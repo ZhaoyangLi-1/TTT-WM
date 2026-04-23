@@ -74,6 +74,15 @@ train:
   find_unused_parameters: false
   ckpt_dir: ${hydra:runtime.output_dir}/checkpoints
   idm:
+    # --- Stage 2.2 cached Stage-1 predictions (A1) ---
+    # When true, Stage 2.2 skips the frozen backbone's AR decode at training
+    # time and reads prebaked pred_frames from disk. Produce the cache with
+    # `scripts/prebake_stage1_pred.py --backbone-ckpt <stage2_1_ckpt> ...`.
+    # Binds to the backbone weights via SHA1 — mismatch will raise unless
+    # require_cache_sha1=false.
+    use_stage1_cache: false
+    stage1_cache_dir: ""
+    require_cache_sha1: true
     horizon: 4
     n_obs_steps: 1
     n_action_steps: 4

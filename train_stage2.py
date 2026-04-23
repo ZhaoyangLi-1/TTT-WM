@@ -65,6 +65,7 @@ Acceleration alignment with Stage 1 (without changing Stage 2 logic):
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
 import os
@@ -76,6 +77,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf, open_dict
+from torch.utils.data import Dataset
 
 from idm_model import InverseDynamicsModelDP as _IDMModelDP
 from train_stage1 import (
@@ -295,6 +297,177 @@ def _extract_backbone_state_dict(ckpt: dict) -> tuple[dict, str]:
     return _clean_state_dict(ckpt["model"]), "live"
 
 
+def compute_backbone_sha1(state_dict: dict) -> str:
+    """Content hash of a backbone state_dict. Used to bind a prebaked cache
+    (scripts/prebake_stage1_pred.py) to the exact backbone weights that
+    produced it — mismatched hashes at Stage 2.2 startup = raise or warn.
+    """
+    buf = io.BytesIO()
+    # Sort keys for stability across Python dict-insert orders.
+    ordered = {k: state_dict[k] for k in sorted(state_dict.keys())}
+    torch.save(ordered, buf)
+    return hashlib.sha1(buf.getvalue()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Cached Stage-1 prediction dataset (A1): wraps a HeldoutTaskSplitDataset so
+# each __getitem__ also returns the prebaked pred_frames for that window,
+# letting Stage 2.2 skip the frozen backbone's AR decode in the hot path.
+# ---------------------------------------------------------------------------
+
+
+class CachedStage1PredDataset(Dataset):
+    """Read-only wrapper over a HeldoutTaskSplitDataset that attaches, as the
+    5th item of each sample, the Stage-1 predicted frames that the frozen
+    backbone would produce for ``(ctx, goal)`` of that window.
+
+    Cache layout (produced by scripts/prebake_stage1_pred.py):
+
+        <cache_dir>/cache_meta.json
+            { "backbone_sha1": "...", "fin": int, "fout": int,
+              "resolution": int, "num_channels": int, "use_goal": bool,
+              "frame_gap": int, "task": "..." }
+
+        <cache_dir>/episode_{ep_idx:06d}.stage1pred.pt
+            {
+              "pred_frames_u8":  uint8 Tensor (N, fout, H, W, C),
+              "window_starts":   int64 Tensor (N,),
+            }
+
+    uint8 quantization is `((pred + 1) * 127.5).clamp(0, 255).byte()`, inverted
+    at read time to float32 in [-1, 1] — the same range the IDM expects.
+    """
+
+    _CACHE_MAX = 8192  # matches VideoFrameDataset._CACHE_MAX
+
+    def __init__(
+        self,
+        base: VideoFrameDataset,
+        cache_dir: Path,
+        expected_sha1: str,
+        *,
+        require_sha1_match: bool = True,
+        is_main: bool = True,
+    ):
+        self.base = base
+        self.cache_dir = Path(cache_dir)
+        self._is_main = bool(is_main)
+        self._require_sha1 = bool(require_sha1_match)
+
+        meta_path = self.cache_dir / "cache_meta.json"
+        if not meta_path.is_file():
+            raise FileNotFoundError(
+                f"Stage-1 pred cache not found at {meta_path}. "
+                f"Run scripts/prebake_stage1_pred.py to populate it."
+            )
+        with meta_path.open() as f:
+            self.meta = json.load(f)
+
+        self._check_compat(expected_sha1)
+
+        self._pt_cache: dict[str, dict] = {}
+        # Map each base sample's (ep_path, start) to (cache_pt_path, row_idx)
+        # by reading the window_starts index of each episode's pt once.
+        self._sample_to_row = self._build_index()
+
+    # ── compatibility & index build ──────────────────────────────────────
+
+    def _check_compat(self, expected_sha1: str) -> None:
+        got = str(self.meta.get("backbone_sha1", ""))
+        mismatch = got and expected_sha1 and got != expected_sha1
+        if mismatch:
+            msg = (
+                f"Stage-1 pred cache backbone_sha1 mismatch:\n"
+                f"  cache: {got}\n"
+                f"  trainer: {expected_sha1}\n"
+                f"  cache_dir: {self.cache_dir}\n"
+                f"Re-run scripts/prebake_stage1_pred.py with the new backbone."
+            )
+            if self._require_sha1:
+                raise RuntimeError(msg)
+            if self._is_main:
+                log.warning(msg)
+
+        base_cfg_ok = (
+            int(self.meta.get("fin", -1)) == int(self.base.fin)
+            and int(self.meta.get("fout", -1)) == int(self.base.fout)
+            and int(self.meta.get("frame_gap", -1)) == int(self.base.gap)
+        )
+        if not base_cfg_ok:
+            raise RuntimeError(
+                f"Cache meta fin/fout/frame_gap mismatch with dataset "
+                f"(cache={self.meta}, dataset=fin{self.base.fin}/"
+                f"fout{self.base.fout}/gap{self.base.gap})."
+            )
+
+    def _cache_pt_path_for(self, ep_path: str) -> Path:
+        # Derive <cache_dir>/episode_XXXXXX.stage1pred.pt from a parquet path.
+        stem = Path(ep_path).stem  # e.g. "episode_001693"
+        return self.cache_dir / f"{stem}.stage1pred.pt"
+
+    def _build_index(self) -> dict[tuple[str, int], tuple[str, int]]:
+        index: dict[tuple[str, int], tuple[str, int]] = {}
+        # Collect the set of unique episode paths we need.
+        ep_paths = {s[0] for s in self.base.samples}
+        missing: list[str] = []
+        for ep_path in sorted(ep_paths):
+            pt_path = self._cache_pt_path_for(ep_path)
+            if not pt_path.is_file():
+                missing.append(str(pt_path))
+                continue
+            payload = torch.load(
+                pt_path, map_location="cpu", weights_only=True, mmap=True,
+            )
+            self._pt_cache[str(pt_path)] = payload
+            starts = payload["window_starts"].tolist()
+            for row, start in enumerate(starts):
+                index[(ep_path, int(start))] = (str(pt_path), int(row))
+        if missing:
+            raise FileNotFoundError(
+                f"{len(missing)} cache .pt files missing under {self.cache_dir}; "
+                f"first few: {missing[:3]}. Re-run prebake."
+            )
+        if self._is_main:
+            log.info(
+                f"[stage2.cache] indexed {len(index)} cached windows across "
+                f"{len(ep_paths)} episodes from {self.cache_dir}"
+            )
+        return index
+
+    # ── Dataset API ──────────────────────────────────────────────────────
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, idx: int):
+        ctx, tgt, actions, goal = self.base[idx]
+        ep_path, start, _ = self.base.samples[idx]
+        key = (ep_path, int(start))
+        pt_path, row = self._sample_to_row[key]
+        payload = self._pt_cache.get(pt_path)
+        if payload is None:
+            if len(self._pt_cache) >= self._CACHE_MAX:
+                oldest = next(iter(self._pt_cache))
+                del self._pt_cache[oldest]
+            payload = torch.load(
+                pt_path, map_location="cpu", weights_only=True, mmap=True,
+            )
+            self._pt_cache[pt_path] = payload
+        pred_u8 = payload["pred_frames_u8"][row]      # (fout, H, W, C) uint8
+        pred = pred_u8.to(torch.float32).permute(0, 3, 1, 2)
+        pred = pred.mul_(1.0 / 127.5).sub_(1.0)        # -> (fout, C, H, W) in [-1,1]
+        return ctx, tgt, actions, goal, pred
+
+    # Expose a handful of attributes that upstream code might poke at so
+    # drop-in wrapping is transparent (e.g. trainer.get_action_stats()).
+    @property
+    def test_tasks(self):
+        return getattr(self.base, "test_tasks", ())
+
+    def get_action_stats(self):
+        return self.base.get_action_stats()
+
+
 # ---------------------------------------------------------------------------
 # Stage 2 base mixin: shared overrides for both 2.1 and 2.2
 # ---------------------------------------------------------------------------
@@ -382,6 +555,51 @@ class Stage2Part1Trainer(_Stage2Mixin, Trainer):
 # ---------------------------------------------------------------------------
 
 
+def _maybe_wrap_with_stage1_cache(
+    train_ds: VideoFrameDataset,
+    val_ds: VideoFrameDataset,
+    cfg: DictConfig,
+    backbone_sha1: str,
+    is_main: bool,
+):
+    """Wrap the Stage 2 datasets with CachedStage1PredDataset iff
+    ``cfg.train.idm.use_stage1_cache`` is set. Otherwise return unchanged.
+
+    Binds the cache to ``backbone_sha1`` so mismatched weights fail loudly
+    (guard against training Stage 2.2 on a stale cache after re-finetuning
+    Stage 2.1).
+    """
+    use_cache = bool(
+        OmegaConf.select(cfg, "train.idm.use_stage1_cache", default=False)
+    )
+    if not use_cache:
+        return train_ds, val_ds
+
+    cache_dir = OmegaConf.select(cfg, "train.idm.stage1_cache_dir", default=None)
+    if not cache_dir:
+        raise ValueError(
+            "train.idm.use_stage1_cache=true requires train.idm.stage1_cache_dir."
+        )
+    require = bool(
+        OmegaConf.select(cfg, "train.idm.require_cache_sha1", default=True)
+    )
+    cache_dir = Path(str(cache_dir)).expanduser()
+    if is_main:
+        log.info(
+            f"Stage 2.2: using prebaked stage-1 predictions from {cache_dir} "
+            f"(require_sha1_match={require})"
+        )
+    train_ds = CachedStage1PredDataset(
+        train_ds, cache_dir, backbone_sha1,
+        require_sha1_match=require, is_main=is_main,
+    )
+    val_ds = CachedStage1PredDataset(
+        val_ds, cache_dir, backbone_sha1,
+        require_sha1_match=require, is_main=is_main,
+    )
+    return train_ds, val_ds
+
+
 class Stage2Part2Trainer(_Stage2Mixin, Trainer):
     """Stage 2.2: freeze the (Stage 2.1) ARVideoPatchTransformer and only
     train the IDM action head.
@@ -404,10 +622,19 @@ class Stage2Part2Trainer(_Stage2Mixin, Trainer):
             OmegaConf.select(cfg, "data.stage2_val_fraction", default=0.01)
         )
         seed = int(OmegaConf.select(cfg, "seed", default=42))
-        return build_heldout_task_datasets(
+        train_ds, val_ds, test_ds = build_heldout_task_datasets(
             cfg.data, cfg.model, self.is_main,
             val_fraction=val_fraction, seed=seed,
         )
+        # Stage 2.2 may optionally read prebaked stage-1 predictions so the
+        # frozen backbone's AR decode is skipped every step. Opt-in via
+        # cfg.train.idm.use_stage1_cache.
+        train_ds, val_ds = _maybe_wrap_with_stage1_cache(
+            train_ds, val_ds, cfg,
+            backbone_sha1=getattr(self, "_backbone_sha1", ""),
+            is_main=self.is_main,
+        )
+        return train_ds, val_ds, test_ds
 
     def _build_trainable_model(self, raw_wm: nn.Module, has_goal: bool) -> nn.Module:
         cfg = self.cfg
@@ -420,8 +647,14 @@ class Stage2Part2Trainer(_Stage2Mixin, Trainer):
         ckpt = torch.load(stage2_1_ckpt, map_location=self.device, weights_only=False)
         sd, src = _extract_backbone_state_dict(ckpt)
         raw_wm.load_state_dict(sd)
+        # Stash backbone hash for the optional Stage-1 prediction cache
+        # (A1). CachedStage1PredDataset will verify it at dataset build time.
+        self._backbone_sha1 = compute_backbone_sha1(sd)
         if self.is_main:
-            log.info(f"Stage 2.2 loaded backbone from {stage2_1_ckpt} ({src} weights)")
+            log.info(
+                f"Stage 2.2 loaded backbone from {stage2_1_ckpt} ({src} weights) "
+                f"sha1={self._backbone_sha1[:12]}"
+            )
 
         wrapped = _IDMModelDP(
             raw_wm,
@@ -483,12 +716,22 @@ class Stage2Part2Trainer(_Stage2Mixin, Trainer):
             if self.is_main:
                 log.info("Loaded action stats into Stage 2.2 diffusion-policy IDM.")
 
-    def _forward(self, model, context, target, actions, goal):
+    def _forward(
+        self, model, context, target, actions, goal, *,
+        return_pred_frames=True, cached_pred_frames=None,
+    ):
         # IDM model returns (pred_frames, pred_actions, loss) — a 3-tuple.
         # The base Trainer._run_epoch expects _forward to return (pred, loss).
         # We drop pred_actions here; they are only needed during inference,
         # not during training where the loss is all that matters.
-        pred, _, loss = model(context, target, actions, goal=goal)
+        # return_pred_frames is part of the base-class interface but has no
+        # effect on the IDM wrapper (its inner Stage-1 forward is a separate
+        # code path); accept-and-ignore keeps the signature compatible.
+        del return_pred_frames
+        pred, _, loss = model(
+            context, target, actions, goal=goal,
+            cached_pred_frames=cached_pred_frames,
+        )
         return pred, loss
 
 
