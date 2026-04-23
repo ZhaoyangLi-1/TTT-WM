@@ -562,18 +562,11 @@ class ARVideoPatchTransformer(nn.Module):
             return pred_frames, loss
 
         else:
-            has_goal = goal is not None
-            all_frames = torch.cat([goal.unsqueeze(1), input_frames], dim=1) if has_goal else input_frames
-            n_ctx      = input_frames.shape[1]
-            tokens     = self._embed_frames(all_frames)
-            t_idx, s_idx = self._build_position_indices(n_ctx, 0, tokens.device, has_goal)
-            block_mask = self._ensure_mask(n_ctx, 0, tokens.device, has_goal)
-            hidden     = self._run_transformer(tokens, t_idx, s_idx, block_mask)
-            pred_frames = unpatchify(
-                self._decode(hidden[:, -N_p:]),
-                cfg.patch_size, cfg.resolution, cfg.num_channels,
-            ).clamp(-1, 1)
-            return pred_frames, None
+            raise RuntimeError(
+                "forward() without target_frames is not a valid inference path "
+                "under the token-causal training setup. Call model.generate() "
+                "for autoregressive rollout instead."
+            )
 
     # ------------------------------------------------------------------
     # AR Generation

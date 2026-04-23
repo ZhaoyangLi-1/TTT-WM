@@ -554,7 +554,32 @@ class VideoFrameDataset(Dataset):
             )
 
         self._parquet_cache: dict[str, pd.DataFrame] = {}
+        self._pt_cache: dict[str, dict] = {}
         self._action_stats_cache: dict[str, np.ndarray] | None = None
+
+    def _pt_path(self, parquet_path: str) -> str:
+        if parquet_path.endswith(".parquet"):
+            return parquet_path[:-len(".parquet")] + ".pt"
+        return parquet_path + ".pt"
+
+    def _read_pt(self, path: str) -> dict | None:
+        """Prefer the pre-baked .pt if it exists next to the parquet.
+
+        Payload layout (produced by scripts/prebake_frames.py):
+            frames:  uint8 tensor (T, res, res, 3)   — pre-resized to training resolution
+            actions: float32 tensor (T, action_dim)
+        """
+        pt_path = self._pt_path(path)
+        if pt_path in self._pt_cache:
+            return self._pt_cache[pt_path]
+        if not os.path.exists(pt_path):
+            return None
+        if len(self._pt_cache) >= self._CACHE_MAX:
+            oldest = next(iter(self._pt_cache))
+            del self._pt_cache[oldest]
+        payload = torch.load(pt_path, map_location="cpu", weights_only=True)
+        self._pt_cache[pt_path] = payload
+        return payload
 
     def _read_parquet(self, path: str) -> pd.DataFrame:
         if path in self._parquet_cache:
@@ -632,8 +657,39 @@ class VideoFrameDataset(Dataset):
 
         return {k: v.copy() for k, v in self._action_stats_cache.items()}
 
+    def _frame_from_pt(self, frames_u8: torch.Tensor, idx: int) -> torch.Tensor:
+        # frames_u8: (T, H, W, 3) uint8 at training resolution already.
+        # Return (3, H, W) float in [-1, 1] matching transforms.Normalize([0.5]*3,[0.5]*3).
+        f = frames_u8[idx].to(torch.float32).permute(2, 0, 1)
+        return f.mul_(1.0 / 127.5).sub_(1.0)
+
     def __getitem__(self, idx):
         parquet_path, start, ep_length = self.samples[idx]
+
+        pt_payload = self._read_pt(parquet_path)
+
+        if pt_payload is not None:
+            frames_u8 = pt_payload["frames"]   # (T, H, W, 3) uint8
+            actions_t = pt_payload["actions"]  # (T, action_dim) float32
+
+            ctx_imgs = [self._frame_from_pt(frames_u8, start + t) for t in range(self.fin)]
+            tgt_imgs = [
+                self._frame_from_pt(frames_u8, start + self._target_offset + t)
+                for t in range(self.fout)
+            ]
+
+            act_start = start + self._action_offset
+            actions = actions_t[act_start : act_start + self.gap].clone()
+
+            if self.use_goal:
+                goal = self._frame_from_pt(frames_u8, ep_length - 1)
+            else:
+                goal = torch.zeros(3, self._res, self._res)
+
+            return torch.stack(ctx_imgs), torch.stack(tgt_imgs), actions, goal
+
+        # Fallback: original parquet + PIL decode path (kept for bootstrap
+        # before prebake_frames.py has been run).
         df = self._read_parquet(parquet_path)
 
         ctx_imgs = []
