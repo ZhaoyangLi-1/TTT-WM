@@ -18,7 +18,7 @@
 set -euo pipefail
 
 DATASET="${DATASET:-/linting-fast-vol/libero_wm}"
-NGPU="${NGPU:-4}"
+NGPU="${NGPU:-6}"
 MASTER_PORT="${MASTER_PORT:-29504}"
 BATCH_SIZE="${BATCH_SIZE:-72}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
