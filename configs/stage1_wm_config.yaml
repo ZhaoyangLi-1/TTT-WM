@@ -3,6 +3,13 @@ seed: 42
 
 outputs_root: ${oc.env:TTT_WM_OUTPUTS_ROOT,/ariesdv0/zhaoyang/data}
 
+# Shared timestamp for the whole DDP run.
+#   - RUN_TS env var (set once by the launcher) → all ranks see the same value
+#   - fallback to ${now:...} when launched without the env var (e.g. single-GPU)
+# This prevents each torchrun rank from resolving ${now:...} to a different
+# second and creating multiple output folders.
+run_timestamp: ${oc.env:RUN_TS,${now:%Y-%m-%d_%H-%M-%S}}
+
 model:
   resolution: 128
   num_channels: 3
@@ -58,7 +65,7 @@ train:
   grad_clip: 1.0
   amp: true
   amp_dtype: bf16
-  ckpt_dir: ${outputs_root}/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
+  ckpt_dir: ${outputs_root}/${experiment_name}/${run_timestamp}
   checkpoint_every: 5
   stage: 1
   resume: ""
@@ -72,4 +79,4 @@ wandb:
 
 hydra:
   run:
-    dir: ${outputs_root}/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
+    dir: ${outputs_root}/${experiment_name}/${run_timestamp}

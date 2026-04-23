@@ -404,7 +404,13 @@ def build_scheduler(
 
 
 class VideoFrameDataset(Dataset):
-    _CACHE_MAX = 64
+    # Large cap because cached entries are mmap views — ~few hundred bytes
+    # per Python-level tensor wrapper; actual data pages are shared via the
+    # OS page cache across all worker processes. We want the cache to cover
+    # the whole dataset so hit rate approaches 100% after one epoch and
+    # torch.load's ZIP/pickle setup cost (12-30ms) only happens once per
+    # episode per worker lifetime.
+    _CACHE_MAX = 8192
 
     def __init__(
         self,
