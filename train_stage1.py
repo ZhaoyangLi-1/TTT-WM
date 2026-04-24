@@ -1179,7 +1179,7 @@ class Trainer:
                 name=self.wandb_cfg.get("name", cfg.experiment_name),
                 config=OmegaConf.to_container(cfg, resolve=True),
                 mode=self.wandb_cfg.get("mode", None),
-                tags=list(wandb_tags) if wandb_tags is not None else None,
+                tags=[t[:64] for t in wandb_tags] if wandb_tags is not None else None,
                 group=self.wandb_cfg.get("group", None),
                 id=self.wandb_cfg.get("id", None),
                 resume="allow" if wandb_resume else None,

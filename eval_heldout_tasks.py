@@ -573,6 +573,108 @@ def save_rollout_comparison(
     save_video(combined, str(output_path), fps=fps)
 
 
+def save_rollout_frames_grid(
+    gt_frames: list[np.ndarray],
+    pred_frames: list[np.ndarray],
+    output_path: Path,
+    n_snapshots: int = 8,
+    image_scale: int = 1,
+) -> None:
+    """Static PNG grid: top row = GT frames, bottom row = rollout predictions,
+    at `n_snapshots` evenly-spaced timesteps. Fast way to eyeball rollout
+    quality without playing the mp4."""
+    n_total = min(len(gt_frames), len(pred_frames))
+    if n_total == 0:
+        return
+    n = min(int(n_snapshots), n_total)
+    if n <= 1:
+        idxs = [0]
+    else:
+        idxs = np.linspace(0, n_total - 1, num=n, dtype=int).tolist()
+
+    def _pick(frames: list[np.ndarray]) -> list[np.ndarray]:
+        out = [frames[i] for i in idxs]
+        if int(image_scale) > 1:
+            out = [upscale_uint8(f, image_scale) for f in out]
+        return out
+
+    gt_pick = _pick(gt_frames)
+    pred_pick = _pick(pred_frames)
+    h, w = gt_pick[0].shape[:2]
+    sep_w = max(2, 2 * max(1, int(image_scale)))
+
+    def _row(frames: list[np.ndarray]) -> np.ndarray:
+        sep_v = np.full((h, sep_w, 3), 180, dtype=np.uint8)
+        pieces: list[np.ndarray] = []
+        for i, img in enumerate(frames):
+            pieces.append(img)
+            if i < len(frames) - 1:
+                pieces.append(sep_v)
+        return np.concatenate(pieces, axis=1)
+
+    gt_row = _row(gt_pick)
+    pred_row = _row(pred_pick)
+
+    # Horizontal separator between GT row and pred row.
+    h_sep = np.full((sep_w, gt_row.shape[1], 3), 180, dtype=np.uint8)
+    grid = np.concatenate([gt_row, h_sep, pred_row], axis=0)
+
+    # Add a thin caption strip at the top and bottom (white background, dark
+    # text) labelling the row meaning and the step indices.
+    from PIL import Image as _Img, ImageDraw as _Draw
+    pil = _Img.fromarray(grid)
+    label_h = max(14, 10 * max(1, int(image_scale)))
+    canvas = _Img.new(
+        "RGB", (pil.width, pil.height + 2 * label_h), color=(255, 255, 255)
+    )
+    canvas.paste(pil, (0, label_h))
+    draw = _Draw.Draw(canvas)
+    # Top caption: step indices
+    step_labels = "  |  ".join(f"step {i}" for i in idxs)
+    draw.text((4, 2), f"GT (top) vs Rollout Pred (bottom)   |   {step_labels}",
+              fill=(0, 0, 0))
+    # Bottom caption: GT/Pred row markers
+    draw.text((4, pil.height + label_h + 2),
+              "GT is top row,  Rollout Pred is bottom row",
+              fill=(80, 80, 80))
+    canvas.save(output_path)
+
+
+def save_rollout_mse_plot(
+    step_mse: list[float],
+    output_path: Path,
+    title: str | None = None,
+) -> None:
+    """Matplotlib line plot of rollout step MSE vs step index. Also marks
+    the first/avg/last values for quick reading."""
+    if not step_mse:
+        return
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    xs = np.arange(len(step_mse))
+    ys = np.asarray(step_mse, dtype=np.float64)
+
+    fig, ax = plt.subplots(figsize=(6.4, 3.6), dpi=120)
+    ax.plot(xs, ys, marker="o", markersize=3, linewidth=1.2, color="#1f77b4")
+    ax.axhline(float(ys.mean()), linestyle="--", linewidth=0.8, color="#ff7f0e",
+               label=f"mean = {ys.mean():.4f}")
+    ax.set_xlabel("Rollout step")
+    ax.set_ylabel("MSE (pred vs GT frame)")
+    ax.set_title(title or "Rollout per-step MSE")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="lower right")
+    # Annotate first and last points
+    ax.annotate(f"{ys[0]:.4f}", xy=(xs[0], ys[0]),
+                xytext=(4, 6), textcoords="offset points", fontsize=8)
+    ax.annotate(f"{ys[-1]:.4f}", xy=(xs[-1], ys[-1]),
+                xytext=(4, 6), textcoords="offset points", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+
+
 def summarize_numeric(values: list[float | None]) -> float | None:
     clean = [float(x) for x in values if x is not None]
     return float(np.mean(clean)) if clean else None
@@ -652,6 +754,15 @@ def main():
         help=(
             "Integer upscale factor (nearest-neighbor) applied when saving PNGs and rollout "
             "videos. Use 1 to save at native model resolution."
+        ),
+    )
+    parser.add_argument(
+        "--grid-snapshots",
+        type=int,
+        default=8,
+        help=(
+            "Number of evenly-spaced frames sampled from the rollout to build the "
+            "rollout_grid.png summary image (2 rows: GT and Pred). Set 0 to disable."
         ),
     )
     args = parser.parse_args()
@@ -783,6 +894,8 @@ def main():
                 )
 
                 video_path = episode_dir / "rollout.mp4"
+                grid_path: Path | None = None
+                mse_plot_path: Path | None = None
                 if rollout_metrics["n_steps"] > 0:
                     save_rollout_comparison(
                         rollout_metrics["gt_frames"],
@@ -790,6 +903,24 @@ def main():
                         video_path,
                         fps=int(args.fps),
                         image_scale=int(args.image_scale),
+                    )
+                    # Static snapshot grid — quick visual summary of the whole
+                    # rollout without playing the video.
+                    grid_path = episode_dir / "rollout_grid.png"
+                    save_rollout_frames_grid(
+                        rollout_metrics["gt_frames"],
+                        rollout_metrics["pred_frames"],
+                        grid_path,
+                        n_snapshots=int(args.grid_snapshots),
+                        image_scale=int(args.image_scale),
+                    )
+                    # Per-step MSE curve plot.
+                    mse_plot_path = episode_dir / "rollout_mse.png"
+                    save_rollout_mse_plot(
+                        rollout_metrics.get("step_mse", []),
+                        mse_plot_path,
+                        title=f"{task_slug}  ep={episode_idx}  "
+                              f"avg_mse={rollout_metrics.get('avg_mse') or float('nan'):.4f}",
                     )
                 else:
                     video_path = None
@@ -807,6 +938,8 @@ def main():
                         "last_mse": rollout_metrics["last_mse"],
                         "step_mse": rollout_metrics.get("step_mse", []),
                         "video_path": str(video_path.resolve()) if video_path else None,
+                        "grid_path": str(grid_path.resolve()) if grid_path else None,
+                        "mse_plot_path": str(mse_plot_path.resolve()) if mse_plot_path else None,
                     },
                 }
                 results.append(episode_result)

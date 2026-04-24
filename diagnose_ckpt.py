@@ -238,6 +238,96 @@ def main() -> None:
     else:
         print("  All patches finite — generate() is working on this input.")
 
+    # ── Step 5: per-patch MSE — teacher-forcing vs generate ────────────
+    # Teacher-forcing feeds every target patch its TRUE predecessor patches
+    # (full in-frame teacher forcing). Generate instead feeds each patch
+    # the model's OWN prediction of the previous patch → AR drift inside
+    # a single frame. This step makes that visible patch-by-patch:
+    #   - patch 0 should be ~identical (both paths depend only on [goal, ctx])
+    #   - patch 1+ drift grows monotonically with patch index
+    print("\n── Step 5: per-patch MSE (TF vs Generate) ─────────────────")
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        pred_ref, _ = model(ctx, tgt, goal)          # teacher-forcing pred
+    tgt_patches = patchify(tgt.float(), P)[0]        # (N_p*fout, patch_dim)
+    ref_patches = patchify(pred_ref.float(), P)[0]
+    gen_patches = patchify(gen.float(), P)[0]
+    n_total = tgt_patches.shape[0]
+
+    probe_idx = [0, 1, 5, 20, 50, 100, 128, 200, n_total - 1]
+    probe_idx = sorted({i for i in probe_idx if 0 <= i < n_total})
+
+    print(f"  {'patch':>6}  {'TF-MSE':>10}  {'Gen-MSE':>10}  {'ratio':>8}")
+    import torch.nn.functional as _F
+    for j in probe_idx:
+        mse_tf = _F.mse_loss(ref_patches[j], tgt_patches[j]).item()
+        mse_gen = _F.mse_loss(gen_patches[j], tgt_patches[j]).item()
+        ratio = mse_gen / max(mse_tf, 1e-9)
+        print(f"  {j:>6d}  {mse_tf:>10.5f}  {mse_gen:>10.5f}  {ratio:>7.2f}x")
+
+    # Also print aggregate stats: mean MSE vs patch index (binned) to see
+    # where in the frame the drift accumulates most.
+    diff_tf = (ref_patches - tgt_patches).float().pow(2).mean(dim=-1)   # (N,)
+    diff_gen = (gen_patches - tgt_patches).float().pow(2).mean(dim=-1)  # (N,)
+    n_bins = 8
+    bin_size = max(1, n_total // n_bins)
+    print(f"\n  Binned mean MSE across patches (bin_size={bin_size}):")
+    print(f"  {'bin':>6}  {'patches':>14}  {'TF-MSE':>10}  {'Gen-MSE':>10}  {'ratio':>8}")
+    for b in range(n_bins):
+        lo = b * bin_size
+        hi = min((b + 1) * bin_size, n_total)
+        if lo >= hi:
+            continue
+        tf_mean = diff_tf[lo:hi].mean().item()
+        gen_mean = diff_gen[lo:hi].mean().item()
+        ratio = gen_mean / max(tf_mean, 1e-9)
+        print(f"  {b:>6d}  {lo:>5d}-{hi - 1:<5d}   {tf_mean:>10.5f}  {gen_mean:>10.5f}  {ratio:>7.2f}x")
+
+    # ── Step 6: whole-frame head-to-head (generate vs forward vs GT) ───
+    # Same episode/window as Step 5. Reports three scalars on the full frame:
+    #   mse(gen, tgt)   — generate path's accuracy against GT
+    #   mse(tf,  tgt)   — teacher-forcing path's accuracy against GT
+    #   mse(gen, tf)    — how close the two paths agree on the *same* frame
+    # Also dumps three side-by-side PNGs (gt | tf | gen) so you can visually
+    # judge whether the model's single-step generate output looks like a
+    # plausible next frame.
+    print("\n── Step 6: whole-frame head-to-head (Gen vs TF vs GT) ─────")
+    # gen (from Step 4) and pred_ref (from Step 5) are both (1, fout, 3, 128, 128).
+    gen_f  = gen.float().clamp(-1, 1)
+    tf_f   = pred_ref.float().clamp(-1, 1)
+    tgt_f  = tgt.float().clamp(-1, 1)
+
+    mse_gen_tgt = _F.mse_loss(gen_f, tgt_f).item()
+    mse_tf_tgt  = _F.mse_loss(tf_f, tgt_f).item()
+    mse_gen_tf  = _F.mse_loss(gen_f, tf_f).item()
+    max_abs_gen_tf = (gen_f - tf_f).abs().max().item()
+    print(f"  mse(gen, GT) = {mse_gen_tgt:.6f}   mse(tf, GT) = {mse_tf_tgt:.6f}   "
+          f"ratio gen/tf = {mse_gen_tgt / max(mse_tf_tgt, 1e-9):.2f}x")
+    print(f"  mse(gen, tf) = {mse_gen_tf:.6f}   max|gen - tf| = {max_abs_gen_tf:.4f}")
+    print(f"  (lower mse(gen, tf) means the two paths agree; lower mse(*, GT) "
+          "means accurate prediction)")
+
+    # Dump side-by-side image so you can eyeball the single-step prediction.
+    def _to_u8(x):  # (3, H, W) in [-1,1] -> (H, W, 3) uint8
+        a = ((x.float().clamp(-1, 1) + 1) * 127.5).cpu().numpy()
+        return a.transpose(1, 2, 0).astype(np.uint8)
+
+    try:
+        from PIL import Image as _PILImage
+        gt_u8  = _to_u8(tgt_f[0, 0])
+        tf_u8  = _to_u8(tf_f[0, 0])
+        gen_u8 = _to_u8(gen_f[0, 0])
+        ctx_u8 = _to_u8(ctx.float()[0, -1])
+        sep = np.full((gt_u8.shape[0], 4, 3), 128, dtype=np.uint8)
+        panel = np.concatenate(
+            [ctx_u8, sep, gt_u8, sep, tf_u8, sep, gen_u8], axis=1,
+        )
+        out_path = Path("/tmp") / f"diagnose_step6_ep{ep_idx:06d}.png"
+        _PILImage.fromarray(panel).save(out_path)
+        print(f"  Saved side-by-side visualization: {out_path}")
+        print("  Panel order: [ ctx | GT_target | TF_pred | Gen_pred ]")
+    except Exception as e:
+        print(f"  (PIL save failed, skipping visualization: {e})")
+
 
 if __name__ == "__main__":
     main()
