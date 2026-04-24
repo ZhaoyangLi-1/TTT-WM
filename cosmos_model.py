@@ -50,6 +50,7 @@ Sanity-check reference
 """
 
 from __future__ import annotations
+import contextlib
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 
@@ -318,12 +319,15 @@ class CausalAttention(nn.Module):
         q = q.to(v.dtype)
         k = k.to(v.dtype)
 
-        # flash_attn_with_kvcache: appends (k, v) into the cache starting
-        # at cache_seqlens per batch, and returns attended output.
-        # causal=True keeps q_idx >= kv_idx over the concatenated sequence.
+        # flash_attn_with_kvcache signature is (q, k_cache, v_cache, k=None,
+        # v=None, ...) — NOT (q, k, v, k_cache, v_cache). Use keyword args
+        # for k/v to avoid the position-argument trap. Given the new (k, v)
+        # this function appends them at position `cache_seqlens` per batch
+        # and computes causal attention of q against the populated cache.
         out = flash_attn_with_kvcache(
-            q, k, v,
+            q,
             k_cache, v_cache,
+            k=k, v=v,
             cache_seqlens=cache_seqlens,
             causal=True,
         )
@@ -578,7 +582,9 @@ class ARVideoPatchTransformer(nn.Module):
         has_goal = goal is not None
         B        = context_frames.shape[0]
         device   = context_frames.device
-        dtype    = context_frames.dtype
+        # NOTE: the KV-cache dtype is derived below from prefix_tokens (after
+        # patch_embed/embed_norm), not from context_frames — autocast may
+        # change the dtype between these two points.
 
         ctx = context_frames[:, -fin:]
 
@@ -593,18 +599,17 @@ class ARVideoPatchTransformer(nn.Module):
 
         # ── Allocate KV caches ────────────────────────────────────────
         # Last decoded patch has no successor, so only fout*N_p - 1 keys
-        # beyond the prefix need to be appended.
+        # beyond the prefix need to be appended. We allocate each layer's
+        # cache LAZILY inside the prefill loop using v_pre.dtype — this is
+        # the only reliable way to match flash_attn's dtype expectations,
+        # because under torch.amp.autocast some ops (F.rms_norm / LayerNorm)
+        # get promoted to fp32 for precision while Linear outputs are kept
+        # at the autocast dtype, so prefix_tokens.dtype does NOT generally
+        # equal the dtype of q/k/v inside the block. flash_attn requires
+        # q.dtype == k_cache.dtype; the lazy allocation guarantees it.
         max_seqlen = prefix_len + n_tgt_total - 1
-        k_caches = [
-            torch.zeros(B, max_seqlen, cfg.n_heads, cfg.head_dim,
-                        device=device, dtype=dtype)
-            for _ in range(cfg.n_layers)
-        ]
-        v_caches = [
-            torch.zeros(B, max_seqlen, cfg.n_heads, cfg.head_dim,
-                        device=device, dtype=dtype)
-            for _ in range(cfg.n_layers)
-        ]
+        k_caches: List[Optional[torch.Tensor]] = [None] * cfg.n_layers
+        v_caches: List[Optional[torch.Tensor]] = [None] * cfg.n_layers
 
         # ── Phase 1: Prefill with RoPE-aware cache population ─────────
         t_idx_pre, s_idx_pre = self._build_position_indices(fin, 0, device, has_goal)
@@ -618,6 +623,16 @@ class ARVideoPatchTransformer(nn.Module):
                 B, prefix_len, 3, cfg.n_heads, cfg.head_dim
             )
             _, k_pre, v_pre = qkv.unbind(dim=2)  # (B, L, H, D) each
+
+            # Allocate cache in the true dtype that flash_attn will see.
+            k_caches[layer_idx] = torch.zeros(
+                B, max_seqlen, cfg.n_heads, cfg.head_dim,
+                device=device, dtype=v_pre.dtype,
+            )
+            v_caches[layer_idx] = torch.zeros(
+                B, max_seqlen, cfg.n_heads, cfg.head_dim,
+                device=device, dtype=v_pre.dtype,
+            )
 
             # k_norm / RoPE now operate directly on (B, L, H, D) — must
             # match the training path in CausalAttention.forward so the
@@ -709,8 +724,22 @@ def check_generate_matches_training(
         B, cfg.frames_out, cfg.num_channels, cfg.resolution, cfg.resolution,
         device=ctx.device, dtype=ctx.dtype,
     )
-    pred_ref, _ = model(ctx, dummy_target, goal)   # (B, fout, C, H, W)
-    pred_gen    = model.generate(ctx, goal=goal)   # (B, fout, C, H, W)
+    # flash-attn only supports fp16/bf16. If caller kept the model + inputs
+    # in fp32, run both paths under bf16 autocast so the diagnostic still
+    # works without requiring the caller to cast everything manually.
+    need_autocast = (
+        ctx.is_cuda
+        and ctx.dtype == torch.float32
+        and not torch.is_autocast_enabled()
+    )
+    amp_ctx = (
+        torch.amp.autocast("cuda", dtype=torch.bfloat16)
+        if need_autocast
+        else contextlib.nullcontext()
+    )
+    with amp_ctx:
+        pred_ref, _ = model(ctx, dummy_target, goal)   # (B, fout, C, H, W)
+        pred_gen    = model.generate(ctx, goal=goal)   # (B, fout, C, H, W)
 
     # Compare the first patch of frame 0 in both outputs. Unpatchify lays
     # patches out in row-major, so the top-left patch is

@@ -440,7 +440,11 @@ def evaluate_teacher_forcing_episode(
                 frames[target_start : target_start + frames_out]
             ).unsqueeze(0).to(device)
 
-            with torch.amp.autocast("cuda", enabled=(use_amp and device.type == "cuda")):
+            with torch.amp.autocast(
+                "cuda",
+                enabled=(use_amp and device.type == "cuda"),
+                dtype=torch.bfloat16,
+            ):
                 pred_frames, _ = model(context, target, goal_batch)
 
             mse = F.mse_loss(pred_frames.float(), target.float()).item()
@@ -524,7 +528,11 @@ def rollout_episode(
     model.eval()
     with torch.no_grad():
         for step_idx in range(n_steps):
-            with torch.amp.autocast("cuda", enabled=(use_amp and device.type == "cuda")):
+            with torch.amp.autocast(
+                "cuda",
+                enabled=(use_amp and device.type == "cuda"),
+                dtype=torch.bfloat16,
+            ):
                 pred_frames = model.generate(window, goal=goal_batch)
 
             gt_frame = frames[(step_idx + 1) * frame_gap].unsqueeze(0).unsqueeze(0).to(device)

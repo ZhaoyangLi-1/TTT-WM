@@ -276,7 +276,16 @@ def extract_context_frames(
 
 def frames_to_uint8(frames: torch.Tensor) -> np.ndarray:
     """(T, C, H, W) in [-1,1] → (T, H, W, C) uint8."""
-    x = (frames.clamp(-1, 1) * 0.5 + 0.5) * 255.0
+    # .float() upcast: numpy doesn't support bfloat16 — without this, any
+    # bf16 tensor coming from autocast(dtype=torch.bfloat16) inference paths
+    # raises `TypeError: Got unsupported ScalarType BFloat16`.
+    x = frames.float()
+    # `clamp` does NOT clean NaN (NaN is incomparable, stays NaN), and Inf
+    # cast to uint8 produces numpy's "invalid value encountered in cast"
+    # warning and writes garbage bytes. Replace both with finite defaults
+    # before scaling so eval visualizations never show corrupted pixels.
+    x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
+    x = (x.clamp(-1, 1) * 0.5 + 0.5) * 255.0
     return x.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
 
 
@@ -437,7 +446,9 @@ def generate_with_progress(
     )
 
     with torch.no_grad(), torch.amp.autocast(
-        'cuda', enabled=(use_amp and device.type == "cuda")
+        'cuda',
+        enabled=(use_amp and device.type == "cuda"),
+        dtype=torch.bfloat16,
     ):
         if has_internals:
             return _run_steps()
