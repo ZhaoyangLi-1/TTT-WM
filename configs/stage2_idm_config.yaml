@@ -45,7 +45,7 @@ val_dataloader:
 
 train:
   compile: false
-  epochs: 300
+  epochs: 100
   gradient_accumulate_every: 1
   optimizer:
     lr: 1.0e-4
