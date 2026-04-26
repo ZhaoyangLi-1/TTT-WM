@@ -108,7 +108,7 @@ train:
 
 wandb:
   enabled: true
-  project: TTT-WM-diffusion
+  project: TTT-WM-diffusion-V2
   name: ${now:%Y.%m.%d-%H.%M.%S}_stage${train.substep}_${data.task_dirname}_gap${data.frame_gap}
   mode: online
   resume: false

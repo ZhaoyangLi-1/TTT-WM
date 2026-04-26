@@ -262,6 +262,12 @@ class HeldoutTaskSplitDataset(VideoFrameDataset):
                 f"{len(self.episode_indices)} episodes "
                 f"(val_fraction={val_fraction}, seed={seed})"
             )
+            _eps_preview = (
+                f"{self.episode_indices[:10]} … (+{len(self.episode_indices) - 10} more)"
+                if len(self.episode_indices) > 10
+                else f"{self.episode_indices}"
+            )
+            log.info(f"[stage2.{split}] episode_indices={_eps_preview}")
 
 
 def build_heldout_task_datasets(
