@@ -666,11 +666,17 @@ class Stage2Part2Trainer(_Stage2Mixin, Trainer):
                 f"sha1={self._backbone_sha1[:12]}"
             )
 
+        idm_kwargs = OmegaConf.to_container(cfg.train.get("idm", {}), resolve=True)
+        # Strip trainer-only knobs (Stage-1 prediction cache lives under
+        # train.idm.* for config locality but is consumed by the trainer in
+        # _maybe_wrap_with_stage1_cache, not by the IDM model constructor).
+        for k in ("use_stage1_cache", "stage1_cache_dir", "require_cache_sha1"):
+            idm_kwargs.pop(k, None)
         wrapped = _IDMModelDP(
             raw_wm,
             n_actions=int(cfg.data.get("frame_gap", 0)),
             freeze_stage1=True,
-            **OmegaConf.to_container(cfg.train.get("idm", {}), resolve=True),
+            **idm_kwargs,
         ).to(self.device)
 
         # prebuild_mask must be called on the wrapper, not raw_wm, because
