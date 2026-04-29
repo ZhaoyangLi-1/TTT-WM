@@ -51,8 +51,7 @@ exec torchrun \
     --nproc_per_node="${NGPU}" \
     --master_port="${MASTER_PORT}" \
     train_stage2.py \
-    --config-name stage2_idm_config \
-    train.substep=2.1 \
+    --config-name stage2_1_idm_config \
     train.stage1_ckpt="${STAGE1_CKPT}" \
     data.root="${DATASET}" \
     data.selected_task="${TASK}" \

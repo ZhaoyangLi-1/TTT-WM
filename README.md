@@ -97,17 +97,24 @@ torchrun \
 diffusion-policy action head. This is different from `train_dp.py`:
 
 - `train_dp.py` trains a standalone diffusion policy from image observations
-- `train.py` with `--config-name stage2_idm_config` trains the
-  Cosmos Stage 2 IDM by first predicting the next frame with Stage 1, then
-  feeding the frame pair into the original diffusion-policy image architecture
-  `[current frame, predicted next frame]`
+- `train.py` with `--config-name stage2_1_idm_config` (Stage 2.1 backbone
+  fine-tune) or `--config-name stage2_2_idm_config` (Stage 2.2 IDM head)
+  trains the Cosmos Stage 2 IDM by first predicting the next frame with
+  Stage 1, then feeding the frame pair into the original diffusion-policy
+  image architecture `[current frame, predicted next frame]`
 
 In this Stage 2 setup, the Stage 1 model is used only to predict
 `predicted_next_frame`. The diffusion action model then takes
 `(s_t, predicted_next_frame)` as an extra two-image observation and predicts
 the intermediate action sequence `a_{t:t+m-1}` with the original DP U-Net.
 
-`configs/stage2_idm_config.yaml` is the dedicated Stage 2 diffusion-policy config.
+Stage 2 has two sub-step configs:
+
+- `configs/stage2_1_idm_config.yaml` — Stage 2.1: fine-tune the Stage-1
+  backbone on a single held-out task. Requires `train.stage1_ckpt`.
+- `configs/stage2_2_idm_config.yaml` — Stage 2.2: freeze the Stage-2.1
+  backbone and train the diffusion-policy IDM action head. Requires
+  `train.stage2_1_ckpt`.
 
 Requirements:
 
@@ -115,40 +122,42 @@ Requirements:
 - provide a trained Stage 1 checkpoint via `train.stage1_ckpt`
 - set `data.frame_gap` to the number of intermediate action steps predicted by IDM
 
-Single-GPU example:
+Stage 2.1 single-GPU example:
 
 ```bash
 python train.py \
-  --config-name stage2_idm_config \
+  --config-name stage2_1_idm_config \
   train.stage1_ckpt=/path/to/stage1_checkpoint.pt \
   data.root=/path/to/libero_wm \
   data.frame_gap=4
 ```
 
-Multi-GPU example:
+Stage 2.1 multi-GPU example:
 
 ```bash
 torchrun \
   --nproc_per_node=4 \
   --master_port=29501 \
   train.py \
-  --config-name stage2_idm_config \
+  --config-name stage2_1_idm_config \
   train.stage1_ckpt=/path/to/stage1_checkpoint.pt \
   data.root=/path/to/libero_wm \
   data.frame_gap=4
 ```
 
-Common overrides:
+Stage 2.2 (after 2.1 finishes) — freeze the backbone and train the IDM head:
 
 ```bash
-python train.py \
-  --config-name stage2_idm_config \
-  train.stage1_ckpt=/path/to/stage1_checkpoint.pt \
+torchrun \
+  --nproc_per_node=4 \
+  --master_port=29501 \
+  train.py \
+  --config-name stage2_2_idm_config \
+  train.stage2_1_ckpt=/path/to/stage2_1_checkpoint.pt \
   data.root=/path/to/libero_wm \
   data.frame_gap=4 \
-  train.freeze_backbone=true \
-  train.idm_dp.num_train_timesteps=100 \
-  train.idm_dp.down_dims=[256,512,1024]
+  train.idm.num_train_timesteps=100 \
+  train.idm.down_dims=[256,512,1024]
 ```
 
 Run offline checkpoint evaluation:

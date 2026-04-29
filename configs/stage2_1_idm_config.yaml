@@ -69,41 +69,8 @@ train:
   stage: 2
   substep: "2.1"
   stage1_ckpt: ""
-  stage2_1_ckpt: ""
   find_unused_parameters: false
   ckpt_dir: ${hydra:runtime.output_dir}/checkpoints
-  idm:
-    # --- Stage 2.2 cached Stage-1 predictions (A1) ---
-    # When true, Stage 2.2 skips the frozen backbone's AR decode at training
-    # time and reads prebaked pred_frames from disk. Produce the cache with
-    # `scripts/prebake_stage1_pred.py --backbone-ckpt <stage2_1_ckpt> ...`.
-    # Binds to the backbone weights via SHA1 — mismatch will raise unless
-    # require_cache_sha1=false.
-    use_stage1_cache: false
-    stage1_cache_dir: ""
-    require_cache_sha1: true
-    horizon: 4
-    n_obs_steps: 1
-    n_action_steps: 4
-    num_train_timesteps: 100
-    num_inference_steps: 100
-    beta_start: 0.0001
-    beta_end: 0.02
-    beta_schedule: squaredcos_cap_v2
-    variance_type: fixed_small
-    clip_sample: true
-    prediction_type: epsilon
-    obs_as_global_cond: true
-    crop_shape: [112, 112]
-    obs_encoder_group_norm: true
-    eval_fixed_crop: true
-    stage1_micro_batch: null
-    diffusion_step_embed_dim: 128
-    down_dims: [512, 1024, 2048]
-    kernel_size: 5
-    n_groups: 8
-    cond_predict_scale: true
-
 
 wandb:
   enabled: true

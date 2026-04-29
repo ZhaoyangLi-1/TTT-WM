@@ -1,19 +1,23 @@
 """Stage 2 training for TTT-WM.
 
-Two sub-steps, both driven by Hydra config ``configs/stage2_idm_config.yaml``:
+Two sub-steps, each driven by its own Hydra config:
 
-* **2.1** — fine-tune the Stage-1 ``ARVideoPatchTransformer`` on the three
-  held-out test tasks (``/scr2/zhaoyang/libero_wm/meta/test_tasks.json``).
-  Episodes from those tasks are split into train/val at the episode level
-  with ``val_fraction=0.01`` (configurable via ``data.stage2_val_fraction``).
+* **2.1** — ``configs/stage2_1_idm_config.yaml``: fine-tune the Stage-1
+  ``ARVideoPatchTransformer`` on the three held-out test tasks
+  (``/scr2/zhaoyang/libero_wm/meta/test_tasks.json``). Episodes from those
+  tasks are split into train/val at the episode level with
+  ``val_fraction=0.01`` (configurable via ``data.stage2_val_fraction``).
   Training objective / inputs / outputs / hyper-parameters are identical to
   Stage 1 training.
 
-* **2.2** — freeze the Stage-2.1 backbone (``ARVideoPatchTransformer``) and
-  train **only** the IDM action head (``InverseDynamicsModelDP`` from
-  ``idm_model.py``, with ``freeze_stage1=True``).
+* **2.2** — ``configs/stage2_2_idm_config.yaml``: freeze the Stage-2.1
+  backbone (``ARVideoPatchTransformer``) and train **only** the IDM action
+  head (``InverseDynamicsModelDP`` from ``idm_model.py``, with
+  ``freeze_stage1=True``).
 
-Select the sub-step with ``train.substep=2.1`` (default) or ``train.substep=2.2``.
+Each config hardcodes ``train.substep`` to the matching value; pick the
+config via ``--config-name stage2_1_idm_config`` or
+``--config-name stage2_2_idm_config``.
 
 Additional config options:
 
@@ -746,7 +750,7 @@ class Stage2Part2Trainer(_Stage2Mixin, Trainer):
 # ---------------------------------------------------------------------------
 
 
-@hydra.main(config_path="configs", config_name="stage2_idm_config", version_base="1.3")
+@hydra.main(config_path="configs", config_name="stage2_1_idm_config", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     _apply_selected_task_overrides(cfg)
     OmegaConf.resolve(cfg)
