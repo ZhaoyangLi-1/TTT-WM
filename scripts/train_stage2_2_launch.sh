@@ -75,7 +75,7 @@ fi
 #    override so spaces and colons survive.
 echo
 echo "Launching Stage 2.2 torchrun on ${NGPU} GPUs..."
-exec torchrun \
+exec c \
     --nproc_per_node="${NGPU}" \
     --master_port="${MASTER_PORT}" \
     train_stage2.py \
