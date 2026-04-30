@@ -541,22 +541,22 @@ def _save_rollout_comparison_video(
 
 
 def _save_visualization_flow_gif(
-    ctx_frames: list[np.ndarray],
     gt_frames: list[np.ndarray],
     s1_frames: list[np.ndarray],
     s2_frames: list[np.ndarray],
     output_path: Path,
     fps: int = 4,
     image_scale: int = 2,
-    window_starts: Optional[list[int]] = None,
+    step_labels: Optional[list[str]] = None,
 ) -> None:
-    """Save an animated GIF with 4 side-by-side panels per frame:
-    Input (last ctx frame) | GT target | Stage 1 pred | Stage 2.1 pred.
+    """Save an animated GIF mirroring the rollout mp4 contents:
+    3 panels per frame — GT | Stage 1 pred | Stage 2.1 pred.
 
-    The GIF cycles through windows in temporal order, so the viewer sees how
-    each model's one-step-ahead prediction tracks GT across the episode.
+    Input frames are the same uint8 sequences used by
+    `_save_rollout_comparison_video`, so the GIF and mp4 are time-aligned
+    representations of the same AR rollout.
     """
-    n = min(len(ctx_frames), len(gt_frames), len(s1_frames), len(s2_frames))
+    n = min(len(gt_frames), len(s1_frames), len(s2_frames))
     if n == 0:
         return
 
@@ -569,38 +569,30 @@ def _save_visualization_flow_gif(
         )
         return np.asarray(pil)
 
-    ctx_s = [_scale(x) for x in ctx_frames[:n]]
-    gt_s  = [_scale(x) for x in gt_frames[:n]]
-    s1_s  = [_scale(x) for x in s1_frames[:n]]
-    s2_s  = [_scale(x) for x in s2_frames[:n]]
-    H, W = ctx_s[0].shape[:2]
+    gt_s = [_scale(x) for x in gt_frames[:n]]
+    s1_s = [_scale(x) for x in s1_frames[:n]]
+    s2_s = [_scale(x) for x in s2_frames[:n]]
+    H, W = gt_s[0].shape[:2]
     sep_w = max(4, 2 * int(image_scale))
     sep_v = np.full((H, sep_w, 3), 180, dtype=np.uint8)
 
     caption_h = max(18, 10 * int(image_scale))
-    full_w = W * 4 + 3 * sep_w
+    full_w = W * 3 + 2 * sep_w
     title_strip = Image.new("RGB", (full_w, caption_h), color=(255, 255, 255))
     tdraw = ImageDraw.Draw(title_strip)
-    panel_titles = [
-        ("Input",     (0, 0, 0)),
-        ("GT",        (0, 0, 0)),
-        ("Stage 1",   (0x1f, 0x77, 0xb4)),
-        ("Stage 2.1", (0x2c, 0xa0, 0x2c)),
-    ]
-    for i, (title, color) in enumerate(panel_titles):
-        tdraw.text((i * (W + sep_w) + 8, 2), title, fill=color)
+    tdraw.text((8,                      2), "GT",        fill=(0, 0, 0))
+    tdraw.text((W + sep_w + 8,          2), "Stage 1",   fill=(0x1f, 0x77, 0xb4))
+    tdraw.text((2 * (W + sep_w) + 8,    2), "Stage 2.1", fill=(0x2c, 0xa0, 0x2c))
     title_np = np.asarray(title_strip)
 
     pil_frames: list[Image.Image] = []
     for t in range(n):
-        row = np.concatenate(
-            [ctx_s[t], sep_v, gt_s[t], sep_v, s1_s[t], sep_v, s2_s[t]], axis=1,
-        )
+        row = np.concatenate([gt_s[t], sep_v, s1_s[t], sep_v, s2_s[t]], axis=1)
         full = np.concatenate([title_np, row], axis=0)
         img = Image.fromarray(full)
-        if window_starts is not None and t < len(window_starts):
+        if step_labels is not None and t < len(step_labels):
             ImageDraw.Draw(img).text(
-                (4, caption_h + 4), f"frame {window_starts[t]}",
+                (4, caption_h + 4), step_labels[t],
                 fill=(255, 255, 255),
             )
         pil_frames.append(img)
@@ -655,10 +647,8 @@ def main() -> None:
     )
     ap.add_argument("--skip-rollout-video", action="store_true",
                     help="Do not save the 3-column rollout comparison video.")
-    ap.add_argument("--n-flow-frames", type=int, default=64,
-                    help="Number of windows sampled into visualization_flow.gif.")
     ap.add_argument("--gif-fps", type=int, default=4,
-                    help="fps for visualization_flow.gif.")
+                    help="fps for visualization_flow.gif (rollout-mirroring).")
     ap.add_argument("--skip-flow-gif", action="store_true",
                     help="Do not save visualization_flow.gif.")
     args = ap.parse_args()
@@ -844,54 +834,44 @@ def main() -> None:
         out_dir / "quantitative" / "summary.png",
     )
 
-    # ── 5b. visualization_flow GIF (Input | GT | S1 | S2.1, animated) ──
-    # GIF starts from --rollout-start-frame so it lines up with the rollout
-    # mp4: same temporal anchor, only the prediction path differs (one-step
-    # generate vs multi-step AR).
+    # ── 5b. visualization_flow GIF (rollout: GT | S1 | S2.1, animated) ─
+    # Mirrors the rollout mp4 contents exactly (same start frame, same
+    # n_rollout_steps, same GT/pred frames). Only the container format
+    # differs — handy when GIF is preferred over mp4 (slack/web embeds).
     flow_gif_path: Optional[Path] = None
-    if not args.skip_flow_gif:
-        flow_start = max(0, min(int(rollout_start), total_windows - 1))
-        n_flow_avail = max(0, total_windows - flow_start)
-        n_flow = min(int(args.n_flow_frames), n_flow_avail)
-        if n_flow > 0:
-            flow_starts = (
-                [flow_start] if n_flow == 1
-                else np.linspace(flow_start, total_windows - 1, num=n_flow, dtype=int).tolist()
-            )
-            print(
-                f"\n── Building visualization_flow GIF "
-                f"(n={n_flow}, start={flow_start}) ────────────"
-            )
-            ctx_imgs, gt_imgs, s1_imgs, s2_imgs = [], [], [], []
-            for s in flow_starts:
-                ctx_t = torch.stack(frames[s:s + fin]).unsqueeze(0).to(device)
-                tgt_t = torch.stack(
-                    frames[s + target_offset:s + target_offset + fout]
-                ).unsqueeze(0).to(device)
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    p1 = model_s1.generate(ctx_t, goal=goal).float()
-                    p2 = model_s2.generate(ctx_t, goal=goal).float()
-                ctx_imgs.append(_to_uint8(ctx_t[0, -1:])[0])
-                gt_imgs.append(_to_uint8(tgt_t[0, :1])[0])
-                s1_imgs.append(_to_uint8(p1[0, :1])[0])
-                s2_imgs.append(_to_uint8(p2[0, :1])[0])
-            gif_name = (
-                "visualization_flow.gif"
-                if flow_start == 0
-                else f"visualization_flow_start{flow_start:04d}.gif"
-            )
-            flow_gif_path = out_dir / "quantitative" / gif_name
-            _save_visualization_flow_gif(
-                ctx_frames=ctx_imgs,
-                gt_frames=gt_imgs,
-                s1_frames=s1_imgs,
-                s2_frames=s2_imgs,
-                output_path=flow_gif_path,
-                fps=int(args.gif_fps),
-                image_scale=int(args.image_scale),
-                window_starts=[int(s) for s in flow_starts],
-            )
-            print(f"  saved → {flow_gif_path}")
+    if (
+        not args.skip_flow_gif
+        and roll_s1["n_steps"] > 0
+        and roll_s2["n_steps"] > 0
+    ):
+        n_gif = len(roll_s1["gt_frames"])
+        # Per-frame caption: step 0 is the starting context; step k>0 lands at
+        # raw frame rollout_start + k*frame_gap.
+        step_labels = [
+            f"start raw_frame={rollout_start}" if k == 0
+            else f"step {k}  raw_frame={rollout_start + k * frame_gap}"
+            for k in range(n_gif)
+        ]
+        gif_name = (
+            "visualization_flow.gif"
+            if rollout_start == 0
+            else f"visualization_flow_start{rollout_start:04d}.gif"
+        )
+        flow_gif_path = out_dir / "quantitative" / gif_name
+        print(
+            f"\n── Building visualization_flow GIF "
+            f"(rollout, n={n_gif}, start={rollout_start}) ──"
+        )
+        _save_visualization_flow_gif(
+            gt_frames=roll_s1["gt_frames"],
+            s1_frames=roll_s1["pred_frames"],
+            s2_frames=roll_s2["pred_frames"],
+            output_path=flow_gif_path,
+            fps=int(args.gif_fps),
+            image_scale=int(args.image_scale),
+            step_labels=step_labels,
+        )
+        print(f"  saved → {flow_gif_path}")
 
     # ── 6. metrics.json ────────────────────────────────────────────────
     metrics = {
