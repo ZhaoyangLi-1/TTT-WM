@@ -845,15 +845,23 @@ def main() -> None:
     )
 
     # ── 5b. visualization_flow GIF (Input | GT | S1 | S2.1, animated) ──
+    # GIF starts from --rollout-start-frame so it lines up with the rollout
+    # mp4: same temporal anchor, only the prediction path differs (one-step
+    # generate vs multi-step AR).
     flow_gif_path: Optional[Path] = None
     if not args.skip_flow_gif:
-        n_flow = min(int(args.n_flow_frames), total_windows)
+        flow_start = max(0, min(int(rollout_start), total_windows - 1))
+        n_flow_avail = max(0, total_windows - flow_start)
+        n_flow = min(int(args.n_flow_frames), n_flow_avail)
         if n_flow > 0:
             flow_starts = (
-                [0] if n_flow == 1
-                else np.linspace(0, total_windows - 1, num=n_flow, dtype=int).tolist()
+                [flow_start] if n_flow == 1
+                else np.linspace(flow_start, total_windows - 1, num=n_flow, dtype=int).tolist()
             )
-            print(f"\n── Building visualization_flow GIF (n={n_flow}) ────────────")
+            print(
+                f"\n── Building visualization_flow GIF "
+                f"(n={n_flow}, start={flow_start}) ────────────"
+            )
             ctx_imgs, gt_imgs, s1_imgs, s2_imgs = [], [], [], []
             for s in flow_starts:
                 ctx_t = torch.stack(frames[s:s + fin]).unsqueeze(0).to(device)
@@ -867,7 +875,12 @@ def main() -> None:
                 gt_imgs.append(_to_uint8(tgt_t[0, :1])[0])
                 s1_imgs.append(_to_uint8(p1[0, :1])[0])
                 s2_imgs.append(_to_uint8(p2[0, :1])[0])
-            flow_gif_path = out_dir / "quantitative" / "visualization_flow.gif"
+            gif_name = (
+                "visualization_flow.gif"
+                if flow_start == 0
+                else f"visualization_flow_start{flow_start:04d}.gif"
+            )
+            flow_gif_path = out_dir / "quantitative" / gif_name
             _save_visualization_flow_gif(
                 ctx_frames=ctx_imgs,
                 gt_frames=gt_imgs,
