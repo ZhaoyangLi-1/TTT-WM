@@ -22,7 +22,11 @@ Usage:
         --dataset /scr2/zhaoyang/libero_wm \\
         --task "KITCHEN_SCENE10: put the butter at the back in the top drawer of the cabinet and close it" \\
         --output-dir /scr2/zhaoyang/compare_s1_s21/KITCHEN_SCENE10 \\
+        [--episode-index 42] \\
         [--n-examples 4] [--n-rollout-steps 8] [--n-tf-windows 64]
+
+If --episode-index is omitted, the first episode matching --task in
+meta/episodes.jsonl is used.
 """
 from __future__ import annotations
 
@@ -124,68 +128,6 @@ def _find_episode_path(dataset_root: Path, task: str) -> tuple[int, Path, int]:
                 )
                 return ep, pq, int(rec["length"])
     raise SystemExit(f"No episode for task {task!r}")
-
-
-def _reconstruct_stage2_split(
-    dataset_root: Path,
-    task: str,
-    val_fraction: float,
-    seed: int,
-) -> tuple[list[int], list[int]]:
-    """Bit-identical reproduction of HeldoutTaskSplitDataset's episode split.
-
-    Mirrors the 5 lines inside train_stage2.HeldoutTaskSplitDataset.__init__
-    (see train_stage2.py:231-250):
-
-        all_eps = sorted(episodes_where_task == selected_task)
-        rng     = np.random.default_rng(seed)
-        shuffled = list(all_eps);  rng.shuffle(shuffled)
-        n_val   = max(1, round(len * val_fraction))  clamped to len-1
-        val_eps = shuffled[:n_val];  train_eps = shuffled[n_val:]
-
-    Returns (val_eps, train_eps) as sorted ascending episode-index lists,
-    identical to what Stage 2.1 training saw. Runs without loading any
-    parquet file — just reads meta/episodes.jsonl.
-    """
-    eps_for_task: list[int] = []
-    with (dataset_root / "meta" / "episodes.jsonl").open() as f:
-        for line in f:
-            rec = json.loads(line)
-            if (rec.get("tasks") or [None])[0] == task:
-                eps_for_task.append(int(rec["episode_index"]))
-    if not eps_for_task:
-        return [], []
-
-    all_eps = sorted(eps_for_task)
-    rng = np.random.default_rng(int(seed))
-    shuffled = list(all_eps)
-    rng.shuffle(shuffled)
-
-    if len(shuffled) > 1:
-        n_val = max(1, int(round(len(shuffled) * float(val_fraction))))
-        n_val = min(n_val, len(shuffled) - 1)
-    else:
-        n_val = 0
-
-    val_eps = sorted(shuffled[:n_val])
-    train_eps = sorted(shuffled[n_val:])
-    return val_eps, train_eps
-
-
-def _read_stage2_split_cfg(ckpt: dict) -> tuple[Optional[str], float, int]:
-    """Pull (selected_task, stage2_val_fraction, seed) out of a Stage 2.1 ckpt
-    so the val/train split can be reproduced bit-identically without needing
-    the user to remember the exact training-time hyperparameters.
-    """
-    saved = ckpt.get("cfg", {})
-    data = saved.get("data", {})
-    task = data.get("selected_task") or None
-    vfrac = float(data.get("stage2_val_fraction", 0.01))
-    # Seed can appear at top-level (cfg.seed) or inside training.
-    seed_val = saved.get("seed")
-    if seed_val is None:
-        seed_val = saved.get("training", {}).get("seed", 42)
-    return task, vfrac, int(seed_val)
 
 
 def _resolve_parquet_path(dataset_root: Path, episode_idx: int) -> Path:
@@ -532,147 +474,6 @@ def _plot_summary(
 
 
 # ---------------------------------------------------------------------------
-# Overlay: compare val-episode vs train-episode metrics in one figure
-# ---------------------------------------------------------------------------
-
-
-def _make_split_overlay(val_dir: Path, train_dir: Path, out_dir: Path) -> None:
-    """Load per-split metrics.json and produce a 2-panel overlay figure +
-    a small combined_metrics.json summarizing the train/val generalization gap.
-    """
-    def _load(d: Path) -> dict:
-        return json.loads((d / "metrics.json").read_text())
-    m_val = _load(val_dir)
-    m_tr  = _load(train_dir)
-
-    tf_val, tf_tr = m_val["teacher_forcing"], m_tr["teacher_forcing"]
-    ro_val, ro_tr = m_val["rollout"], m_tr["rollout"]
-
-    # ── Plot: 2 panels — TF per window; Rollout per step ──────────────
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.2), dpi=120)
-
-    # Teacher-forcing overlay
-    ax = axes[0]
-    if tf_val["n_windows"]:
-        ax.plot(tf_val["window_starts"], tf_val["stage1_mse_per_window"],
-                color="#1f77b4", linestyle="-",  linewidth=1.2,
-                label=f"S1 · val   (ep {m_val['episode_index']})")
-        ax.plot(tf_val["window_starts"], tf_val["stage2_1_mse_per_window"],
-                color="#2ca02c", linestyle="-",  linewidth=1.2,
-                label=f"S2.1 · val")
-    if tf_tr["n_windows"]:
-        ax.plot(tf_tr["window_starts"], tf_tr["stage1_mse_per_window"],
-                color="#1f77b4", linestyle="--", linewidth=1.2,
-                label=f"S1 · train (ep {m_tr['episode_index']})")
-        ax.plot(tf_tr["window_starts"], tf_tr["stage2_1_mse_per_window"],
-                color="#2ca02c", linestyle="--", linewidth=1.2,
-                label="S2.1 · train")
-    ax.set_xlabel("Window start frame")
-    ax.set_ylabel("Teacher-forcing MSE")
-    ax.set_title("Teacher-forcing MSE — val (solid) vs train (dashed)")
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="upper right", fontsize=8)
-
-    # Rollout overlay
-    ax = axes[1]
-    if ro_val["n_steps"]:
-        xs = np.arange(ro_val["n_steps"])
-        ax.plot(xs, ro_val["stage1_step_mse"],
-                color="#1f77b4", linestyle="-",  marker="o", markersize=3, linewidth=1.2,
-                label="S1 · val")
-        ax.plot(xs, ro_val["stage2_1_step_mse"],
-                color="#2ca02c", linestyle="-",  marker="o", markersize=3, linewidth=1.2,
-                label="S2.1 · val")
-    if ro_tr["n_steps"]:
-        xs = np.arange(ro_tr["n_steps"])
-        ax.plot(xs, ro_tr["stage1_step_mse"],
-                color="#1f77b4", linestyle="--", marker="s", markersize=3, linewidth=1.2,
-                label="S1 · train")
-        ax.plot(xs, ro_tr["stage2_1_step_mse"],
-                color="#2ca02c", linestyle="--", marker="s", markersize=3, linewidth=1.2,
-                label="S2.1 · train")
-    ax.set_xlabel("Rollout step")
-    ax.set_ylabel("MSE")
-    ax.set_title("Rollout MSE — val (solid/circle) vs train (dashed/square)")
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="lower right", fontsize=8)
-
-    fig.tight_layout()
-    fig.savefig(out_dir / "overlay.png", bbox_inches="tight")
-    plt.close(fig)
-
-    # ── combined_metrics.json — scalar summary of the generalization gap ─
-    def _pct_delta(old: float, new: float) -> float | None:
-        if old is None or new is None:
-            return None
-        old = float(old); new = float(new)
-        if old <= 0:
-            return None
-        return (old - new) / old * 100.0
-
-    tf_val_s1 = tf_val.get("stage1_mean_mse")
-    tf_val_s2 = tf_val.get("stage2_1_mean_mse")
-    tf_tr_s1  = tf_tr.get("stage1_mean_mse")
-    tf_tr_s2  = tf_tr.get("stage2_1_mean_mse")
-    ro_val_s1 = ro_val.get("stage1_mean_mse")
-    ro_val_s2 = ro_val.get("stage2_1_mean_mse")
-    ro_tr_s1  = ro_tr.get("stage1_mean_mse")
-    ro_tr_s2  = ro_tr.get("stage2_1_mean_mse")
-
-    combined = {
-        "task": m_val["task"],
-        "val_episode":   m_val["episode_index"],
-        "train_episode": m_tr["episode_index"],
-        "teacher_forcing_mean_mse": {
-            "val":   {"stage1": tf_val_s1, "stage2_1": tf_val_s2,
-                      "s2_1_improvement_pct": _pct_delta(tf_val_s1, tf_val_s2)},
-            "train": {"stage1": tf_tr_s1,  "stage2_1": tf_tr_s2,
-                      "s2_1_improvement_pct": _pct_delta(tf_tr_s1,  tf_tr_s2)},
-        },
-        "rollout_mean_mse": {
-            "val":   {"stage1": ro_val_s1, "stage2_1": ro_val_s2,
-                      "s2_1_improvement_pct": _pct_delta(ro_val_s1, ro_val_s2)},
-            "train": {"stage1": ro_tr_s1,  "stage2_1": ro_tr_s2,
-                      "s2_1_improvement_pct": _pct_delta(ro_tr_s1,  ro_tr_s2)},
-        },
-        "generalization_gap_pct": {
-            # Positive number = S2.1 improves train more than val = overfit-ish.
-            "teacher_forcing": (
-                None if None in (tf_val_s1, tf_val_s2, tf_tr_s1, tf_tr_s2)
-                else _pct_delta(tf_tr_s1, tf_tr_s2) - _pct_delta(tf_val_s1, tf_val_s2)
-            ),
-            "rollout": (
-                None if None in (ro_val_s1, ro_val_s2, ro_tr_s1, ro_tr_s2)
-                else _pct_delta(ro_tr_s1, ro_tr_s2) - _pct_delta(ro_val_s1, ro_val_s2)
-            ),
-        },
-    }
-    (out_dir / "combined_metrics.json").write_text(json.dumps(combined, indent=2))
-
-    # ── Pretty-print summary ───────────────────────────────────────────
-    print("\n── val vs train summary ────────────────────────────────────")
-    def _fmt(x):
-        return f"{x:.5f}" if isinstance(x, (int, float)) else "n/a"
-    def _fmtpct(x):
-        return f"{x:+.1f}%" if isinstance(x, (int, float)) else "n/a"
-    print(f"  Teacher-forcing mean MSE:")
-    print(f"    val   — S1={_fmt(tf_val_s1)}  S2.1={_fmt(tf_val_s2)}  "
-          f"(Δ={_fmtpct(_pct_delta(tf_val_s1, tf_val_s2))})")
-    print(f"    train — S1={_fmt(tf_tr_s1)}  S2.1={_fmt(tf_tr_s2)}  "
-          f"(Δ={_fmtpct(_pct_delta(tf_tr_s1, tf_tr_s2))})")
-    print(f"  Rollout mean MSE:")
-    print(f"    val   — S1={_fmt(ro_val_s1)}  S2.1={_fmt(ro_val_s2)}  "
-          f"(Δ={_fmtpct(_pct_delta(ro_val_s1, ro_val_s2))})")
-    print(f"    train — S1={_fmt(ro_tr_s1)}  S2.1={_fmt(ro_tr_s2)}  "
-          f"(Δ={_fmtpct(_pct_delta(ro_tr_s1, ro_tr_s2))})")
-    gap_tf = combined["generalization_gap_pct"]["teacher_forcing"]
-    gap_ro = combined["generalization_gap_pct"]["rollout"]
-    print(f"\n  Generalization gap (train improvement − val improvement):")
-    print(f"    TF      : {_fmtpct(gap_tf)}  (positive = overfit tendency)")
-    print(f"    Rollout : {_fmtpct(gap_ro)}")
-
-
-# ---------------------------------------------------------------------------
 # Rollout video (GT | Stage 1 | Stage 2.1 side-by-side)
 # ---------------------------------------------------------------------------
 
@@ -735,6 +536,87 @@ def _save_rollout_comparison_video(
 
 
 # ---------------------------------------------------------------------------
+# visualization_flow GIF (Input | GT | Stage 1 | Stage 2.1, animated)
+# ---------------------------------------------------------------------------
+
+
+def _save_visualization_flow_gif(
+    ctx_frames: list[np.ndarray],
+    gt_frames: list[np.ndarray],
+    s1_frames: list[np.ndarray],
+    s2_frames: list[np.ndarray],
+    output_path: Path,
+    fps: int = 4,
+    image_scale: int = 2,
+    window_starts: Optional[list[int]] = None,
+) -> None:
+    """Save an animated GIF with 4 side-by-side panels per frame:
+    Input (last ctx frame) | GT target | Stage 1 pred | Stage 2.1 pred.
+
+    The GIF cycles through windows in temporal order, so the viewer sees how
+    each model's one-step-ahead prediction tracks GT across the episode.
+    """
+    n = min(len(ctx_frames), len(gt_frames), len(s1_frames), len(s2_frames))
+    if n == 0:
+        return
+
+    def _scale(x: np.ndarray) -> np.ndarray:
+        if int(image_scale) <= 1:
+            return x
+        pil = Image.fromarray(x).resize(
+            (x.shape[1] * int(image_scale), x.shape[0] * int(image_scale)),
+            resample=Image.NEAREST,
+        )
+        return np.asarray(pil)
+
+    ctx_s = [_scale(x) for x in ctx_frames[:n]]
+    gt_s  = [_scale(x) for x in gt_frames[:n]]
+    s1_s  = [_scale(x) for x in s1_frames[:n]]
+    s2_s  = [_scale(x) for x in s2_frames[:n]]
+    H, W = ctx_s[0].shape[:2]
+    sep_w = max(4, 2 * int(image_scale))
+    sep_v = np.full((H, sep_w, 3), 180, dtype=np.uint8)
+
+    caption_h = max(18, 10 * int(image_scale))
+    full_w = W * 4 + 3 * sep_w
+    title_strip = Image.new("RGB", (full_w, caption_h), color=(255, 255, 255))
+    tdraw = ImageDraw.Draw(title_strip)
+    panel_titles = [
+        ("Input",     (0, 0, 0)),
+        ("GT",        (0, 0, 0)),
+        ("Stage 1",   (0x1f, 0x77, 0xb4)),
+        ("Stage 2.1", (0x2c, 0xa0, 0x2c)),
+    ]
+    for i, (title, color) in enumerate(panel_titles):
+        tdraw.text((i * (W + sep_w) + 8, 2), title, fill=color)
+    title_np = np.asarray(title_strip)
+
+    pil_frames: list[Image.Image] = []
+    for t in range(n):
+        row = np.concatenate(
+            [ctx_s[t], sep_v, gt_s[t], sep_v, s1_s[t], sep_v, s2_s[t]], axis=1,
+        )
+        full = np.concatenate([title_np, row], axis=0)
+        img = Image.fromarray(full)
+        if window_starts is not None and t < len(window_starts):
+            ImageDraw.Draw(img).text(
+                (4, caption_h + 4), f"frame {window_starts[t]}",
+                fill=(255, 255, 255),
+            )
+        pil_frames.append(img)
+
+    duration_ms = max(1, int(1000 / max(int(fps), 1)))
+    pil_frames[0].save(
+        output_path,
+        save_all=True,
+        append_images=pil_frames[1:],
+        duration=duration_ms,
+        loop=0,
+        optimize=False,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -751,40 +633,11 @@ def main() -> None:
     ap.add_argument("--n-rollout-steps", type=int, default=50)
     ap.add_argument("--n-tf-windows", type=int, default=64,
                     help="Windows sampled for teacher-forcing MSE sweep.")
-    ap.add_argument("--episode-index", type=int, default=-1,
-                    help="Explicit episode index (overrides --split).")
     ap.add_argument(
-        "--split", choices=("val", "train", "both", "first-match"), default="val",
+        "--episode-index", type=int, default=-1,
         help=(
-            "Which episode to evaluate on. 'val' (default) reproduces Stage "
-            "2.1 training's val/train split from the ckpt cfg and uses the "
-            "first val episode. 'train' uses the first train episode. "
-            "'both' runs the full pipeline TWICE — once on val, once on train "
-            "— saving to <output-dir>/val and <output-dir>/train, plus a "
-            "<output-dir>/val_vs_train/overlay.png combining all 4 curves. "
-            "'first-match' = original behavior (first matching in episodes.jsonl)."
-        ),
-    )
-    ap.add_argument(
-        "--val-fraction", type=float, default=-1.0,
-        help=(
-            "Override stage2_val_fraction for split reconstruction "
-            "(default: read from Stage 2.1 ckpt cfg)."
-        ),
-    )
-    ap.add_argument(
-        "--split-seed", type=int, default=-1,
-        help=(
-            "Override seed for split reconstruction "
-            "(default: read from Stage 2.1 ckpt cfg)."
-        ),
-    )
-    ap.add_argument(
-        "--verify-split", action="store_true",
-        help=(
-            "Print the reconstructed Stage 2.1 val/train episode lists and "
-            "exit without running any evaluation. Use this to sanity-check "
-            "that the split matches what training actually saw."
+            "Episode index to evaluate on. If omitted (-1), the first episode "
+            "matching --task in meta/episodes.jsonl is used."
         ),
     )
     ap.add_argument("--image-scale", type=int, default=2,
@@ -802,6 +655,12 @@ def main() -> None:
     )
     ap.add_argument("--skip-rollout-video", action="store_true",
                     help="Do not save the 3-column rollout comparison video.")
+    ap.add_argument("--n-flow-frames", type=int, default=64,
+                    help="Number of windows sampled into visualization_flow.gif.")
+    ap.add_argument("--gif-fps", type=int, default=4,
+                    help="fps for visualization_flow.gif.")
+    ap.add_argument("--skip-flow-gif", action="store_true",
+                    help="Do not save visualization_flow.gif.")
     args = ap.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -815,7 +674,7 @@ def main() -> None:
     print("\n── Loading Stage 1 model ───────────────────────────────────")
     model_s1, cfg_s1, ckpt_s1 = _load_model(args.stage1_ckpt, device)
     print("\n── Loading Stage 2.1 model ─────────────────────────────────")
-    model_s2, cfg_s2, ckpt_s2 = _load_model(args.stage2_1_ckpt, device)
+    model_s2, cfg_s2, _ = _load_model(args.stage2_1_ckpt, device)
 
     # Both ckpts should share the same patch/frame config for a fair comparison.
     for attr in ("resolution", "patch_size", "frames_in", "frames_out"):
@@ -829,107 +688,18 @@ def main() -> None:
     print(f"\nShared cfg: res={cfg.resolution} patch={cfg.patch_size} "
           f"fin={cfg.frames_in} fout={cfg.frames_out} gap={frame_gap}")
 
-    # ── Reconstruct Stage 2.1's train/val split from the ckpt cfg ──────
-    # This matches train_stage2.HeldoutTaskSplitDataset bit-identically.
+    # ── Pick the episode to evaluate on ────────────────────────────────
     dataset_root = Path(args.dataset)
-    ckpt_task, ckpt_vfrac, ckpt_seed = _read_stage2_split_cfg(ckpt_s2)
-    vfrac = args.val_fraction if args.val_fraction >= 0 else ckpt_vfrac
-    seed = args.split_seed if args.split_seed >= 0 else ckpt_seed
-    if ckpt_task and ckpt_task != args.task:
-        print(
-            f"\n[warn] --task='{args.task}' differs from Stage 2.1 ckpt's "
-            f"data.selected_task='{ckpt_task}'. Using --task for the split "
-            f"reconstruction; the ckpt's backbone was trained on the other. "
-            f"If this is intentional, ignore; otherwise pass the matching --task."
-        )
-    val_eps, train_eps = _reconstruct_stage2_split(
-        dataset_root, args.task, val_fraction=vfrac, seed=seed,
-    )
-    print("\n── Reconstructed Stage 2.1 split ───────────────────────────")
-    print(f"  task          : {args.task}")
-    print(f"  val_fraction  : {vfrac}")
-    print(f"  seed          : {seed}")
-    print(f"  total episodes: {len(val_eps) + len(train_eps)}")
-    print(f"  val   ({len(val_eps)}): {val_eps}")
-    print(f"  train ({len(train_eps)}): "
-          f"{train_eps[:6]}{' …' if len(train_eps) > 6 else ''}")
-
-    if args.verify_split:
-        print("\n--verify-split was set; exiting without running evaluation.")
-        return
-
-    # ── --split both: run twice (val + train) and overlay the results ──
-    if args.split == "both":
-        if not val_eps:
-            raise SystemExit("Cannot run --split both: reconstructed val set is empty.")
-        if not train_eps:
-            raise SystemExit("Cannot run --split both: reconstructed train set is empty.")
-        import subprocess
-        sub_dirs: dict[str, Path] = {}
-        for sub_split in ("val", "train"):
-            sub_out = out_dir / sub_split
-            # Re-exec this script with --split <sub_split> and a sub output-dir.
-            new_args = [sys.executable, sys.argv[0]]
-            skip_next = False
-            for tok in sys.argv[1:]:
-                if skip_next:
-                    skip_next = False
-                    continue
-                if tok in ("--split", "--output-dir"):
-                    skip_next = True
-                    continue
-                if tok.startswith("--split=") or tok.startswith("--output-dir="):
-                    continue
-                new_args.append(tok)
-            new_args += ["--split", sub_split, "--output-dir", str(sub_out)]
-            print(f"\n=== Sub-run: --split {sub_split} → {sub_out} ===")
-            subprocess.run(new_args, check=True)
-            sub_dirs[sub_split] = sub_out
-
-        # Aggregate: load both metrics.json, make an overlay figure.
-        overlay_dir = out_dir / "val_vs_train"
-        overlay_dir.mkdir(parents=True, exist_ok=True)
-        _make_split_overlay(sub_dirs["val"], sub_dirs["train"], overlay_dir)
-
-        print(f"\nAll outputs under: {out_dir.resolve()}")
-        print(f"  val  : {sub_dirs['val'].resolve()}")
-        print(f"  train: {sub_dirs['train'].resolve()}")
-        print(f"  overlay: {overlay_dir.resolve()}")
-        return
-
-    # Choose which episode to evaluate on.
     if args.episode_index >= 0:
         ep_idx = int(args.episode_index)
         source_label = "manual"
-    elif args.split == "val":
-        if not val_eps:
-            raise SystemExit(
-                "Stage 2.1 split has no val episodes (val_fraction × n_eps < 1). "
-                "Use --split train or --episode-index ..."
-            )
-        ep_idx = val_eps[0]
-        source_label = "stage2.1-val"
-    elif args.split == "train":
-        if not train_eps:
-            raise SystemExit("Reconstructed split has no train episodes.")
-        ep_idx = train_eps[0]
-        source_label = "stage2.1-train"
-    else:  # "first-match"
+    else:
         ep_idx, _, _ = _find_episode_path(dataset_root, args.task)
         source_label = "first-match"
 
     pq = _resolve_parquet_path(dataset_root, ep_idx)
-
-    # Tag the chosen episode with its role in the split (for logging + JSON).
-    if ep_idx in val_eps:
-        episode_role = "val"
-    elif ep_idx in train_eps:
-        episode_role = "train"
-    else:
-        episode_role = "unknown"  # e.g. --episode-index pointing elsewhere
-
     print(f"\nTask        : {args.task}")
-    print(f"Chosen ep   : {ep_idx}  ({source_label}, role={episode_role})")
+    print(f"Chosen ep   : {ep_idx}  ({source_label})")
     print(f"Parquet     : {pq.name}")
     frames = _load_frames(pq, cfg.resolution)
     print(f"Loaded      : {len(frames)} frames at {cfg.resolution}x{cfg.resolution}")
@@ -1074,6 +844,42 @@ def main() -> None:
         out_dir / "quantitative" / "summary.png",
     )
 
+    # ── 5b. visualization_flow GIF (Input | GT | S1 | S2.1, animated) ──
+    flow_gif_path: Optional[Path] = None
+    if not args.skip_flow_gif:
+        n_flow = min(int(args.n_flow_frames), total_windows)
+        if n_flow > 0:
+            flow_starts = (
+                [0] if n_flow == 1
+                else np.linspace(0, total_windows - 1, num=n_flow, dtype=int).tolist()
+            )
+            print(f"\n── Building visualization_flow GIF (n={n_flow}) ────────────")
+            ctx_imgs, gt_imgs, s1_imgs, s2_imgs = [], [], [], []
+            for s in flow_starts:
+                ctx_t = torch.stack(frames[s:s + fin]).unsqueeze(0).to(device)
+                tgt_t = torch.stack(
+                    frames[s + target_offset:s + target_offset + fout]
+                ).unsqueeze(0).to(device)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    p1 = model_s1.generate(ctx_t, goal=goal).float()
+                    p2 = model_s2.generate(ctx_t, goal=goal).float()
+                ctx_imgs.append(_to_uint8(ctx_t[0, -1:])[0])
+                gt_imgs.append(_to_uint8(tgt_t[0, :1])[0])
+                s1_imgs.append(_to_uint8(p1[0, :1])[0])
+                s2_imgs.append(_to_uint8(p2[0, :1])[0])
+            flow_gif_path = out_dir / "quantitative" / "visualization_flow.gif"
+            _save_visualization_flow_gif(
+                ctx_frames=ctx_imgs,
+                gt_frames=gt_imgs,
+                s1_frames=s1_imgs,
+                s2_frames=s2_imgs,
+                output_path=flow_gif_path,
+                fps=int(args.gif_fps),
+                image_scale=int(args.image_scale),
+                window_starts=[int(s) for s in flow_starts],
+            )
+            print(f"  saved → {flow_gif_path}")
+
     # ── 6. metrics.json ────────────────────────────────────────────────
     metrics = {
         "task": args.task,
@@ -1082,15 +888,7 @@ def main() -> None:
         "frame_gap": int(frame_gap),
         "stage1_ckpt": str(Path(args.stage1_ckpt).resolve()),
         "stage2_1_ckpt": str(Path(args.stage2_1_ckpt).resolve()),
-        "stage2_1_split": {
-            "source": source_label,
-            "role_of_chosen_episode": episode_role,
-            "val_fraction": float(vfrac),
-            "seed": int(seed),
-            "ckpt_selected_task": ckpt_task,
-            "val_episodes": val_eps,
-            "train_episodes": train_eps,
-        },
+        "episode_source": source_label,
         "examples": example_rows,
         "teacher_forcing": {
             "n_windows": int(tf_s1["n_windows"]),
@@ -1117,6 +915,7 @@ def main() -> None:
             "quantitative_dir": str((out_dir / "quantitative").resolve()),
             "summary_png": str((out_dir / "quantitative" / "summary.png").resolve()),
             "rollout_video": str(rollout_video_path.resolve()) if rollout_video_path else None,
+            "visualization_flow_gif": str(flow_gif_path.resolve()) if flow_gif_path else None,
         },
     }
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
