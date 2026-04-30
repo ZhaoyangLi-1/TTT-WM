@@ -259,6 +259,55 @@ def _run_rollout(
 
 
 @torch.no_grad()
+def _run_single_step_sweep(
+    model: ARVideoPatchTransformer,
+    frames: list[torch.Tensor],
+    cfg: ARPatchConfig,
+    frame_gap: int,
+    device: torch.device,
+    *,
+    stride: int = 1,
+) -> dict:
+    """For each input frame i (stride-spaced), independently generate one
+    step ahead: ctx = GT frames[i] -> pred ~ frames[i + frame_gap].
+
+    Unlike `_run_rollout`, every step starts from a clean GT context (no
+    autoregression). Sweeps i = 0, stride, 2*stride, ..., as long as
+    i + frame_gap <= len(frames) - 1, so every prediction has a GT target.
+    """
+    if cfg.frames_in != 1 or cfg.frames_out != 1:
+        raise NotImplementedError("Single-step sweep only supports fin=fout=1.")
+    last = len(frames) - 1 - frame_gap
+    if last < 0:
+        return {
+            "n_steps": 0, "step_mse": [],
+            "gt_frames": [], "pred_frames": [],
+            "input_indices": [], "target_indices": [],
+        }
+    indices = list(range(0, last + 1, max(int(stride), 1)))
+    goal = frames[-1].unsqueeze(0).to(device)
+    gt_u8: list[np.ndarray] = []
+    pred_u8: list[np.ndarray] = []
+    step_mse: list[float] = []
+    for i in indices:
+        ctx = frames[i].unsqueeze(0).unsqueeze(0).to(device)
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            pred = model.generate(ctx, goal=goal)
+        gt = frames[i + frame_gap].unsqueeze(0).unsqueeze(0).to(device)
+        step_mse.append(float(F.mse_loss(pred.float(), gt.float()).item()))
+        gt_u8.append(_to_uint8(gt[0])[0])
+        pred_u8.append(_to_uint8(pred[0])[0])
+    return {
+        "n_steps": len(indices),
+        "step_mse": step_mse,
+        "gt_frames": gt_u8,
+        "pred_frames": pred_u8,
+        "input_indices": indices,
+        "target_indices": [i + frame_gap for i in indices],
+    }
+
+
+@torch.no_grad()
 def _per_row_gen_vs_forward_drift(
     model: ARVideoPatchTransformer,
     frames: list[torch.Tensor],
@@ -651,6 +700,13 @@ def main() -> None:
                     help="fps for visualization_flow.gif (rollout-mirroring).")
     ap.add_argument("--skip-flow-gif", action="store_true",
                     help="Do not save visualization_flow.gif.")
+    ap.add_argument("--singlestep-stride", type=int, default=1,
+                    help="Stride for single-step sweep (1 = every frame: "
+                         "i -> i+gap, i+1 -> i+1+gap, ...).")
+    ap.add_argument("--singlestep-fps", type=int, default=6,
+                    help="fps for the single-step sweep mp4.")
+    ap.add_argument("--skip-singlestep-video", action="store_true",
+                    help="Do not save singlestep_comparison.mp4.")
     args = ap.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -812,6 +868,40 @@ def main() -> None:
             image_scale=int(args.image_scale),
         )
 
+    # ── 3c. Single-step sweep (each frame independently: i -> i+gap) ───
+    singlestep_video_path: Optional[Path] = None
+    ss_s1: dict = {"n_steps": 0, "step_mse": [], "input_indices": [], "target_indices": []}
+    ss_s2: dict = {"n_steps": 0, "step_mse": [], "input_indices": [], "target_indices": []}
+    if not args.skip_singlestep_video:
+        print("\n── Single-step sweep (S1 vs S2.1, ctx = GT each step) ──")
+        ss_s1 = _run_single_step_sweep(
+            model_s1, frames, cfg, frame_gap, device,
+            stride=int(args.singlestep_stride),
+        )
+        ss_s2 = _run_single_step_sweep(
+            model_s2, frames, cfg, frame_gap, device,
+            stride=int(args.singlestep_stride),
+        )
+        if ss_s1["n_steps"] > 0 and ss_s2["n_steps"] > 0:
+            print(f"  S1   : n={ss_s1['n_steps']:>3d}  "
+                  f"mean MSE = {np.mean(ss_s1['step_mse']):.5f}")
+            print(f"  S2.1 : n={ss_s2['n_steps']:>3d}  "
+                  f"mean MSE = {np.mean(ss_s2['step_mse']):.5f}")
+            singlestep_video_path = (
+                out_dir / "quantitative" / "singlestep_comparison.mp4"
+            )
+            _save_rollout_comparison_video(
+                gt_frames=ss_s1["gt_frames"],
+                s1_frames=ss_s1["pred_frames"],
+                s2_frames=ss_s2["pred_frames"],
+                output_path=singlestep_video_path,
+                fps=int(args.singlestep_fps),
+                image_scale=int(args.image_scale),
+            )
+            print(f"  saved -> {singlestep_video_path}")
+        else:
+            print("  episode too short for any (i, i+gap) pair; skipping.")
+
     # ── 4. Per-row generate-vs-forward drift ───────────────────────────
     print("\n── Per-row gen-vs-forward drift (first window) ─────────────")
     drift_s1 = _per_row_gen_vs_forward_drift(
@@ -903,12 +993,23 @@ def main() -> None:
             "stage1": drift_s1.tolist(),
             "stage2_1": drift_s2.tolist(),
         },
+        "single_step": {
+            "stride": int(args.singlestep_stride),
+            "n_steps": int(ss_s1["n_steps"]),
+            "input_indices": ss_s1["input_indices"],
+            "target_indices": ss_s1["target_indices"],
+            "stage1_step_mse": ss_s1["step_mse"],
+            "stage2_1_step_mse": ss_s2["step_mse"],
+            "stage1_mean_mse": float(np.mean(ss_s1["step_mse"])) if ss_s1["step_mse"] else None,
+            "stage2_1_mean_mse": float(np.mean(ss_s2["step_mse"])) if ss_s2["step_mse"] else None,
+        },
         "output_paths": {
             "examples_dir": str((out_dir / "examples").resolve()),
             "quantitative_dir": str((out_dir / "quantitative").resolve()),
             "summary_png": str((out_dir / "quantitative" / "summary.png").resolve()),
             "rollout_video": str(rollout_video_path.resolve()) if rollout_video_path else None,
             "visualization_flow_gif": str(flow_gif_path.resolve()) if flow_gif_path else None,
+            "singlestep_video": str(singlestep_video_path.resolve()) if singlestep_video_path else None,
         },
     }
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
