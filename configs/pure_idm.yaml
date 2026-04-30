@@ -15,10 +15,6 @@ data:
   task_dirname: ${task_slug:${data.selected_task}}
   test_tasks: []  # auto-populated from data.selected_task by train_pure.py
   stage2_val_fraction: 0.02
-  num_workers: 8
-  pin_memory: true
-  persistent_workers: true
-  prefetch_factor: 4‘
   loader_timeout: 600
 
 ema:

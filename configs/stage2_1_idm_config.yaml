@@ -14,10 +14,6 @@ data:
   task_tag: ""                                      # auto-populated from data.selected_task
   test_tasks: []                                    # auto-populated from data.selected_task
   stage2_val_fraction: 0.01
-  num_workers: 8
-  pin_memory: true
-  persistent_workers: true
-  prefetch_factor: 4
   loader_timeout: 600
 
 ema:
