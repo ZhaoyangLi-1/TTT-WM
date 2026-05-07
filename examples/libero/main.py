@@ -29,7 +29,7 @@ class Args:
     #################################################################################################################
     host: str = "0.0.0.0"
     port: int = 8000
-    resize_size: int | None = None
+    resize_size: Optional[int] = None
     replan_steps: int = 5
     rotate_images_180: bool = False
 
@@ -48,8 +48,8 @@ class Args:
     video_out_path: str = "data/libero/videos"  # Path to save videos
     save_videos: bool = True
     save_preprocessed_video: bool = False
-    summary_out_path: str | None = "data/libero/results"
-    run_name: str | None = None
+    summary_out_path: Optional[str] = "data/libero/results"
+    run_name: Optional[str] = None
 
     # Path to a JSON file mapping each task to a goal frame image path.
     # Used by Stage 2.2 (goal-conditioned IDM) and Pure IDM (goal acts as next_image).
@@ -57,23 +57,23 @@ class Args:
     #   {"<task_description>": "<path>", "<task_id>": "<path>", ...}
     #   [{"task_id": int, "task_description": str, "image_path": str}, ...]
     # Relative paths are resolved against the JSON file's parent directory.
-    goal_frames_json: str | None = None
+    goal_frames_json: Optional[str] = None
 
     # Path to libero_wm's meta/test_tasks.json. When provided, the rollout loop
     # only evaluates the tasks listed in this file (matched against the LIBERO
     # benchmark by `source_task` == bddl filename without .bddl). Goal frames
     # for those tasks are extracted from libero_wm parquet data (see
     # libero_wm_root). When set, --goal-frames-json is ignored.
-    test_tasks_json: str | None = None
+    test_tasks_json: Optional[str] = None
 
     # Root of the libero_wm dataset (containing `meta/` and `data/chunk-XXX/`).
     # Required when test_tasks_json is set so we can read episodes.jsonl and
     # the corresponding parquet file to extract the goal frame.
-    libero_wm_root: str | None = None
+    libero_wm_root: Optional[str] = None
 
     # Directory under which extracted goal frame PNGs are cached. Defaults to
     # `<libero_wm_root>/derived_goal_frames/` when test_tasks_json is in use.
-    goal_frames_cache_dir: str | None = None
+    goal_frames_cache_dir: Optional[str] = None
 
     seed: int = 7  # Random Seed (for reproducibility)
 
