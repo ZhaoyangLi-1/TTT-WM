@@ -4,10 +4,23 @@ import functools
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 
 from client import array_typing as at
+
+
+def convert_to_uint8(img):
+    """Convert a float image in [0, 1] to uint8. Pass through if already uint8."""
+    if isinstance(img, np.ndarray):
+        if np.issubdtype(img.dtype, np.floating):
+            return (255.0 * np.clip(img, 0.0, 1.0)).astype(np.uint8)
+        return img
+    arr = np.asarray(img)
+    if np.issubdtype(arr.dtype, np.floating):
+        arr = (255.0 * np.clip(arr, 0.0, 1.0)).astype(np.uint8)
+    return arr
 
 
 @functools.partial(jax.jit, static_argnums=(1, 2, 3))
