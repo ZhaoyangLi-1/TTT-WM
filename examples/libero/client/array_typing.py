@@ -33,7 +33,7 @@ UInt8 = Any
 
 # --- Core type aliases -----------------------------------------------------
 Array = Union[jax.Array, torch.Tensor]
-KeyArrayLike: TypeAlias = jax.typing.ArrayLike
+KeyArrayLike: TypeAlias = Any
 Params: TypeAlias = Any
 
 T = TypeVar("T")
