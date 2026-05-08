@@ -1,0 +1,11 @@
+{
+  "_comment": "Fair eval: held-out val 6098 used as goal for every online episode.",
+  "records": [
+    {
+      "source_task": "KITCHEN_SCENE2_put_the_middle_black_bowl_on_the_plate",
+      "task": "KITCHEN_SCENE2: put the middle black bowl on the plate",
+      "goal_episode_index": 6098,
+      "test_episode_indices": [6098]
+    }
+  ]
+}

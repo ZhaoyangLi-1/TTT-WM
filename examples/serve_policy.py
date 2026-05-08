@@ -463,18 +463,42 @@ class Stage2PolicyAdapter(BasePolicyAdapter):
         return goal.unsqueeze(0).to(self._device)
 
     def infer(self, obs: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
+        t0 = time.monotonic()
         context = self._build_context(obs, session)
         goal = self._build_goal(obs, session)
-        start = time.monotonic()
-        with torch.no_grad():
-            pred_frames, pred_actions = self._model.generate(context, goal=goal)
-        infer_ms = (time.monotonic() - start) * 1000.0
+        if self._device.type == "cuda":
+            torch.cuda.synchronize()
+        t_pre = time.monotonic()
+
+        autocast_device = "cuda" if self._device.type == "cuda" else "cpu"
+        with torch.no_grad(), torch.autocast(device_type=autocast_device, dtype=torch.bfloat16):
+            pred_frames = self._model._predict_next_frame(context, goal=goal)
+            if self._device.type == "cuda":
+                torch.cuda.synchronize()
+            t_stage1 = time.monotonic()
+            obs_dict = self._model._build_obs_dict(context, pred_frames)
+            pred_actions = self._model.policy.predict_action(obs_dict)["action"]
+        if self._device.type == "cuda":
+            torch.cuda.synchronize()
+        t_policy = time.monotonic()
+
         actions = pred_actions[0].detach().cpu().float().numpy()
         if actions.ndim == 1:
             actions = actions[None, :]
+        infer_ms = (t_policy - t_pre) * 1000.0
+        timings = {
+            "pre_ms":     (t_pre     - t0)      * 1000.0,
+            "stage1_ms": (t_stage1   - t_pre)   * 1000.0,
+            "policy_ms": (t_policy   - t_stage1) * 1000.0,
+            "infer_ms":   infer_ms,
+        }
+        logger.info(
+            "stage2 timing: pre=%.0fms stage1=%.0fms policy=%.0fms",
+            timings["pre_ms"], timings["stage1_ms"], timings["policy_ms"],
+        )
         response: dict[str, Any] = {
             "actions": actions,
-            "policy_timing": {"infer_ms": infer_ms},
+            "policy_timing": timings,
         }
         if pred_frames is not None and pred_frames.shape[1] > 0:
             response["predicted_image"] = world_tensor_to_uint8_image(pred_frames[0, 0])
@@ -535,7 +559,8 @@ class PureIDMPolicyAdapter(BasePolicyAdapter):
         target = next_frame.unsqueeze(0).unsqueeze(0).to(self._device)
 
         start = time.monotonic()
-        with torch.no_grad():
+        autocast_device = "cuda" if self._device.type == "cuda" else "cpu"
+        with torch.no_grad(), torch.autocast(device_type=autocast_device, dtype=torch.bfloat16):
             _, pred_actions = self._model.generate(context, target_frames=target)
         infer_ms = (time.monotonic() - start) * 1000.0
         actions = pred_actions[0].detach().cpu().float().numpy()
@@ -614,15 +639,21 @@ def load_stage2_adapter(
     model_cfg = build_world_model_cfg(cfg)
     raw_wm = ARVideoPatchTransformer(model_cfg).to(device)
     maybe_configure_diffusion_policy(diffusion_policy_src)
+    idm_kwargs = dict(cfg["train"].get("idm", {}) or {})
+    for k in ("use_stage1_cache", "stage1_cache_dir", "require_cache_sha1"):
+        idm_kwargs.pop(k, None)
     model = InverseDynamicsModelDP(
         raw_wm,
         n_actions=int(cfg["data"].get("frame_gap", 1)),
         freeze_stage1=True,
-        **cfg["train"].get("idm", {}),
+        **idm_kwargs,
     ).to(device)
 
     state_dict, weight_source = select_stage_weights(ckpt, use_ema=use_ema)
     load_state_dict_flexible(model, state_dict)
+    # DictOfTensorMixin._load_from_state_dict rebuilds the policy's normalizer
+    # ParameterDict on CPU during load; move everything back to ``device``.
+    model.to(device)
     model.eval()
     logger.info("Loaded stage2 checkpoint %s (%s)", checkpoint_path, weight_source)
     return Stage2PolicyAdapter(
@@ -653,6 +684,7 @@ def load_pure_idm_adapter(
 
     state_dict, weight_source = select_stage_weights(ckpt, use_ema=use_ema)
     load_state_dict_flexible(model, state_dict)
+    model.to(device)
     model.eval()
     logger.info("Loaded pure_idm checkpoint %s (%s)", checkpoint_path, weight_source)
     return PureIDMPolicyAdapter(
@@ -762,16 +794,24 @@ class WebsocketPolicyServer:
         await websocket.send(packer.pack(self._adapter.metadata))
 
         prev_total_time = None
+        infer_count = 0
         while True:
             try:
                 start_time = time.monotonic()
                 obs = unpackb(await websocket.recv())
+                infer_start = time.monotonic()
                 result = self._adapter.infer(obs, session)
+                infer_ms = (time.monotonic() - infer_start) * 1000.0
                 result.setdefault("server_timing", {})
                 if prev_total_time is not None:
                     result["server_timing"]["prev_total_ms"] = prev_total_time * 1000.0
                 await websocket.send(packer.pack(result))
                 prev_total_time = time.monotonic() - start_time
+                infer_count += 1
+                logger.info(
+                    "infer #%d ok (infer_ms=%.0f, total_ms=%.0f)",
+                    infer_count, infer_ms, prev_total_time * 1000.0,
+                )
             except websockets.ConnectionClosed:
                 logger.info("Connection from %s closed", websocket.remote_address)
                 break
@@ -817,6 +857,63 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional diffusion_policy source checkout for DP-based checkpoints.",
     )
+    parser.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=None,
+        help=(
+            "Override the diffusion policy's denoising step count at inference. "
+            "Lower values (e.g. 16-32) trade a small fidelity loss for big latency wins."
+        ),
+    )
+    parser.add_argument(
+        "--use-ddim",
+        action="store_true",
+        help=(
+            "Replace the policy's DDPM sampler with a DDIMScheduler that reuses the "
+            "same betas/alphas. Pairs naturally with --num-inference-steps to take far "
+            "fewer denoising steps at inference without retraining."
+        ),
+    )
+    parser.add_argument(
+        "--stage1-frames-out",
+        type=int,
+        default=None,
+        help=(
+            "Override the world-model's frames_out at inference. The IDM head only "
+            "consumes pred_frames[:, :1] (see idm_model._build_obs_dict), so setting "
+            "this to 1 preserves the first predicted frame's value (AR is causal) but "
+            "skips ~75%% of stage1 decode steps when training used frames_out=4."
+        ),
+    )
+    parser.add_argument(
+        "--compile-policy",
+        action="store_true",
+        help=(
+            "Wrap the diffusion U-Net with torch.compile (mode='reduce-overhead') to "
+            "reduce per-step overhead. First inference incurs a 30-60s trace; steady "
+            "state is typically 30-50%% faster."
+        ),
+    )
+    parser.add_argument(
+        "--compile-stage1",
+        action="store_true",
+        help=(
+            "Also compile the stage1 world model. Higher risk of trace failure due to "
+            "flash_attn / dynamic AR loop control flow; usually a smaller win since "
+            "stage1 is not the bottleneck."
+        ),
+    )
+    parser.add_argument(
+        "--stage1-bf16",
+        action="store_true",
+        help=(
+            "Cast stage1 weights to bf16 directly (instead of relying on autocast). "
+            "Removes per-op dtype check/cast overhead in the AR decode loop; only "
+            "safe on Ampere+ GPUs (A10 / A100 / H100 / RTX 30+/40+) which support "
+            "bf16 natively."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -830,6 +927,132 @@ def main() -> None:
         use_ema=bool(args.use_ema),
         diffusion_policy_src=args.diffusion_policy_src,
     )
+    def _iter_diffusion_policies():
+        # Stage2 / Pure IDM keep the diffusion policy under adapter._model.policy.
+        owner = getattr(adapter, "_model", None)
+        nested = getattr(owner, "policy", None) if owner is not None else None
+        if nested is not None:
+            yield nested
+        # DP adapter exposes the policy directly as adapter._policy.
+        dp_policy = getattr(adapter, "_policy", None)
+        if dp_policy is not None:
+            yield dp_policy
+
+    if args.use_ddim:
+        try:
+            from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+        except ImportError as exc:
+            raise ImportError(
+                "--use-ddim requires `diffusers`; install via `pip install diffusers`."
+            ) from exc
+        swapped = 0
+        for policy in _iter_diffusion_policies():
+            ddpm = getattr(policy, "noise_scheduler", None)
+            if ddpm is None:
+                continue
+            cfg_d = dict(ddpm.config)
+            ddim = DDIMScheduler(
+                num_train_timesteps=cfg_d.get("num_train_timesteps", 100),
+                beta_start=cfg_d.get("beta_start", 0.0001),
+                beta_end=cfg_d.get("beta_end", 0.02),
+                beta_schedule=cfg_d.get("beta_schedule", "squaredcos_cap_v2"),
+                clip_sample=cfg_d.get("clip_sample", True),
+                prediction_type=cfg_d.get("prediction_type", "epsilon"),
+                set_alpha_to_one=True,
+                steps_offset=0,
+            )
+            policy.noise_scheduler = ddim
+            swapped += 1
+        if swapped:
+            logger.info("Swapped %d policy scheduler(s) to DDIM.", swapped)
+        else:
+            logger.warning("--use-ddim requested but no policy with noise_scheduler found.")
+
+    if args.num_inference_steps is not None:
+        steps = int(args.num_inference_steps)
+        applied = 0
+        for policy in _iter_diffusion_policies():
+            if hasattr(policy, "num_inference_steps"):
+                policy.num_inference_steps = steps
+                applied += 1
+        if applied:
+            logger.info("Overriding num_inference_steps to %d on %d policy(ies).", steps, applied)
+        else:
+            logger.warning(
+                "num_inference_steps override requested but no compatible policy found."
+            )
+
+    if args.stage1_frames_out is not None:
+        new_fout = int(args.stage1_frames_out)
+        owner = getattr(adapter, "_model", None)
+        stage1 = getattr(owner, "stage1", None) if owner is not None else None
+        cfg = getattr(stage1, "cfg", None) if stage1 is not None else None
+        if cfg is not None and hasattr(cfg, "frames_out"):
+            old_fout = int(cfg.frames_out)
+            cfg.frames_out = new_fout
+            logger.info(
+                "Stage1 frames_out override: %d -> %d (saves ~%.0f%% of AR decode steps).",
+                old_fout, new_fout, max(0.0, (1 - new_fout / max(old_fout, 1)) * 100),
+            )
+        else:
+            logger.warning(
+                "--stage1-frames-out requested but adapter has no model.stage1.cfg.frames_out."
+            )
+
+    if args.compile_policy:
+        compiled = 0
+        for policy in _iter_diffusion_policies():
+            unet = getattr(policy, "model", None)
+            if unet is None:
+                continue
+            try:
+                # ``default`` (inductor JIT) instead of ``reduce-overhead``: the
+                # diffusion U-Net forward receives ``timesteps`` as a CPU scalar
+                # tensor (it does ``timesteps.to(sample.device)`` internally),
+                # which makes CUDA Graph capture fall back to eager. ``default``
+                # still kernel-fuses without requiring all-cuda inputs.
+                policy.model = torch.compile(
+                    unet,
+                    mode="default",
+                    fullgraph=False,
+                    dynamic=False,
+                )
+                compiled += 1
+            except Exception as exc:
+                logger.warning("torch.compile(policy.model) failed: %s", exc)
+        if compiled:
+            logger.info(
+                "torch.compile applied to %d diffusion U-Net(s); first infer will be slow (warmup).",
+                compiled,
+            )
+        else:
+            logger.warning("--compile-policy requested but no policy.model attribute found.")
+
+    if args.compile_stage1:
+        owner = getattr(adapter, "_model", None)
+        stage1 = getattr(owner, "stage1", None) if owner is not None else None
+        if stage1 is not None:
+            try:
+                owner.stage1 = torch.compile(
+                    stage1,
+                    mode="reduce-overhead",
+                    fullgraph=False,
+                    dynamic=False,
+                )
+                logger.info("torch.compile applied to stage1; first infer will be slow.")
+            except Exception as exc:
+                logger.warning("torch.compile(stage1) failed: %s", exc)
+        else:
+            logger.warning("--compile-stage1 requested but adapter has no model.stage1.")
+
+    if args.stage1_bf16:
+        owner = getattr(adapter, "_model", None)
+        stage1 = getattr(owner, "stage1", None) if owner is not None else None
+        if stage1 is not None:
+            stage1.to(torch.bfloat16)
+            logger.info("Cast stage1 weights to bf16.")
+        else:
+            logger.warning("--stage1-bf16 requested but adapter has no model.stage1.")
     logger.info("Serving %s on ws://%s:%s", adapter.metadata.get("model_type"), args.host, args.port)
     server = WebsocketPolicyServer(adapter, host=args.host, port=args.port)
     server.serve_forever()

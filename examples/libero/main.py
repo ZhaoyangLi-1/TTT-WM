@@ -5,7 +5,7 @@ import logging
 import math
 import pathlib
 from datetime import datetime
-from typing import Optional
+from typing import Dict, List, Optional
 
 import imageio
 from libero.libero import benchmark
@@ -41,6 +41,7 @@ class Args:
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
+    max_steps: Optional[int] = None  # Override the per-suite max episode length
 
     #################################################################################################################
     # Utils
@@ -109,6 +110,11 @@ def eval_libero(args: Args) -> None:
         max_steps = 400  # longest training demo has 373 steps
     else:
         raise ValueError(f"Unknown task suite: {args.task_suite_name}")
+    if args.max_steps is not None:
+        logging.info(
+            f"Overriding max_steps for {args.task_suite_name}: {max_steps} -> {args.max_steps}"
+        )
+        max_steps = int(args.max_steps)
 
     client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
     server_metadata = client.get_server_metadata()
@@ -219,20 +225,86 @@ def eval_libero(args: Args) -> None:
         # Initialize LIBERO environment and task description
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
 
-        # Resolve and pre-process this task's goal frame.
-        task_goal_image: Optional[np.ndarray] = None
-        if test_record is not None and goal_send_key is not None:
+        # Resolve and pre-process this task's goal frame(s). Each online episode
+        # gets its own goal image keyed by episode_idx so callers can align the
+        # goal scene to the LIBERO init state actually used for that rollout.
+        task_goal_images: Dict[int, np.ndarray] = {}
+        # Per-episode source path of the goal PNG (preserved at original orientation)
+        # so we can dump a 228x228 copy alongside the rollout video without re-running
+        # the orientation flip applied for the policy server.
+        task_goal_source_paths: Dict[int, pathlib.Path] = {}
+        # Which libero_wm episode_index was used for each online episode_idx (when
+        # the goal came from libero_wm). Powers split bookkeeping in summary.json.
+        task_goal_episode_indices: Dict[int, int] = {}
+        # Set of libero_wm episode_indices that should be labelled as the held-out
+        # test/val split in summary.json.
+        test_episode_indices: set = set(
+            int(x) for x in (test_record.get("test_episode_indices") if test_record else None) or []
+        )
+        # When goal_align_by_init_proprio is True, defer goal selection to the
+        # episode loop (after env.set_init_state) so we can pick the libero_wm
+        # demo whose t=0 proprio is closest to the online rollout's t=0 proprio
+        # — this matches the training distribution where (context, goal) come
+        # from the same trajectory's start and end.
+        align_by_proprio = bool(
+            test_record.get("goal_align_by_init_proprio", False) if test_record else False
+        )
+        candidate_goal_eps: List[int] = []
+        candidate_goal_proprios: Dict[int, np.ndarray] = {}
+        # Cache for loaded goal images / source paths during runtime selection.
+        runtime_goal_image_cache: Dict[int, np.ndarray] = {}
+        runtime_goal_path_cache: Dict[int, pathlib.Path] = {}
+        if align_by_proprio and test_record is not None and goal_send_key is not None:
             assert wm_root is not None and cache_dir is not None
-            goal_path = _ensure_goal_frame_from_libero_wm(
-                wm_root=wm_root,
-                cache_dir=cache_dir,
-                source_task=test_record["source_task"],
-                full_task=test_record["task"],
-            )
-            task_goal_image = _load_and_preprocess_image(goal_path, resize_size, args.rotate_images_180)
+            built = _build_goal_set(test_record)
+            if built is None:
+                raise ValueError(
+                    "goal_align_by_init_proprio=true requires goal_set_episode_range "
+                    "(and optional goal_set_excluded_episodes) to define the candidate pool."
+                )
+            candidate_goal_eps = list(built)
+            for ep in candidate_goal_eps:
+                candidate_goal_proprios[ep] = _load_first_proprio_from_libero_wm(
+                    wm_root, ep
+                )
             logging.info(
-                f"Loaded goal frame for task_id={task_id} ({bddl_stem}) from {goal_path}"
+                f"goal_align_by_init_proprio=True: candidate pool size={len(candidate_goal_eps)} "
+                f"(task_id={task_id})"
             )
+
+        if align_by_proprio:
+            # Skip the per-episode_idx preload — selection happens after set_init_state.
+            pass
+        elif test_record is not None and goal_send_key is not None:
+            assert wm_root is not None and cache_dir is not None
+            ep_to_image: Dict[int, np.ndarray] = {}
+            ep_to_path: Dict[int, pathlib.Path] = {}
+            for episode_idx in range(args.num_trials_per_task):
+                ep_for_goal = _resolve_goal_episode_index(test_record, episode_idx)
+                if ep_for_goal is None:
+                    continue
+                cached_image = ep_to_image.get(ep_for_goal)
+                if cached_image is None:
+                    goal_path = _ensure_goal_frame_from_libero_wm(
+                        wm_root=wm_root,
+                        cache_dir=cache_dir,
+                        source_task=test_record["source_task"],
+                        full_task=test_record["task"],
+                        episode_index_override=ep_for_goal,
+                    )
+                    cached_image = _load_and_preprocess_image(
+                        goal_path, resize_size, args.rotate_images_180
+                    )
+                    ep_to_image[ep_for_goal] = cached_image
+                    ep_to_path[ep_for_goal] = goal_path
+                    split_tag = "test" if ep_for_goal in test_episode_indices else "train"
+                    logging.info(
+                        f"Loaded goal frame for task_id={task_id} ({bddl_stem}) "
+                        f"libero_wm_episode={ep_for_goal} ({split_tag}) from {goal_path}"
+                    )
+                task_goal_images[episode_idx] = cached_image
+                task_goal_source_paths[episode_idx] = ep_to_path[ep_for_goal]
+                task_goal_episode_indices[episode_idx] = int(ep_for_goal)
         elif goal_send_key is not None and goal_index:
             goal_path = _lookup_goal_path(goal_index, task_id, task_description)
             if goal_path is None:
@@ -244,7 +316,12 @@ def eval_libero(args: Args) -> None:
                     raise FileNotFoundError(msg)
                 logging.warning(msg + " Falling back to goal=None for this task.")
             else:
-                task_goal_image = _load_and_preprocess_image(goal_path, resize_size, args.rotate_images_180)
+                shared_image = _load_and_preprocess_image(
+                    goal_path, resize_size, args.rotate_images_180
+                )
+                for episode_idx in range(args.num_trials_per_task):
+                    task_goal_images[episode_idx] = shared_image
+                    task_goal_source_paths[episode_idx] = goal_path
                 logging.info(f"Loaded goal frame for task {task_id} from {goal_path}")
 
         # Start episodes
@@ -252,12 +329,59 @@ def eval_libero(args: Args) -> None:
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
             logging.info(f"\nTask: {task_description}")
 
+            task_goal_image: Optional[np.ndarray] = task_goal_images.get(episode_idx)
+
             # Reset environment
             env.reset()
             action_plan = collections.deque()
 
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
+
+            # Runtime goal selection: pick the libero_wm demo whose t=0 proprio
+            # is closest to the env's t=0 proprio after set_init_state. This
+            # produces a (rollout-start, goal-end) pair drawn from approximately
+            # the same init state, restoring the training distribution where
+            # context and goal share a trajectory.
+            if (
+                align_by_proprio
+                and goal_send_key is not None
+                and candidate_goal_eps
+            ):
+                online_proprio = _online_proprio_from_obs(obs)
+                ep_for_goal = min(
+                    candidate_goal_eps,
+                    key=lambda e: float(np.linalg.norm(
+                        online_proprio - candidate_goal_proprios[e]
+                    )),
+                )
+                cached_image = runtime_goal_image_cache.get(ep_for_goal)
+                if cached_image is None:
+                    goal_path = _ensure_goal_frame_from_libero_wm(
+                        wm_root=wm_root,
+                        cache_dir=cache_dir,
+                        source_task=test_record["source_task"],
+                        full_task=test_record["task"],
+                        episode_index_override=ep_for_goal,
+                    )
+                    cached_image = _load_and_preprocess_image(
+                        goal_path, resize_size, args.rotate_images_180
+                    )
+                    runtime_goal_image_cache[ep_for_goal] = cached_image
+                    runtime_goal_path_cache[ep_for_goal] = goal_path
+                task_goal_image = cached_image
+                task_goal_images[episode_idx] = cached_image
+                task_goal_source_paths[episode_idx] = runtime_goal_path_cache[ep_for_goal]
+                task_goal_episode_indices[episode_idx] = int(ep_for_goal)
+                proprio_l2 = float(np.linalg.norm(
+                    online_proprio - candidate_goal_proprios[ep_for_goal]
+                ))
+                split_tag = "test" if ep_for_goal in test_episode_indices else "train"
+                logging.info(
+                    f"[align_by_proprio] task_id={task_id} ({bddl_stem}) "
+                    f"online_ep={episode_idx} → libero_wm_ep={ep_for_goal} "
+                    f"({split_tag}, proprio_l2={proprio_l2:.4f})"
+                )
 
             # Setup
             t = 0
@@ -355,13 +479,25 @@ def eval_libero(args: Args) -> None:
                 "reward": float(reward),
                 "steps_executed": int(t),
             }
+            ep_for_goal = task_goal_episode_indices.get(episode_idx)
+            if ep_for_goal is not None:
+                episode_record["goal_libero_wm_episode_index"] = int(ep_for_goal)
+                episode_record["goal_split"] = (
+                    "test" if int(ep_for_goal) in test_episode_indices else "train"
+                )
 
             if args.save_videos and replay_images:
                 video_path = video_root / f"task_{task_id:03d}_episode_{episode_idx:03d}_{suffix}.mp4"
+                rendered_frames = []
+                for frame in replay_images:
+                    arr = np.ascontiguousarray(np.asarray(frame)[::-1, ::-1])
+                    pil = Image.fromarray(arr).resize((228, 228), Image.BILINEAR)
+                    rendered_frames.append(np.asarray(pil))
                 imageio.mimwrite(
                     video_path,
-                    [np.asarray(x) for x in replay_images],
+                    rendered_frames,
                     fps=10,
+                    macro_block_size=1,
                 )
                 episode_record["video_path"] = str(video_path)
 
@@ -375,6 +511,25 @@ def eval_libero(args: Args) -> None:
                     fps=10,
                 )
                 episode_record["policy_input_video_path"] = str(input_video_path)
+
+            # Dump the per-episode goal frame as a 228x228 PNG next to the video.
+            # We re-load from the cached source PNG and rotate 180 degrees so the
+            # saved goal sits in the same orientation as the rollout video, making
+            # visual A/B pairing of "asked goal" vs "actually reached" trivial.
+            if args.save_videos and episode_idx in task_goal_source_paths:
+                goal_src_path = task_goal_source_paths[episode_idx]
+                goal_png_path = (
+                    video_root / f"task_{task_id:03d}_episode_{episode_idx:03d}_{suffix}_goal.png"
+                )
+                with Image.open(goal_src_path) as goal_img:
+                    goal_img = (
+                        goal_img.convert("RGB")
+                        .transpose(Image.ROTATE_180)
+                        .resize((228, 228), Image.BILINEAR)
+                    )
+                    goal_img.save(goal_png_path)
+                episode_record["goal_image_path"] = str(goal_png_path)
+                episode_record["goal_source_path"] = str(goal_src_path)
 
             episode_records.append(episode_record)
 
@@ -462,31 +617,157 @@ def _load_test_tasks_filter(json_path: str) -> dict:
     return filt
 
 
+def _build_goal_set(test_record: dict) -> Optional[List[int]]:
+    """Materialise the ``goal_set_episode_range`` + ``goal_set_excluded_episodes``
+    schema into an explicit list of libero_wm episode indices.
+
+    Returns ``None`` if the record does not use this schema. Otherwise the
+    returned list contains every integer in the inclusive range, minus any
+    excluded indices, sorted ascending. Use this to mirror "training set goal
+    frames excluding validation" without listing all 49 indices by hand.
+    """
+    rng = test_record.get("goal_set_episode_range")
+    if rng is None:
+        return None
+    if not (isinstance(rng, (list, tuple)) and len(rng) == 2):
+        raise ValueError(
+            f"goal_set_episode_range must be [start, end] (inclusive), got {rng!r}"
+        )
+    start, end = int(rng[0]), int(rng[1])
+    if end < start:
+        raise ValueError(
+            f"goal_set_episode_range end={end} must be >= start={start}"
+        )
+    excluded = {
+        int(e) for e in (test_record.get("goal_set_excluded_episodes") or [])
+    }
+    return [i for i in range(start, end + 1) if i not in excluded]
+
+
+def _resolve_goal_episode_index(test_record: dict, episode_idx: int) -> Optional[int]:
+    """Pick the libero_wm episode_index whose terminal frame should serve as the
+    goal for online ``episode_idx``. Schema priority (highest first):
+
+    1. ``goal_set_episode_range`` + optional ``goal_set_excluded_episodes``: builds
+       a goal set covering ``[start, end]`` minus excluded indices, then maps
+       ``episode_idx`` onto the set deterministically via modulo. Use this for
+       "training-set goal frames excluding validation": set range to the full
+       50-episode block and list the val index in excluded.
+    2. ``goal_episode_indices``: an explicit list of libero_wm episode indices,
+       one per online episode. ``goal_episode_indices[episode_idx]`` is used.
+    3. ``goal_episode_index_base``: an integer; resolved to ``base + episode_idx``.
+       Use when libero_wm episodes for this task are stored consecutively in the
+       same order as LIBERO benchmark ``initial_states[0..49]`` and you do NOT
+       need to skip the val episode.
+    4. ``goal_episode_index``: a single integer; same goal frame for every
+       online episode (legacy / smoke-test behaviour).
+    """
+    goal_set = _build_goal_set(test_record)
+    if goal_set is not None:
+        if not goal_set:
+            raise ValueError(
+                "goal_set_episode_range produced an empty goal set after "
+                "applying goal_set_excluded_episodes."
+            )
+        return int(goal_set[episode_idx % len(goal_set)])
+    indices = test_record.get("goal_episode_indices")
+    if isinstance(indices, list) and indices:
+        if episode_idx >= len(indices):
+            raise ValueError(
+                f"goal_episode_indices has {len(indices)} items but online "
+                f"episode_idx={episode_idx} was requested. Either extend the list "
+                f"or lower --num-trials-per-task."
+            )
+        return int(indices[episode_idx])
+    base = test_record.get("goal_episode_index_base")
+    if base is not None:
+        return int(base) + int(episode_idx)
+    single = test_record.get("goal_episode_index")
+    if single is not None:
+        return int(single)
+    return None
+
+
+def _load_first_proprio_from_libero_wm(
+    wm_root: pathlib.Path, ep_index: int
+) -> np.ndarray:
+    """Read the t=0 ``state`` row of ``episode_<ep_index>.parquet``. libero_wm's
+    state schema is the 8-dim concatenation of [eef_pos(3), eef_axis_angle(3),
+    gripper_qpos(2)] — exactly what main.py constructs from the LIBERO env at
+    runtime — so this vector can be compared 1-to-1 to the online proprio.
+    """
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError(
+            "pyarrow is required to extract first proprio from libero_wm parquet."
+        ) from exc
+
+    chunk = ep_index // 1000
+    parquet_path = (
+        wm_root / "data" / f"chunk-{chunk:03d}" / f"episode_{ep_index:06d}.parquet"
+    )
+    if not parquet_path.is_file():
+        raise FileNotFoundError(f"libero_wm parquet not found: {parquet_path}")
+    state_rows = (
+        pq.ParquetFile(str(parquet_path))
+        .read(columns=["state"])
+        .column("state")
+        .to_pylist()
+    )
+    if not state_rows:
+        raise ValueError(f"libero_wm parquet has no state rows: {parquet_path}")
+    return np.asarray(state_rows[0], dtype=np.float64)
+
+
+def _online_proprio_from_obs(obs: dict) -> np.ndarray:
+    """Build the same 8-dim proprio used by main.py's ``observation/state``."""
+    return np.concatenate(
+        (
+            np.asarray(obs["robot0_eef_pos"], dtype=np.float64),
+            _quat2axisangle(np.asarray(obs["robot0_eef_quat"], dtype=np.float64)),
+            np.asarray(obs["robot0_gripper_qpos"], dtype=np.float64),
+        )
+    )
+
+
 def _ensure_goal_frame_from_libero_wm(
     wm_root: pathlib.Path,
     cache_dir: pathlib.Path,
     source_task: str,
     full_task: str,
+    *,
+    episode_index_override: Optional[int] = None,
 ) -> pathlib.Path:
     """Return a path to the goal-frame PNG for `source_task`, extracting from
-    libero_wm parquet data if not already cached."""
-    cache_path = cache_dir / f"{source_task}.png"
+    libero_wm parquet data if not already cached.
+
+    When ``episode_index_override`` is provided (e.g. a held-out validation
+    episode the policy never saw during training), that exact episode is used
+    instead of the first ``full_task``-matching record in episodes.jsonl.
+    """
+    if episode_index_override is not None:
+        episode_index = int(episode_index_override)
+        cache_path = cache_dir / f"{source_task}__episode_{episode_index:06d}.png"
+    else:
+        cache_path = cache_dir / f"{source_task}.png"
     if cache_path.is_file():
         return cache_path
 
-    eps_path = wm_root / "meta" / "episodes.jsonl"
-    episode_index = None
-    with open(eps_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            if full_task in (rec.get("tasks") or []):
-                episode_index = int(rec["episode_index"])
-                break
-    if episode_index is None:
-        raise ValueError(f"No episode in {eps_path} matches task: {full_task!r}")
+    if episode_index_override is None:
+        eps_path = wm_root / "meta" / "episodes.jsonl"
+        episode_index = None
+        with open(eps_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                if full_task in (rec.get("tasks") or []):
+                    episode_index = int(rec["episode_index"])
+                    break
+        if episode_index is None:
+            raise ValueError(f"No episode in {eps_path} matches task: {full_task!r}")
 
     try:
         import pyarrow.parquet as pq

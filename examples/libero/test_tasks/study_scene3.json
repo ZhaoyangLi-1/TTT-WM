@@ -1,0 +1,11 @@
+{
+  "_comment": "Fair eval: held-out val 6148 used as goal for every online episode.",
+  "records": [
+    {
+      "source_task": "STUDY_SCENE3_pick_up_the_book_and_place_it_in_the_front_compartment_of_the_caddy",
+      "task": "STUDY_SCENE3: pick up the book and place it in the front compartment of the caddy",
+      "goal_episode_index": 6148,
+      "test_episode_indices": [6148]
+    }
+  ]
+}

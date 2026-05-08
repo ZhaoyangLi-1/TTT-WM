@@ -1,0 +1,13 @@
+{
+  "_comment": "Diagnostic: aligned train-only goal pool (49 episodes; val 6148 excluded). At runtime, each online episode's goal is the libero_wm demo whose t=0 proprio is closest to the LIBERO init_state used. (online start, goal end) thus come from approximately the same trajectory — matching training. NOTE: goal frames are still from training set, so success rate here is a leakage upper bound, not a fair number.",
+  "records": [
+    {
+      "source_task": "STUDY_SCENE3_pick_up_the_book_and_place_it_in_the_front_compartment_of_the_caddy",
+      "task": "STUDY_SCENE3: pick up the book and place it in the front compartment of the caddy",
+      "goal_set_episode_range": [6143, 6192],
+      "goal_set_excluded_episodes": [6148],
+      "goal_align_by_init_proprio": true,
+      "test_episode_indices": [6148]
+    }
+  ]
+}

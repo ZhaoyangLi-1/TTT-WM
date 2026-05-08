@@ -1,0 +1,11 @@
+{
+  "_comment": "Full goal set = KITCHEN_SCENE10 all 50 libero_wm episodes (49 train + 1 val 6048). val 6048 sits at offset 5 within [6043..6092]. Use --num-trials-per-task 50 to cover the full split. summary.json will tag the val episode with goal_split='test'.",
+  "records": [
+    {
+      "source_task": "KITCHEN_SCENE10_put_the_butter_at_the_back_in_the_top_drawer_of_the_cabinet_and_close_it",
+      "task": "KITCHEN_SCENE10: put the butter at the back in the top drawer of the cabinet and close it",
+      "goal_set_episode_range": [6043, 6092],
+      "test_episode_indices": [6048]
+    }
+  ]
+}

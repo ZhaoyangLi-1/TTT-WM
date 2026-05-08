@@ -1,0 +1,13 @@
+{
+  "_comment": "Diagnostic: aligned train-only goal pool (49 episodes; val 6048 excluded). At runtime, each online episode's goal is the libero_wm demo whose t=0 proprio is closest to the LIBERO init_state used. (online start, goal end) thus come from approximately the same trajectory — matching training. NOTE: goal frames are still from training set, so success rate here is a leakage upper bound, not a fair number.",
+  "records": [
+    {
+      "source_task": "KITCHEN_SCENE10_put_the_butter_at_the_back_in_the_top_drawer_of_the_cabinet_and_close_it",
+      "task": "KITCHEN_SCENE10: put the butter at the back in the top drawer of the cabinet and close it",
+      "goal_set_episode_range": [6043, 6092],
+      "goal_set_excluded_episodes": [6048],
+      "goal_align_by_init_proprio": true,
+      "test_episode_indices": [6048]
+    }
+  ]
+}
