@@ -159,11 +159,11 @@ task:
     #   gripper       = raw_action[t, -1]
     # NOTE: when changing this flag (or shape_meta.action), delete
     #       ${dataset_root}/meta/normalizer_cache.pt before re-running.
-    abs_action: true
-    rotation_rep: rotation_6d
-    state_key: state
-    state_pos_slice: [0, 3]
-    state_rot_slice: [3, 6]
+    abs_action: false
+    # rotation_rep: rotation_6d
+    # state_key: state
+    # state_pos_slice: [0, 3]
+    # state_rot_slice: [3, 6]
     # Per-obs slice into source columns referenced via obs_key_mapping.
     # `state` is 8D = ee_pos(3) + ee_axis_angle(3) + gripper_qpos(2).
     obs_slices:
