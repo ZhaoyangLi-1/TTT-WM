@@ -190,16 +190,55 @@ class TrainDiffusionWorkspace(BaseWorkspace):
             val_dataset = dataset.get_validation_dataset()
             val_dataloader = self._build_dataloader(val_dataset, cfg.val_dataloader)
 
-            # Try to load cached normalizer from disk
-            normalizer_cache_path = Path(dataset.root) / "meta" / "normalizer_cache.pt"
+            # Try to load cached normalizer from disk. Key the cache path by
+            # action_dim so 7D (delta) and 10D (abs+rot6d) caches don't collide
+            # — this prevented a hard-to-debug `shape '[-1, 7]' is invalid for
+            # input of size N` crash at compute_loss after toggling abs_action.
+            action_dim = int(dataset.action_shape[0])
+            meta_dir = Path(dataset.root) / "meta"
+            meta_dir.mkdir(parents=True, exist_ok=True)
+            normalizer_cache_path = meta_dir / f"normalizer_cache_act{action_dim}.pt"
+            legacy_cache_path = meta_dir / "normalizer_cache.pt"
             normalizer = None
             if self.is_main or self.world_size == 1:
+                cache_to_load: Path | None = None
                 if normalizer_cache_path.is_file():
-                    print(f"Loading cached normalizer from {normalizer_cache_path} ...")
+                    cache_to_load = normalizer_cache_path
+                elif legacy_cache_path.is_file():
+                    # Tolerate the legacy unkeyed path for back-compat, but
+                    # only if its action scale matches the current action_dim.
+                    try:
+                        state = torch.load(legacy_cache_path, map_location="cpu")
+                        legacy_scale = state.get("action", {}).get("scale", None)
+                        if legacy_scale is not None and legacy_scale.numel() == action_dim:
+                            cache_to_load = legacy_cache_path
+                        else:
+                            print(
+                                f"Ignoring stale normalizer cache at {legacy_cache_path}: "
+                                f"scale shape {tuple(legacy_scale.shape) if legacy_scale is not None else None} "
+                                f"does not match current action_dim={action_dim}."
+                            )
+                    except Exception as exc:
+                        print(f"Ignoring unreadable legacy normalizer cache {legacy_cache_path}: {exc}")
+
+                if cache_to_load is not None:
+                    print(f"Loading cached normalizer from {cache_to_load} ...")
                     normalizer = copy.deepcopy(self.model.normalizer)
-                    normalizer.load_state_dict(torch.load(normalizer_cache_path, map_location="cpu"))
-                    print("Cached normalizer loaded.")
-                else:
+                    normalizer.load_state_dict(torch.load(cache_to_load, map_location="cpu"))
+                    # Defensive shape check: if a stale cache slipped through
+                    # (e.g. user pre-staged a wrong-dim file), rebuild instead
+                    # of crashing deep inside compute_loss.
+                    cached_scale = normalizer["action"].params_dict["scale"]
+                    if cached_scale.numel() != action_dim:
+                        print(
+                            f"Cached normalizer action dim {cached_scale.numel()} != dataset action_dim "
+                            f"{action_dim}; rebuilding."
+                        )
+                        normalizer = None
+                    else:
+                        print("Cached normalizer loaded.")
+
+                if normalizer is None:
                     print("Building dataset normalizer (this reads all parquet files, may be slow)...")
                     normalizer = dataset.get_normalizer()
                     torch.save(normalizer.state_dict(), normalizer_cache_path)

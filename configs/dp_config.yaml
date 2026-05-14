@@ -88,7 +88,7 @@ training:
   resume_path: null
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 100
+  num_epochs: 300
   gradient_accumulate_every: 1
   grad_clip: 1.0
   use_ema: true   # gates the `ema:` block above; default True if omitted
@@ -161,7 +161,7 @@ checkpoint:
 
 logging:
   enabled: true
-  project: TTT-WM-diffusion
+  project: TTT-WM-diffusion-V4
   mode: online
   resume: false
   name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${data.selected_task}
