@@ -51,7 +51,7 @@ policy:
   num_inference_steps: 100
   obs_as_global_cond: ${obs_as_global_cond}
 
-  crop_shape: [112, 112]
+  crop_shape: [114, 114]
   obs_encoder_group_norm: true
   eval_fixed_crop: true
 
