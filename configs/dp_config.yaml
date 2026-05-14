@@ -18,7 +18,7 @@ obs_as_global_cond: true
 
 shape_meta:
   action:
-    shape: [10]   # abs: [xyz(3), rotation_6d(6), gripper(1)]
+    shape: [7]   # abs: [xyz(3), rotation_6d(6), gripper(1)]
   obs:
     image:
       shape: [3, 128, 128]

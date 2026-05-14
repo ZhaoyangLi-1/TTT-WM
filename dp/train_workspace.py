@@ -256,20 +256,37 @@ class TrainDiffusionWorkspace(BaseWorkspace):
 
                 if cache_to_load is not None:
                     print(f"Loading cached normalizer from {cache_to_load} ...")
-                    normalizer = copy.deepcopy(self.model.normalizer)
-                    normalizer.load_state_dict(torch.load(cache_to_load, map_location="cpu"))
-                    # Defensive shape check: if a stale cache slipped through
-                    # (e.g. user pre-staged a wrong-dim file), rebuild instead
-                    # of crashing deep inside compute_loss.
-                    cached_scale = normalizer["action"].params_dict["scale"]
-                    if cached_scale.numel() != action_dim:
+                    # Peek at the cache's params_dict.<obs_key>.* layout — if
+                    # the obs set differs from what the model expects, rebuild
+                    # rather than crash inside compute_loss with a cryptic
+                    # `'ParameterDict' object has no attribute '<key>'`.
+                    cached_state = torch.load(cache_to_load, map_location="cpu")
+                    cached_keys = {
+                        k.split(".")[1]
+                        for k in cached_state.keys()
+                        if k.startswith("params_dict.") and "." in k.split("params_dict.", 1)[1]
+                    }
+                    expected_keys = set(dict(self.model.normalizer.params_dict).keys())
+                    missing = expected_keys - cached_keys
+                    extra = cached_keys - expected_keys
+                    if missing or extra:
                         print(
-                            f"Cached normalizer action dim {cached_scale.numel()} != dataset action_dim "
-                            f"{action_dim}; rebuilding."
+                            f"Cached normalizer key set mismatch (missing={sorted(missing)}, "
+                            f"extra={sorted(extra)}); rebuilding."
                         )
                         normalizer = None
                     else:
-                        print("Cached normalizer loaded.")
+                        normalizer = copy.deepcopy(self.model.normalizer)
+                        normalizer.load_state_dict(cached_state)
+                        cached_scale = normalizer["action"].params_dict["scale"]
+                        if cached_scale.numel() != action_dim:
+                            print(
+                                f"Cached normalizer action dim {cached_scale.numel()} != dataset action_dim "
+                                f"{action_dim}; rebuilding."
+                            )
+                            normalizer = None
+                        else:
+                            print("Cached normalizer loaded.")
 
                 if normalizer is None:
                     print("Building dataset normalizer (this reads all parquet files, may be slow)...")
