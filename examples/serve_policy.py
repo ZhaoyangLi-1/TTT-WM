@@ -93,6 +93,16 @@ STATE_ALIASES = (
     "observation/state",
     "state",
 )
+EE_POS_ALIASES = (
+    "observation/ee_pos",
+    "ee_pos",
+    "observation/robot0_eef_pos",
+    "robot0_eef_pos",
+)
+EE_ORI_ALIASES = (
+    "observation/ee_ori",
+    "ee_ori",
+)
 GOAL_IMAGE_ALIASES = (
     "observation/goal_image",
     "goal_image",
@@ -256,6 +266,11 @@ def infer_source_alias(obs_key: str, obs_type: str) -> tuple[str, ...]:
         if "next" in key or "predicted" in key:
             return NEXT_IMAGE_ALIASES
         return IMAGE_ALIASES
+    # Lowdim proprio. Order matters: more specific patterns first.
+    if "ee_pos" in key or key == "eef_pos":
+        return EE_POS_ALIASES
+    if "ee_ori" in key or key == "eef_ori" or key == "ee_quat" or key == "eef_quat":
+        return EE_ORI_ALIASES
     if "state" in key:
         return STATE_ALIASES
     return (obs_key,)
@@ -313,6 +328,20 @@ class DPPolicyAdapter(BasePolicyAdapter):
             key: infer_source_alias(key, attr.get("type", "low_dim"))
             for key, attr in self._obs_meta.items()
         }
+        # Only advertise `preferred_*_key` hints for obs the model actually
+        # consumes. Otherwise clients see misleading hints (e.g. a hard-coded
+        # `preferred_wrist_key` for a policy that was trained agentview-only)
+        # and may send extra obs that get silently ignored.
+        obs_keys_lc = {k.lower() for k in self._obs_meta}
+        _has = lambda *needles: any(any(n in k for n in needles) for k in obs_keys_lc)
+        preferred: dict[str, str] = {}
+        if _has("wrist", "hand", "eye"):
+            preferred["preferred_wrist_key"] = "observation/wrist_image"
+        if _has("image") and not all(("wrist" in k or "hand" in k or "eye" in k) for k in obs_keys_lc if "image" in k):
+            preferred["preferred_image_key"] = "observation/image"
+        if any(k.lower() == "state" or "proprio" in k.lower() for k in self._obs_meta):
+            preferred["preferred_state_key"] = "observation/state"
+
         self._metadata = {
             "model_type": "dp",
             "causal": True,
@@ -324,9 +353,7 @@ class DPPolicyAdapter(BasePolicyAdapter):
             "abs_action": self._abs_action,
             "n_obs_steps": self._n_obs_steps,
             "policy_obs_keys": list(self._obs_meta.keys()),
-            "preferred_image_key": "observation/image",
-            "preferred_wrist_key": "observation/wrist_image",
-            "preferred_state_key": "observation/state",
+            **preferred,
         }
 
     def _infer_input_resolution(self) -> int | None:

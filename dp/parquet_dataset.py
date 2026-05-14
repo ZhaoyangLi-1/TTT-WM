@@ -47,6 +47,7 @@ class TTTWMParquetImageDataset(BaseImageDataset):
         frames_out: int = 1,
         action_key: str = "actions",
         obs_key_mapping: dict[str, str] | None = None,
+        obs_slices: dict[str, list[int]] | None = None,
         split: str = "train",
         split_mode: str = "auto",
         val_ratio: float = 0.1,
@@ -70,6 +71,7 @@ class TTTWMParquetImageDataset(BaseImageDataset):
 
         shape_meta = _to_container(shape_meta)
         obs_key_mapping = _to_container(obs_key_mapping) or {}
+        obs_slices = _to_container(obs_slices) or {}
         test_tasks = list(_to_container(test_tasks) or [])
 
         self.shape_meta = shape_meta
@@ -84,6 +86,12 @@ class TTTWMParquetImageDataset(BaseImageDataset):
         self.frames_out = int(frames_out)
         self.action_key = str(action_key)
         self.obs_key_mapping = dict(obs_key_mapping)
+        # Optional per-obs slice into the underlying parquet column. Lets
+        # multiple lowdim obs share one source column (e.g. `state` →
+        # `ee_pos` [0:3] + `ee_ori` [3:6]) without baking new columns.
+        self.obs_slices: dict[str, tuple[int, int]] = {
+            key: (int(pair[0]), int(pair[1])) for key, pair in obs_slices.items()
+        }
         self.split = split
         self.split_mode = str(split_mode).lower()
         self.val_ratio = float(val_ratio)
@@ -224,6 +232,7 @@ class TTTWMParquetImageDataset(BaseImageDataset):
             frames_out=self.frames_out,
             action_key=self.action_key,
             obs_key_mapping=self.obs_key_mapping,
+            obs_slices=self.obs_slices,
             split_mode=self.split_mode,
             val_ratio=self.val_ratio,
             test_task_count=self.test_task_count,
@@ -467,6 +476,10 @@ class TTTWMParquetImageDataset(BaseImageDataset):
 
     def _decode_lowdim_value(self, value: Any, obs_key: str) -> np.ndarray:
         array = np.asarray(value, dtype=np.float32)
+        slice_range = self.obs_slices.get(obs_key)
+        if slice_range is not None:
+            s, e = slice_range
+            array = array[..., s:e]
         expected_shape = self.obs_shapes[obs_key]
         return array.reshape(expected_shape)
 

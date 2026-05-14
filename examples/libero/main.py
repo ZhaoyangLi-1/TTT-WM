@@ -119,6 +119,14 @@ def eval_libero(args: Args) -> None:
     client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
     server_metadata = client.get_server_metadata()
     logging.info(f"Connected to policy server metadata: {server_metadata}")
+    # [DIAG] Pretty-print abs_action wiring so a bad rollout can be triaged
+    # without hunting through the verbose metadata blob.
+    logging.info(
+        "[DIAG] server abs_action=%s, action_dim=%s, action_horizon=%s",
+        server_metadata.get("abs_action"),
+        server_metadata.get("action_dim"),
+        server_metadata.get("action_horizon"),
+    )
 
     model_resize_size = server_metadata.get("input_resolution", None)
     resize_size = int(model_resize_size) if args.resize_size is None and model_resize_size is not None else (
@@ -232,6 +240,17 @@ def eval_libero(args: Args) -> None:
         env, task_description = _get_libero_env(
             task, LIBERO_ENV_RESOLUTION, args.seed, abs_action=abs_action,
         )
+        # [DIAG] Verify OSC was actually flipped to abs mode (use_delta=False).
+        # If this prints True, abs_action plumbing is broken end-to-end and the
+        # policy's absolute targets are being interpreted as deltas → robot drifts.
+        try:
+            _diag_ctrl = env.env.robots[0].controller
+            logging.info(
+                "[DIAG] task_id=%s controller=%s use_delta=%s",
+                task_id, type(_diag_ctrl).__name__, getattr(_diag_ctrl, "use_delta", None),
+            )
+        except Exception as _diag_exc:
+            logging.warning("[DIAG] could not read controller.use_delta: %s", _diag_exc)
 
         # Resolve and pre-process this task's goal frame(s). Each online episode
         # gets its own goal image keyed by episode_idx so callers can align the
@@ -430,16 +449,25 @@ def eval_libero(args: Args) -> None:
                     if not action_plan:
                         # Finished executing previous action chunk -- compute new chunk
                         # Prepare observations dict
+                        _ee_pos = np.asarray(obs["robot0_eef_pos"], dtype=np.float32)
+                        _ee_ori = np.asarray(
+                            _quat2axisangle(obs["robot0_eef_quat"]), dtype=np.float32
+                        )
                         element = {
                             "observation/image": img,
                             "observation/wrist_image": wrist_img,
+                            # Full 8D proprio (back-compat) plus pre-sliced ee_pos
+                            # and ee_ori in axis-angle. The split keys let policy
+                            # adapters use either layout without rebaking.
                             "observation/state": np.concatenate(
                                 (
-                                    obs["robot0_eef_pos"],
-                                    _quat2axisangle(obs["robot0_eef_quat"]),
-                                    obs["robot0_gripper_qpos"],
+                                    _ee_pos,
+                                    _ee_ori,
+                                    np.asarray(obs["robot0_gripper_qpos"], dtype=np.float32),
                                 )
                             ),
+                            "observation/ee_pos": _ee_pos,
+                            "observation/ee_ori": _ee_ori,
                             "prompt": str(task_description),
                         }
                         if not episode_policy_started:
@@ -457,6 +485,45 @@ def eval_libero(args: Args) -> None:
                         assert (
                             len(action_chunk) >= args.replan_steps
                         ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
+                        # [DIAG] First-chunk dump for the very first inference
+                        # call of the run (regardless of task_id, since
+                        # --test-tasks-json may filter away task_id=0). Used to
+                        # sanity-check the policy's action ranges against the
+                        # current ee pose.
+                        if not getattr(env, "_diag_first_chunk_logged", False):
+                            env._diag_first_chunk_logged = True
+                            _ee_pos = obs["robot0_eef_pos"]
+                            _ee_quat = obs["robot0_eef_quat"]
+                            logging.info(
+                                "[DIAG] action_chunk.shape=%s dtype=%s",
+                                getattr(action_chunk, "shape", None),
+                                getattr(action_chunk, "dtype", None),
+                            )
+                            # Dump every step of the chunk so we can see
+                            # whether xyz is monotonically drifting within a
+                            # single inference (the no-proprio failure mode
+                            # for abs_action).
+                            for _i, _a in enumerate(action_chunk):
+                                _a = np.asarray(_a)
+                                logging.info(
+                                    "[DIAG] action_chunk[%d] xyz=%s axis_angle=%s grip=%.3f",
+                                    _i,
+                                    np.round(_a[:3], 5).tolist(),
+                                    np.round(_a[3:6], 4).tolist(),
+                                    float(_a[6]),
+                                )
+                            logging.info(
+                                "[DIAG] obs robot0_eef_pos=%s eef_quat=%s",
+                                np.asarray(_ee_pos).tolist(),
+                                np.asarray(_ee_quat).tolist(),
+                            )
+                            # also dump first sent image's orientation signature
+                            _h = img.shape[0]
+                            logging.info(
+                                "[DIAG] img sent shape=%s dtype=%s top-row mean=%.2f bottom-row mean=%.2f",
+                                tuple(img.shape), img.dtype,
+                                float(img[0].mean()), float(img[_h - 1].mean()),
+                            )
                         action_plan.extend(action_chunk[: args.replan_steps])
 
                     action = action_plan.popleft()
@@ -920,5 +987,13 @@ def _quat2axisangle(quat):
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    # `force=True` overrides any handler that robosuite / gym / jax may have
+    # attached at import time. Without it, those libraries leave the root
+    # logger at WARNING and every `logging.info(...)` here is silently
+    # dropped (including the `[DIAG]` rollout-diagnostic prints).
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        force=True,
+    )
     eval_libero(tyro.cli(Args))
