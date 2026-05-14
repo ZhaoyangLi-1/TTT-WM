@@ -962,6 +962,19 @@ class Trainer:
                 default=OmegaConf.select(cfg, "training.checkpoint_every", default=1),
             )
         )
+        # Optional separate cadence for "permanent" snapshots that are never
+        # evicted. 0/null disables → fall back to the existing behaviour
+        # where `epoch_NNNN.pt` is dumped at every `checkpoint_every`.
+        # When set (e.g. 50 for a long Stage 2.2 run), per-epoch snapshots
+        # use that cadence instead and get a `keep_epoch_NNNN.pt` filename
+        # with 1-indexed completed-epoch count so naming matches user intent.
+        self.keep_every_epochs = int(
+            OmegaConf.select(
+                cfg,
+                "train.keep_every_epochs",
+                default=OmegaConf.select(cfg, "training.keep_every_epochs", default=0),
+            ) or 0
+        )
         self.max_train_steps = OmegaConf.select(
             cfg,
             "train.max_train_steps",
@@ -1931,7 +1944,29 @@ class Trainer:
                 if self.is_main:
                     if (epoch % self.checkpoint_every) == 0:
                         self._save_checkpoint(epoch, val_loss, tag="last")
-                        self._save_checkpoint(epoch, val_loss, tag=f"epoch_{epoch:04d}")
+                        # Existing behaviour preserved when keep_every_epochs
+                        # is disabled: dump a permanent epoch_NNNN.pt at the
+                        # same cadence as `last.pt` (0-indexed).
+                        if self.keep_every_epochs <= 0:
+                            self._save_checkpoint(
+                                epoch, val_loss, tag=f"epoch_{epoch:04d}"
+                            )
+
+                    # Separate, opt-in cadence for permanent snapshots. Uses
+                    # 1-indexed completed_epochs in the filename to match the
+                    # user-facing "after N epochs of training" semantics, and
+                    # always saves on the final epoch so the run ends with a
+                    # snapshot regardless of where it lands modulo cadence.
+                    if self.keep_every_epochs > 0:
+                        completed_epochs = epoch + 1
+                        is_keep = (completed_epochs % self.keep_every_epochs == 0)
+                        is_last = (completed_epochs == int(self.num_epochs))
+                        if is_keep or is_last:
+                            self._save_checkpoint(
+                                epoch,
+                                val_loss,
+                                tag=f"keep_epoch_{completed_epochs:04d}",
+                            )
 
                     if ran_val and val_loss < self.best_val_loss:
                         if self.best_ckpt_path and self.best_ckpt_path.exists():

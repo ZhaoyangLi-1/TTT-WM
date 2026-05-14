@@ -528,6 +528,30 @@ class TrainDiffusionWorkspace(BaseWorkspace):
                         if topk_manager is not None and topk_manager.path_value_map:
                             self._refresh_best_symlink(topk_manager)
 
+                    # Periodic permanent snapshots — independent of topk
+                    # eviction, so a long training run leaves a dense ladder
+                    # of ckpts for post-hoc analysis (e.g. every 50 epochs of
+                    # a 3000-epoch run → 60 snapshots that all survive).
+                    # `completed_epochs` is 1-indexed (number of epochs that
+                    # have actually run), so the filename matches what the
+                    # user typed in `keep_every_epochs`.
+                    keep_every_epochs = int(
+                        OmegaConf.select(cfg, "training.keep_every_epochs", default=0) or 0
+                    )
+                    if self.is_main and keep_every_epochs > 0:
+                        completed_epochs = self.epoch + 1
+                        total_epochs = int(cfg.training.num_epochs)
+                        is_keep_epoch = (completed_epochs % keep_every_epochs == 0)
+                        is_last_epoch = (completed_epochs == total_epochs)
+                        if is_keep_epoch or is_last_epoch:
+                            keep_path = os.path.join(
+                                self.output_dir,
+                                "checkpoints",
+                                f"keep-epoch={completed_epochs:04d}.ckpt",
+                            )
+                            os.makedirs(os.path.dirname(keep_path), exist_ok=True)
+                            self.save_checkpoint(path=keep_path)
+
                     self.model.train()
                     if self.is_main:
                         self._wandb_log(

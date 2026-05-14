@@ -92,7 +92,7 @@ optimizer:
   lr: 1.0e-4
   betas: [0.95, 0.999]
   eps: 1.0e-8
-  weight_decay: 5.0e-2
+  weight_decay: 1.0e-6
 
 training:
   device: auto
@@ -108,6 +108,11 @@ training:
   grad_clip: 1.0
   use_ema: true   # gates the `ema:` block above; default True if omitted
   checkpoint_every: 5
+  # Permanent snapshot every N epochs (NOT subject to topk eviction).
+  # Filename is 1-indexed completed-epoch count, e.g. after 50 epochs of
+  # training → `keep-epoch=0050.ckpt`. The final epoch is always saved.
+  # 0 or null disables.
+  keep_every_epochs: 30
   val_every: 5
   sample_every: 5
   max_train_steps: null

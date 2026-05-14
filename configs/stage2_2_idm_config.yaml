@@ -63,7 +63,7 @@ train:
   gradient_accumulate_every: 1
   optimizer:
     lr: 1.0e-4
-    weight_decay: 5.0e-2
+    weight_decay: 1.0e-6
     betas: [0.95, 0.999]
     eps: 1.0e-8
     no_decay_norm: true
@@ -73,6 +73,14 @@ train:
     min_lr: 0.0
   lr_scheduler: cosine
   checkpoint_every: 10
+  # Permanent snapshot every N epochs (NOT subject to topk eviction or
+  # `last.pt` overwrite). Filename uses 1-indexed completed-epoch count,
+  # e.g. after 50 epochs of training → `keep_epoch_0050.pt`. The final
+  # epoch is always saved too. 0 or null disables this and falls back to
+  # the legacy behaviour where `epoch_NNNN.pt` is dumped at every
+  # `checkpoint_every`. With epochs=3000, keep_every_epochs=50 → 60 ckpts
+  # at {50, 100, ..., 2950, 3000}.
+  keep_every_epochs: 30
   val_every: 5
   sample_every: 5
   max_train_steps: null
