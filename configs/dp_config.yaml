@@ -28,12 +28,12 @@ shape_meta:
     # abs_action targets — without it the policy cannot anchor predictions
     # to the current robot state and collapses to the training-mean pose
     # (the visible upward-drift failure mode).
-    ee_pos:
-      shape: [3]
-      type: low_dim
-    ee_ori:
-      shape: [3]      # axis-angle (matches the action's rot input)
-      type: low_dim
+    # ee_pos:
+    #   shape: [3]
+    #   type: low_dim
+    # ee_ori:
+    #   shape: [3]      # axis-angle (matches the action's rot input)
+    #   type: low_dim
 
 data:
   action_key: actions
@@ -92,7 +92,7 @@ optimizer:
   lr: 1.0e-4
   betas: [0.95, 0.999]
   eps: 1.0e-8
-  weight_decay: 1.0e-6
+  weight_decay: 5.0e-2
 
 training:
   device: auto
@@ -166,9 +166,9 @@ task:
     # state_rot_slice: [3, 6]
     # Per-obs slice into source columns referenced via obs_key_mapping.
     # `state` is 8D = ee_pos(3) + ee_axis_angle(3) + gripper_qpos(2).
-    obs_slices:
-      ee_pos: [0, 3]
-      ee_ori: [3, 6]
+    # obs_slices:
+    #   ee_pos: [0, 3]
+    #   ee_ori: [3, 6]
 
 checkpoint:
   topk:
