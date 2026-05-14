@@ -102,8 +102,8 @@ training:
   resume: false
   resume_path: null
   lr_scheduler: cosine
-  lr_warmup_steps: 500
-  num_epochs: 300
+  lr_warmup_steps: 600
+  num_epochs: 400
   gradient_accumulate_every: 1
   grad_clip: 1.0
   use_ema: true   # gates the `ema:` block above; default True if omitted
@@ -112,7 +112,7 @@ training:
   # Filename is 1-indexed completed-epoch count, e.g. after 50 epochs of
   # training → `keep-epoch=0050.ckpt`. The final epoch is always saved.
   # 0 or null disables.
-  keep_every_epochs: 30
+  keep_every_epochs: 20
   val_every: 5
   sample_every: 5
   max_train_steps: null

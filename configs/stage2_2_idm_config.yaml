@@ -59,7 +59,7 @@ val_dataloader:
 
 train:
   compile: false
-  epochs: 300
+  epochs: 400
   gradient_accumulate_every: 1
   optimizer:
     lr: 1.0e-4
@@ -80,7 +80,7 @@ train:
   # the legacy behaviour where `epoch_NNNN.pt` is dumped at every
   # `checkpoint_every`. With epochs=3000, keep_every_epochs=50 → 60 ckpts
   # at {50, 100, ..., 2950, 3000}.
-  keep_every_epochs: 30
+  keep_every_epochs: 20
   val_every: 5
   sample_every: 5
   max_train_steps: null
