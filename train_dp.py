@@ -106,6 +106,47 @@ def _apply_selected_task_overrides(cfg: DictConfig) -> None:
         )
 
 
+def _log_episode_split(cfg: DictConfig) -> None:
+    """Print the episode-level train/val split chosen by the dataset.
+
+    Same convention as Stage 2.2's HeldoutTaskSplitDataset: episodes
+    matching `data.selected_task` are deterministically shuffled with
+    `seed`, the first `round(N * val_ratio)` go to val, the rest to train.
+    Datasets are NOT split at the sample-window level — every window
+    belongs whole to one split, eliminating intra-episode leakage.
+    """
+    if not _is_main_rank():
+        return
+    try:
+        # Force verbose=False so the dataset's own banner stays out of the way;
+        # split=train so both _train/_val episode lists are populated identically.
+        preview = hydra.utils.instantiate(
+            cfg.task.dataset, verbose=False, split="train"
+        )
+    except Exception as exc:
+        print(f"[train_dp] Could not preview episode split: {exc}")
+        return
+
+    train_eps = list(preview._train_episode_indices)
+    val_eps = list(preview._val_episode_indices)
+
+    print("=" * 78)
+    print("[train_dp] Episode-level train/val split (same scheme as Stage 2.2):")
+    print(f"  task_filter   : {preview.task_filter!r}")
+    print(f"  seed          : {preview.seed}")
+    print(f"  val_ratio     : {preview.val_ratio}")
+    print(f"  split_reason  : {preview._split_reason}")
+    print(f"  train episodes: {len(train_eps)} -> {train_eps}")
+    print(f"  val   episodes: {len(val_eps)} -> {val_eps}")
+    if len(val_eps) <= 1:
+        print(
+            "  WARNING: val_ratio is low; only "
+            f"{len(val_eps)} episode in the val split — val_loss will be noisy. "
+            "Consider raising data.val_ratio."
+        )
+    print("=" * 78)
+
+
 @hydra.main(version_base=None, config_path="configs", config_name="dp_config")
 def _hydra_main(cfg: DictConfig) -> None:
     diffusion_policy_src = OmegaConf.select(
@@ -119,6 +160,8 @@ def _hydra_main(cfg: DictConfig) -> None:
 
     _apply_selected_task_overrides(cfg)
     OmegaConf.resolve(cfg)
+
+    _log_episode_split(cfg)
 
     from dp.common import cleanup_distributed
     from dp.train_workspace import TrainDiffusionWorkspace
