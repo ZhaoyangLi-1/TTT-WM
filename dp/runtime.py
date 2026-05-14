@@ -15,10 +15,20 @@ DIFFUSION_POLICY_ENV_KEYS = (
 )
 
 
+def _build_task_dirname(task_name: str) -> str:
+    # Matches train_stage2._build_task_dirname so dp_config and stage2 configs
+    # produce identical slugs from data.selected_task.
+    normalized = str(task_name).replace(":", "").replace(" ", "_").strip("_")
+    return normalized or "task"
+
+
 def register_omegaconf_resolvers() -> None:
     OmegaConf.register_new_resolver("eval", eval, replace=True)
     OmegaConf.register_new_resolver(
         "if", lambda cond, t, f: t if cond else f, replace=True
+    )
+    OmegaConf.register_new_resolver(
+        "task_slug", _build_task_dirname, replace=True
     )
 
 

@@ -176,4 +176,6 @@ hydra:
   job:
     override_dirname: ${name}
   run:
-    dir: ${outputs_root}/original_diffusion_policy/${data.selected_task}/${now:%Y-%m-%d}/${now:%H-%M-%S}_${name}_${data.selected_task}
+    # `${task_slug:...}` strips ":" / spaces from data.selected_task so the
+    # path stays filesystem-friendly. Resolver registered in dp/runtime.py.
+    dir: ${outputs_root}/dp/${task_slug:${data.selected_task}}/${now:%Y%m%d_%H%M%S}
