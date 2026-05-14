@@ -32,6 +32,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from cosmos_model import ARPatchConfig, ARVideoPatchTransformer
+from dp.action_utils import decode_abs_action_10d_to_7d
 from dp.common import resolve_checkpoint_path as resolve_dp_checkpoint_path
 from dp.common import resolve_device
 from dp.runtime import configure_diffusion_policy_path, register_omegaconf_resolvers
@@ -296,7 +297,18 @@ class DPPolicyAdapter(BasePolicyAdapter):
         self._obs_meta = shape_meta["obs"]
         self._n_obs_steps = int(OmegaConf.select(cfg, "n_obs_steps", default=1))
         self._horizon = int(OmegaConf.select(cfg, "n_action_steps", default=1))
-        self._action_dim = int(shape_meta["action"]["shape"][0])
+        policy_action_dim = int(shape_meta["action"]["shape"][0])
+        self._abs_action = bool(
+            OmegaConf.select(cfg, "task.dataset.abs_action", default=False)
+        )
+        if self._abs_action and policy_action_dim != 10:
+            raise ValueError(
+                f"DP cfg has task.dataset.abs_action=true but action shape is {policy_action_dim} "
+                "(expected 10 for [xyz, rotation_6d, gripper])."
+            )
+        # Server decodes abs_action 10D -> 7D before sending to client, so the
+        # advertised action_dim is always the env-facing 7.
+        self._env_action_dim = 7 if self._abs_action else policy_action_dim
         self._source_aliases = {
             key: infer_source_alias(key, attr.get("type", "low_dim"))
             for key, attr in self._obs_meta.items()
@@ -308,7 +320,8 @@ class DPPolicyAdapter(BasePolicyAdapter):
             "weight_source": weight_source,
             "input_resolution": self._infer_input_resolution(),
             "action_horizon": self._horizon,
-            "action_dim": self._action_dim,
+            "action_dim": self._env_action_dim,
+            "abs_action": self._abs_action,
             "n_obs_steps": self._n_obs_steps,
             "policy_obs_keys": list(self._obs_meta.keys()),
             "preferred_image_key": "observation/image",
@@ -380,6 +393,10 @@ class DPPolicyAdapter(BasePolicyAdapter):
         action_np = action[0].detach().cpu().float().numpy()
         if action_np.ndim == 1:
             action_np = action_np[None, :]
+        if self._abs_action:
+            # 10D [xyz_abs, rotation_6d, gripper] -> 7D [xyz_abs, axis_angle, gripper]
+            # for an OSC_POSE controller in control_delta=False mode.
+            action_np = decode_abs_action_10d_to_7d(action_np)
         return {
             "actions": action_np,
             "policy_timing": {"infer_ms": infer_ms},
@@ -405,7 +422,14 @@ class Stage2PolicyAdapter(BasePolicyAdapter):
         self._resolution = int(model_cfg["resolution"])
         self._use_goal = bool(data_cfg.get("use_goal", False))
         self._action_horizon = int(data_cfg.get("frame_gap", 1))
-        self._action_dim = int(data_cfg.get("action_dim", 7))
+        policy_action_dim = int(data_cfg.get("action_dim", 7))
+        self._abs_action = bool(data_cfg.get("abs_action", False))
+        if self._abs_action and policy_action_dim != 10:
+            raise ValueError(
+                f"Stage 2.2 cfg has data.abs_action=true but data.action_dim={policy_action_dim} "
+                "(expected 10 for [xyz, rotation_6d, gripper])."
+            )
+        self._env_action_dim = 7 if self._abs_action else policy_action_dim
         self._metadata = {
             "model_type": "stage2",
             "causal": True,
@@ -414,7 +438,8 @@ class Stage2PolicyAdapter(BasePolicyAdapter):
             "input_resolution": self._resolution,
             "frames_in": self._frames_in,
             "action_horizon": self._action_horizon,
-            "action_dim": self._action_dim,
+            "action_dim": self._env_action_dim,
+            "abs_action": self._abs_action,
             "goal_conditioned": self._use_goal,
             "goal_optional": True,
             "preferred_image_key": "observation/image",
@@ -485,6 +510,8 @@ class Stage2PolicyAdapter(BasePolicyAdapter):
         actions = pred_actions[0].detach().cpu().float().numpy()
         if actions.ndim == 1:
             actions = actions[None, :]
+        if self._abs_action:
+            actions = decode_abs_action_10d_to_7d(actions)
         infer_ms = (t_policy - t_pre) * 1000.0
         timings = {
             "pre_ms":     (t_pre     - t0)      * 1000.0,
@@ -522,7 +549,14 @@ class PureIDMPolicyAdapter(BasePolicyAdapter):
         data_cfg = cfg["data"]
         self._resolution = int(model_cfg["resolution"])
         self._action_horizon = int(data_cfg.get("frame_gap", 1))
-        self._action_dim = int(data_cfg.get("action_dim", 7))
+        policy_action_dim = int(data_cfg.get("action_dim", 7))
+        self._abs_action = bool(data_cfg.get("abs_action", False))
+        if self._abs_action and policy_action_dim != 10:
+            raise ValueError(
+                f"Pure IDM cfg has data.abs_action=true but data.action_dim={policy_action_dim} "
+                "(expected 10 for [xyz, rotation_6d, gripper])."
+            )
+        self._env_action_dim = 7 if self._abs_action else policy_action_dim
         self._metadata = {
             "model_type": "pure_idm",
             "causal": False,
@@ -530,7 +564,8 @@ class PureIDMPolicyAdapter(BasePolicyAdapter):
             "weight_source": weight_source,
             "input_resolution": self._resolution,
             "action_horizon": self._action_horizon,
-            "action_dim": self._action_dim,
+            "action_dim": self._env_action_dim,
+            "abs_action": self._abs_action,
             "requires_next_image": True,
             "preferred_image_key": "observation/image",
             "preferred_next_image_key": "next_image",
@@ -566,6 +601,8 @@ class PureIDMPolicyAdapter(BasePolicyAdapter):
         actions = pred_actions[0].detach().cpu().float().numpy()
         if actions.ndim == 1:
             actions = actions[None, :]
+        if self._abs_action:
+            actions = decode_abs_action_10d_to_7d(actions)
         return {
             "actions": actions,
             "policy_timing": {"infer_ms": infer_ms},

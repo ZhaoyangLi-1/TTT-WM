@@ -15,13 +15,31 @@ data:
   test_tasks: []                                    # auto-populated from data.selected_task
   stage2_val_fraction: 0.01
   loader_timeout: 600
+  # On-the-fly 10D abs action: [xyz(3), rotation_6d(6), gripper(1)].
+  # The .pt frame fast-path still serves frames; actions are computed
+  # from the parquet's `state` column once per episode and cached.
+  # NOTE: action_stats cache is per-mode — abs uses meta/action_stats_abs.json.
+  action_dim: 10
+  abs_action: true
+  state_key: state
+  state_pos_slice: [0, 3]
+  state_rot_slice: [3, 6]
 
+# EMA (DDPM power-law schedule). Read by train_stage1.py:Trainer via the
+# inherited Stage2Part2Trainer. Gated by `training.use_ema` (below), which
+# defaults to True if absent but is set explicitly here for safety. The
+# code looks under top-level `training:` (NOT `train:` — that block carries
+# the optimizer / scheduler / checkpoint hyperparams instead).
+# Checkpoint save/load prefers ckpt["ema"]["shadow"] over ckpt["model"].
 ema:
   update_after_step: 0
   inv_gamma: 1.0
   power: 0.75
   min_value: 0.0
   max_value: 0.9999
+
+training:
+  use_ema: true
 
 dataloader:
   batch_size: 128

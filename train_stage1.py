@@ -436,6 +436,23 @@ class VideoFrameDataset(Dataset):
         self.image_key = data_cfg.get("image_key", "image")
         self.action_key = data_cfg.get("action_key", "actions")
         self.use_goal = data_cfg.get("use_goal", True)
+        # Optional on-the-fly conversion to 10D abs action
+        # (target_pos = state[t+1][:3], rotation_6d(state[t+1][3:6]),
+        #  gripper = raw_actions[t, -1]). When True the .pt fast path keeps
+        # serving frames, but actions are recomputed from the parquet's
+        # `state` column and cached per episode.
+        self.abs_action = bool(data_cfg.get("abs_action", False))
+        self.state_key = data_cfg.get("state_key", "state")
+        pos_slice = data_cfg.get("state_pos_slice", [0, 3])
+        rot_slice = data_cfg.get("state_rot_slice", [3, 6])
+        self.state_pos_slice = tuple(int(v) for v in pos_slice)
+        self.state_rot_slice = tuple(int(v) for v in rot_slice)
+        if self.abs_action:
+            action_dim_cfg = int(data_cfg.get("action_dim", 7))
+            if action_dim_cfg != 10:
+                raise ValueError(
+                    f"abs_action=true requires data.action_dim=10, got {action_dim_cfg}"
+                )
         self._res = model_cfg.resolution
         self.transform = transforms.Compose(
             [
@@ -569,6 +586,9 @@ class VideoFrameDataset(Dataset):
         self._parquet_cache: dict[str, pd.DataFrame] = {}
         self._pt_cache: dict[str, dict] = {}
         self._action_stats_cache: dict[str, np.ndarray] | None = None
+        # Per-episode 10D abs actions, keyed by parquet path. Same eviction
+        # discipline as _parquet_cache; only populated when abs_action=True.
+        self._abs_action_cache: dict[str, np.ndarray] = {}
 
     def _pt_path(self, parquet_path: str) -> str:
         if parquet_path.endswith(".parquet"):
@@ -606,9 +626,48 @@ class VideoFrameDataset(Dataset):
         if len(self._parquet_cache) >= self._CACHE_MAX:
             oldest = next(iter(self._parquet_cache))
             del self._parquet_cache[oldest]
-        df = pd.read_parquet(path, columns=[self.image_key, self.action_key])
+        cols = [self.image_key, self.action_key]
+        if self.abs_action:
+            cols.append(self.state_key)
+        df = pd.read_parquet(path, columns=cols)
         self._parquet_cache[path] = df
         return df
+
+    def _read_parquet_columns(self, path: str, columns: list[str]) -> pd.DataFrame:
+        # Lightweight reader for paths where the .pt fast path serves frames
+        # but we still need scalar columns (e.g. `state`/`actions` for
+        # abs_action). Does not write into `_parquet_cache`, which is reserved
+        # for the (image + action[+ state]) layout the dataset's main path
+        # expects.
+        return pd.read_parquet(path, columns=columns)
+
+    def _get_abs_actions(self, parquet_path: str) -> np.ndarray:
+        cached = self._abs_action_cache.get(parquet_path)
+        if cached is not None:
+            return cached
+        if len(self._abs_action_cache) >= self._CACHE_MAX:
+            oldest = next(iter(self._abs_action_cache))
+            del self._abs_action_cache[oldest]
+        df = self._read_parquet_columns(
+            parquet_path, [self.state_key, self.action_key]
+        )
+        states = np.stack(
+            [np.asarray(v, dtype=np.float32) for v in df[self.state_key].tolist()],
+            axis=0,
+        )
+        raw_actions = np.stack(
+            [np.asarray(v, dtype=np.float32) for v in df[self.action_key].tolist()],
+            axis=0,
+        )
+        from dp.action_utils import state_to_abs_action
+        abs_actions = state_to_abs_action(
+            states,
+            raw_actions,
+            pos_slice=self.state_pos_slice,
+            rot_slice=self.state_rot_slice,
+        )
+        self._abs_action_cache[parquet_path] = abs_actions
+        return abs_actions
 
     def __len__(self):
         return len(self.samples)
@@ -617,7 +676,10 @@ class VideoFrameDataset(Dataset):
         if self._action_stats_cache is not None:
             return {k: v.copy() for k, v in self._action_stats_cache.items()}
 
-        cache_path = self._data_root / "meta" / "action_stats.json"
+        # Keep the 7D and 10D abs caches independent so toggling abs_action
+        # never silently reuses a stale stat file.
+        cache_name = "action_stats_abs.json" if self.abs_action else "action_stats.json"
+        cache_path = self._data_root / "meta" / cache_name
         if cache_path.exists():
             if self.is_main:
                 log.info(f"Loading cached action stats from {cache_path}")
@@ -636,11 +698,14 @@ class VideoFrameDataset(Dataset):
 
         for ep_idx in tqdm(self.episode_indices, desc="Computing action stats", disable=not self.is_main):
             path = self.episode_files[ep_idx]
-            df = self._read_parquet(path)
-            actions = np.stack(
-                [np.array(value, copy=False) for value in df[self.action_key].tolist()],
-                axis=0,
-            ).astype(np.float64, copy=False)
+            if self.abs_action:
+                actions = self._get_abs_actions(path).astype(np.float64, copy=False)
+            else:
+                df = self._read_parquet(path)
+                actions = np.stack(
+                    [np.array(value, copy=False) for value in df[self.action_key].tolist()],
+                    axis=0,
+                ).astype(np.float64, copy=False)
 
             batch_min = actions.min(axis=0)
             batch_max = actions.max(axis=0)
@@ -698,7 +763,15 @@ class VideoFrameDataset(Dataset):
             ]
 
             act_start = start + self._action_offset
-            actions = actions_t[act_start : act_start + self.gap].clone()
+            if self.abs_action:
+                # .pt only has 7D actions; recompute 10D abs from the
+                # parquet's `state` (one read per episode, cached).
+                abs_actions = self._get_abs_actions(parquet_path)
+                actions = torch.from_numpy(
+                    abs_actions[act_start : act_start + self.gap].copy()
+                )
+            else:
+                actions = actions_t[act_start : act_start + self.gap].clone()
 
             if self.use_goal:
                 goal = self._frame_from_pt(frames_u8, ep_length - 1)
@@ -725,15 +798,21 @@ class VideoFrameDataset(Dataset):
             tgt_imgs.append(self.transform(img))
 
         act_start = start + self._action_offset
-        actions = torch.stack(
-            [
-                torch.tensor(
-                    np.array(df.iloc[act_start + i][self.action_key], copy=True),
-                    dtype=torch.float32,
-                )
-                for i in range(self.gap)
-            ]
-        )
+        if self.abs_action:
+            abs_actions = self._get_abs_actions(parquet_path)
+            actions = torch.from_numpy(
+                abs_actions[act_start : act_start + self.gap].copy()
+            )
+        else:
+            actions = torch.stack(
+                [
+                    torch.tensor(
+                        np.array(df.iloc[act_start + i][self.action_key], copy=True),
+                        dtype=torch.float32,
+                    )
+                    for i in range(self.gap)
+                ]
+            )
 
         if self.use_goal:
             goal_data = df.iloc[ep_length - 1][self.image_key]

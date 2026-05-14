@@ -133,6 +133,12 @@ def eval_libero(args: Args) -> None:
 
     requires_next_image = bool(server_metadata.get("requires_next_image", False))
     goal_conditioned = bool(server_metadata.get("goal_conditioned", False))
+    # When the policy was trained with abs_action=True it outputs absolute
+    # 7D ``[xyz, axis_angle, gripper]`` (server already decoded from 10D),
+    # so the env must run its OSC controller in abs mode.
+    abs_action = bool(server_metadata.get("abs_action", False))
+    if abs_action:
+        logging.info("Server reports abs_action=True; switching OSC controller to use_delta=False.")
 
     # Decide which observation key (if any) to use for shipping the per-task goal frame.
     if requires_next_image:
@@ -223,7 +229,9 @@ def eval_libero(args: Args) -> None:
         initial_states = task_suite.get_task_init_states(task_id)
 
         # Initialize LIBERO environment and task description
-        env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
+        env, task_description = _get_libero_env(
+            task, LIBERO_ENV_RESOLUTION, args.seed, abs_action=abs_action,
+        )
 
         # Resolve and pre-process this task's goal frame(s). Each online episode
         # gets its own goal image keyed by episode_idx so callers can align the
@@ -584,13 +592,32 @@ def eval_libero(args: Args) -> None:
         logging.info(f"Saved rollout summary to {summary_path}")
 
 
-def _get_libero_env(task, resolution, seed):
-    """Initializes and returns the LIBERO environment, along with the task description."""
+def _get_libero_env(task, resolution, seed, *, abs_action: bool = False):
+    """Initializes and returns the LIBERO environment, along with the task description.
+
+    When ``abs_action=True``, the underlying robosuite OSC_POSE controller is
+    flipped to ``use_delta=False`` so it interprets policy actions as absolute
+    target poses (xyz + axis-angle) instead of normalized deltas. Matches
+    lpb's ``libero_image_runner`` setup for diffusion policies trained with
+    abs_action=True.
+    """
     task_description = task.language
     task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
     env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
     env = OffScreenRenderEnv(**env_args)
     env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
+    if abs_action:
+        # LIBERO's OffScreenRenderEnv builds controller_configs internally
+        # (env_wrapper.py:47) so the only post-hoc knob is the live OSC
+        # instance. robosuite >=1.4 stores the flag as `use_delta`.
+        for robot in env.env.robots:
+            controller = getattr(robot, "controller", None)
+            if controller is None or not hasattr(controller, "use_delta"):
+                raise RuntimeError(
+                    "abs_action=True requires an OSC controller with `use_delta`; "
+                    f"got {type(controller).__name__ if controller else None}."
+                )
+            controller.use_delta = False
     return env, task_description
 
 

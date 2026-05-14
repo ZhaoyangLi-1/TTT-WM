@@ -16,12 +16,25 @@ data:
   stage2_val_fraction: 0.01
   loader_timeout: 600
 
+# EMA (DDPM power-law schedule, HF diffusers convention).
+# Stage 2.1 overrides the parent stage1_wm_config's legacy `train.ema:`
+# block by introducing this top-level `ema:` — train_stage1.py:Trainer
+# detects the top-level block first and switches to the DP power-law
+# code path. Gated by `training.use_ema` (below), which defaults to True
+# if absent but is set explicitly here for safety.
+# The `training:` key is intentional — train_stage1.py looks under
+# `training.use_ema`, NOT `train.use_ema` (the `train:` block is for
+# optimizer / scheduler / checkpoint hyperparams).
+# Checkpoint save/load prefers ckpt["ema"]["shadow"] over ckpt["model"].
 ema:
   update_after_step: 0
   inv_gamma: 1.0
   power: 0.75
   min_value: 0.0
   max_value: 0.9999
+
+training:
+  use_ema: true
 
 dataloader:
   batch_size: 128

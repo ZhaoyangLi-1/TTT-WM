@@ -12,13 +12,18 @@ import torch
 from omegaconf import OmegaConf
 from PIL import Image
 
-from diffusion_policy.common.normalize_util import get_image_range_normalizer
+from diffusion_policy.common.normalize_util import (
+    get_image_range_normalizer,
+    robomimic_abs_action_only_normalizer_from_stat,
+    array_to_stats,
+)
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.model.common.normalizer import (
     LinearNormalizer,
     SingleFieldLinearNormalizer,
 )
 
+from dp.action_utils import state_to_abs_action
 from dp.common import dict_apply
 
 
@@ -52,6 +57,11 @@ class TTTWMParquetImageDataset(BaseImageDataset):
         max_train_episodes: int | None = None,
         cache_size: int = 32,
         verbose: bool = True,
+        abs_action: bool = False,
+        rotation_rep: str = "rotation_6d",
+        state_key: str = "state",
+        state_pos_slice: tuple[int, int] = (0, 3),
+        state_rot_slice: tuple[int, int] = (3, 6),
     ):
         super().__init__()
 
@@ -86,6 +96,25 @@ class TTTWMParquetImageDataset(BaseImageDataset):
         self.max_train_episodes = max_train_episodes
         self.cache_size = max(int(cache_size), 1)
         self.verbose = bool(verbose)
+        self.abs_action = bool(abs_action)
+        self.rotation_rep = str(rotation_rep)
+        self.state_key = str(state_key)
+        self.state_pos_slice = tuple(int(v) for v in state_pos_slice)
+        self.state_rot_slice = tuple(int(v) for v in state_rot_slice)
+
+        if self.abs_action:
+            if self.rotation_rep != "rotation_6d":
+                raise ValueError(
+                    f"Only rotation_rep='rotation_6d' is implemented for abs_action; got {self.rotation_rep!r}"
+                )
+            if len(self.state_pos_slice) != 2 or len(self.state_rot_slice) != 2:
+                raise ValueError("state_pos_slice and state_rot_slice must be (start, end) pairs")
+            pos_dim = self.state_pos_slice[1] - self.state_pos_slice[0]
+            rot_dim = self.state_rot_slice[1] - self.state_rot_slice[0]
+            if pos_dim != 3 or rot_dim != 3:
+                raise ValueError(
+                    f"abs_action expects 3D position and 3D axis-angle slices of state, got pos={pos_dim}, rot={rot_dim}"
+                )
 
         if self.horizon < 1:
             raise ValueError("horizon must be >= 1")
@@ -105,6 +134,10 @@ class TTTWMParquetImageDataset(BaseImageDataset):
         if len(action_shape) != 1:
             raise ValueError(f"Only 1D actions are supported, got {action_shape}")
         self.action_shape = action_shape
+        if self.abs_action and action_shape[0] != 10:
+            raise ValueError(
+                f"abs_action + rotation_6d requires shape_meta.action.shape=[10], got {list(action_shape)}"
+            )
 
         obs_meta = shape_meta["obs"]
         self.rgb_keys: list[str] = []
@@ -122,12 +155,12 @@ class TTTWMParquetImageDataset(BaseImageDataset):
             else:
                 raise ValueError(f"Unsupported obs type for {key}: {obs_type}")
 
-        self._required_columns = list(
-            dict.fromkeys(
-                [self.action_key]
-                + [self.obs_columns[key] for key in self.rgb_keys + self.lowdim_keys]
-            )
-        )
+        required_columns = [self.action_key] + [
+            self.obs_columns[key] for key in self.rgb_keys + self.lowdim_keys
+        ]
+        if self.abs_action:
+            required_columns.append(self.state_key)
+        self._required_columns = list(dict.fromkeys(required_columns))
 
         self._episode_paths, episode_meta = self._load_episode_manifest()
         self._episode_meta = episode_meta
@@ -176,6 +209,7 @@ class TTTWMParquetImageDataset(BaseImageDataset):
             )
 
         self._parquet_cache: dict[str, pd.DataFrame] = {}
+        self._abs_action_cache: dict[int, np.ndarray] = {}
         self._all_actions_cache: torch.Tensor | None = None
 
         self._init_kwargs = dict(
@@ -199,6 +233,11 @@ class TTTWMParquetImageDataset(BaseImageDataset):
             max_train_episodes=self.max_train_episodes,
             cache_size=self.cache_size,
             verbose=self.verbose,
+            abs_action=self.abs_action,
+            rotation_rep=self.rotation_rep,
+            state_key=self.state_key,
+            state_pos_slice=self.state_pos_slice,
+            state_rot_slice=self.state_rot_slice,
         )
 
     def _load_episode_manifest(self) -> tuple[dict[int, Path], dict[int, dict[str, Any]]]:
@@ -363,6 +402,38 @@ class TTTWMParquetImageDataset(BaseImageDataset):
             del self._parquet_cache[oldest]
         return df
 
+    def _compute_abs_actions(self, df: pd.DataFrame) -> np.ndarray:
+        raw_actions = np.stack(
+            [np.asarray(value, dtype=np.float32) for value in df[self.action_key].tolist()],
+            axis=0,
+        )
+        states = np.stack(
+            [np.asarray(value, dtype=np.float32) for value in df[self.state_key].tolist()],
+            axis=0,
+        )
+        return state_to_abs_action(
+            states,
+            raw_actions,
+            pos_slice=self.state_pos_slice,
+            rot_slice=self.state_rot_slice,
+        )
+
+    def _get_abs_actions(self, episode_idx: int) -> np.ndarray:
+        cached = self._abs_action_cache.get(episode_idx)
+        if cached is not None:
+            # move-to-end for LRU-ish behaviour
+            self._abs_action_cache.pop(episode_idx)
+            self._abs_action_cache[episode_idx] = cached
+            return cached
+
+        df = self._read_parquet(episode_idx)
+        abs_actions = self._compute_abs_actions(df)
+        self._abs_action_cache[episode_idx] = abs_actions
+        while len(self._abs_action_cache) > self.cache_size:
+            oldest = next(iter(self._abs_action_cache))
+            del self._abs_action_cache[oldest]
+        return abs_actions
+
     @staticmethod
     def _extract_image_bytes(value: Any) -> bytes | Any:
         if isinstance(value, dict) and "bytes" in value:
@@ -423,16 +494,19 @@ class TTTWMParquetImageDataset(BaseImageDataset):
             except ImportError:
                 iterator = indices
             for episode_idx in iterator:
-                df = self._read_parquet(episode_idx)
-                actions.append(
-                    np.stack(
-                        [
-                            self._decode_action_value(value)
-                            for value in df[self.action_key].tolist()
-                        ],
-                        axis=0,
+                if self.abs_action:
+                    actions.append(self._get_abs_actions(episode_idx))
+                else:
+                    df = self._read_parquet(episode_idx)
+                    actions.append(
+                        np.stack(
+                            [
+                                self._decode_action_value(value)
+                                for value in df[self.action_key].tolist()
+                            ],
+                            axis=0,
+                        )
                     )
-                )
             if actions:
                 self._all_actions_cache = torch.from_numpy(np.concatenate(actions, axis=0))
             else:
@@ -441,9 +515,16 @@ class TTTWMParquetImageDataset(BaseImageDataset):
 
     def get_normalizer(self, **kwargs: Any) -> LinearNormalizer:
         normalizer = LinearNormalizer()
-        normalizer["action"] = SingleFieldLinearNormalizer.create_fit(
-            self.get_all_actions().cpu().numpy()
-        )
+        all_actions = self.get_all_actions().cpu().numpy()
+        if self.abs_action:
+            # Range-normalize position to [-1, 1] and leave rotation_6d /
+            # gripper untouched, matching lpb's libero recipe.
+            action_stat = array_to_stats(all_actions)
+            normalizer["action"] = robomimic_abs_action_only_normalizer_from_stat(
+                action_stat
+            )
+        else:
+            normalizer["action"] = SingleFieldLinearNormalizer.create_fit(all_actions)
 
         for obs_key in self.lowdim_keys:
             values: list[np.ndarray] = []
@@ -505,13 +586,19 @@ class TTTWMParquetImageDataset(BaseImageDataset):
                 axis=0,
             )
 
-        action = np.stack(
-            [
-                self._decode_action_value(df.iloc[row_idx][self.action_key])
-                for row_idx in action_row_indices
-            ],
-            axis=0,
-        )
+        if self.abs_action:
+            abs_actions = self._get_abs_actions(episode_idx)
+            ep_len = abs_actions.shape[0]
+            clipped = [min(max(idx, 0), ep_len - 1) for idx in action_row_indices]
+            action = abs_actions[clipped]
+        else:
+            action = np.stack(
+                [
+                    self._decode_action_value(df.iloc[row_idx][self.action_key])
+                    for row_idx in action_row_indices
+                ],
+                axis=0,
+            )
 
         data = {"obs": obs_dict, "action": action.astype(np.float32)}
         return dict_apply(data, torch.from_numpy)

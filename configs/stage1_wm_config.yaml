@@ -58,6 +58,14 @@ train:
     no_decay_norm: true
   scheduler:
     warmup_fraction: 0.05
+  # Legacy EMA path (fixed decay schedule), read by train_stage1.py:Trainer
+  # at `cfg.train.ema`. Differs from the DP power-law `ema:` block used by
+  # stage2_1/stage2_2/dp_config — kept on this schedule to preserve binary
+  # compatibility with already-pretrained Stage-1 checkpoints.
+  #   enabled        — explicit on/off (no fallback default).
+  #   decay          — fixed shadow decay; ema = decay*ema + (1-decay)*model.
+  #   update_every   — gradient-step cadence for EMA updates (1 = every step).
+  # Checkpoint save/load prefers ckpt["ema"]["shadow"] over ckpt["model"].
   ema:
     enabled: true
     decay: 0.9999
