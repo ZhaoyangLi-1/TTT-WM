@@ -8,7 +8,7 @@ PKG_DIR="$DP_PATH/diffusion_policy"
 echo ">>> DP_PATH: $DP_PATH"
 
 if [ -d "$PKG_DIR" ]; then
-  echo ">>> $PKG_DIR 已存在,跳过安装。"
+  echo ">>> $PKG_DIR is already installed. Skip installation."
 else
   echo ">>> Cloning diffusion_policy..."
   git clone https://github.com/real-stanford/diffusion_policy.git "$DP_PATH"
