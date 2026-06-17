@@ -18,7 +18,7 @@ model:
   d_model: 768
   n_heads: 12
   n_layers: 12
-  mlp_ratio: 2.67        
+  mlp_ratio: 2        
   dropout: 0.2           
   frames_in: 1
   frames_out: 1
@@ -52,8 +52,8 @@ train:
 
   gradient_accumulate_every: 1  
   optimizer:
-    lr: 5.0e-6             
-    weight_decay: 7.0e-2
+    lr: 1.0e-4             
+    weight_decay: 7.0e-3
     betas: [0.9, 0.98]    
     no_decay_norm: true
   scheduler:
@@ -74,7 +74,7 @@ train:
   amp: true
   amp_dtype: bf16
   ckpt_dir: ${outputs_root}/${experiment_name}/${run_timestamp}
-  checkpoint_every: 5
+  checkpoint_every: 20
   stage: 1
   resume: ""
   device: "auto"
@@ -82,7 +82,7 @@ train:
 
 wandb:
   enabled: true
-  project: TTT-WM-diffusion
+  project: TTT-WM-diffusion-Latest
   name: ${experiment_name}
 
 hydra:
