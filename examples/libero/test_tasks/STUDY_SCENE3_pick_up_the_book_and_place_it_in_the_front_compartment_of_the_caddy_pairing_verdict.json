@@ -1,0 +1,13 @@
+{
+  "_verdict": "NO_RECOVERABLE_PAIRING",
+  "_comment": "scripts/match_init_to_libero_wm.py found NO trustworthy 1-to-1 pairing between LIBERO get_task_init_states() and libero_wm demos: best image match cost never approaches 0 and margins are <=0, i.e. the online init states are INDEPENDENT draws from the same layout distribution as the demos, not the same instances. Do NOT use a goal_episode_indices/base mapping as if it were exact. For a consistent (but train-leakage) diagnostic use goal_align_by_init_proprio (*_aligned.json), ideally with an image NN metric. A fair AND consistent demo-frame goal does not exist in this data.",
+  "source_task": "STUDY_SCENE3_pick_up_the_book_and_place_it_in_the_front_compartment_of_the_caddy",
+  "task": "STUDY_SCENE3: pick up the book and place it in the front compartment of the caddy",
+  "ordering_is_identity": false,
+  "greedy_is_bijection": false,
+  "image_match_cost_min": 0.060530345886945724,
+  "image_match_cost_median": 0.07074528932571411,
+  "image_match_cost_max": 0.08840717375278473,
+  "margin_min": -0.012307904660701752,
+  "demo_demo_note": "see script stdout for demo-demo spread"
+}

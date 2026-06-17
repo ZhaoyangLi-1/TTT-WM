@@ -450,7 +450,12 @@ class CachedStage1PredDataset(Dataset):
         return len(self.base)
 
     def __getitem__(self, idx: int):
-        ctx, tgt, actions, goal = self.base[idx]
+        sample = self.base[idx]
+        if len(sample) == 5:
+            ctx, tgt, actions, goal, proprio = sample
+        else:
+            ctx, tgt, actions, goal = sample
+            proprio = None
         ep_path, start, _ = self.base.samples[idx]
         key = (ep_path, int(start))
         pt_path, row = self._sample_to_row[key]
@@ -466,6 +471,8 @@ class CachedStage1PredDataset(Dataset):
         pred_u8 = payload["pred_frames_u8"][row]      # (fout, H, W, C) uint8
         pred = pred_u8.to(torch.float32).permute(0, 3, 1, 2)
         pred = pred.mul_(1.0 / 127.5).sub_(1.0)        # -> (fout, C, H, W) in [-1,1]
+        if proprio is not None:
+            return ctx, tgt, actions, goal, proprio, pred
         return ctx, tgt, actions, goal, pred
 
     # Expose a handful of attributes that upstream code might poke at so
@@ -476,6 +483,11 @@ class CachedStage1PredDataset(Dataset):
 
     def get_action_stats(self):
         return self.base.get_action_stats()
+
+    def get_obs_stats(self):
+        # Optional — only present when the base dataset has proprio configured.
+        fn = getattr(self.base, "get_obs_stats", None)
+        return fn() if fn is not None else {}
 
 
 # ---------------------------------------------------------------------------
@@ -626,6 +638,34 @@ class Stage2Part2Trainer(_Stage2Mixin, Trainer):
     def _stage_tag(self) -> str:
         return "2.2"
 
+    def _save_epoch_checkpoints(self, epoch, val_loss, ran_val):
+        """Stage 2.2 checkpoint policy (overrides the base Trainer).
+
+          * NO best-val_loss / topk checkpoints are kept.
+          * NO every-N-epochs keep across the whole run.
+          * ``last.pt`` still rolls every ``checkpoint_every`` for resume.
+          * A permanent ``keep_epoch_XXXX.pt`` is written every
+            ``keep_every_epochs`` epochs but ONLY during the final 20% of
+            training; the final epoch is always saved. ``completed_epochs``
+            (= ``epoch + 1``) is 1-indexed so the filename matches the
+            user-facing "after N epochs of training" semantics.
+        """
+        del ran_val  # val_loss-based "best" checkpoints intentionally dropped
+        if (epoch % self.checkpoint_every) == 0:
+            self._save_checkpoint(epoch, val_loss, tag="last")
+
+        keep_every = int(self.keep_every_epochs)
+        if keep_every > 0:
+            total_epochs = int(self.num_epochs)
+            completed_epochs = epoch + 1
+            in_last_20pct = completed_epochs >= total_epochs * 0.8
+            is_keep = in_last_20pct and (completed_epochs % keep_every == 0)
+            is_last = completed_epochs == total_epochs
+            if is_keep or is_last:
+                self._save_checkpoint(
+                    epoch, val_loss, tag=f"keep_epoch_{completed_epochs:04d}"
+                )
+
     def _build_datasets(self):
         cfg = self.cfg
         val_fraction = float(
@@ -724,17 +764,30 @@ class Stage2Part2Trainer(_Stage2Mixin, Trainer):
         # self.model is still the raw IDM wrapper — unwrap_model is a no-op
         # here but kept for consistency with the rest of the codebase.
         raw = unwrap_model(self.model)
+        obs_stats = (
+            train_ds.get_obs_stats()
+            if hasattr(train_ds, "get_obs_stats")
+            else {}
+        )
         if hasattr(raw, "set_action_stats") and hasattr(train_ds, "get_action_stats"):
             stats = train_ds.get_action_stats()
-            raw.set_action_stats(stats)
+            raw.set_action_stats(stats, obs_stats=obs_stats)
             if self.ema is not None and hasattr(self.ema.shadow, "set_action_stats"):
-                self.ema.shadow.set_action_stats(stats)
+                self.ema.shadow.set_action_stats(stats, obs_stats=obs_stats)
             if self.is_main:
-                log.info("Loaded action stats into Stage 2.2 diffusion-policy IDM.")
+                proprio_info = (
+                    f" + {len(obs_stats)} proprio keys ({sorted(obs_stats)})"
+                    if obs_stats
+                    else ""
+                )
+                log.info(
+                    "Loaded action stats into Stage 2.2 diffusion-policy IDM"
+                    f"{proprio_info}."
+                )
 
     def _forward(
         self, model, context, target, actions, goal, *,
-        return_pred_frames=True, cached_pred_frames=None,
+        return_pred_frames=True, cached_pred_frames=None, proprio=None,
     ):
         # IDM model returns (pred_frames, pred_actions, loss) — a 3-tuple.
         # The base Trainer._run_epoch expects _forward to return (pred, loss).
@@ -747,6 +800,7 @@ class Stage2Part2Trainer(_Stage2Mixin, Trainer):
         pred, _, loss = model(
             context, target, actions, goal=goal,
             cached_pred_frames=cached_pred_frames,
+            proprio=proprio,
         )
         return pred, loss
 

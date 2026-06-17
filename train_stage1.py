@@ -410,6 +410,12 @@ def build_scheduler(
 # ---------------------------------------------------------------------------
 
 
+def _rotate_180_pil(img: "Image.Image") -> "Image.Image":
+    # [rotate180] Module-level (picklable) helper so it can live inside a
+    # transforms.Compose used by DataLoader workers. Exact 180° rotation.
+    return img.rotate(180)
+
+
 class VideoFrameDataset(Dataset):
     # Large cap because cached entries are mmap views — ~few hundred bytes
     # per Python-level tensor wrapper; actual data pages are shared via the
@@ -453,9 +459,50 @@ class VideoFrameDataset(Dataset):
                 raise ValueError(
                     f"abs_action=true requires data.action_dim=10, got {action_dim_cfg}"
                 )
+
+        # Optional proprio obs (Stage 2.2): when both obs_key_mapping and
+        # obs_slices are configured, __getitem__ appends a proprio dict as
+        # the 5th tuple element. Each entry has shape (fin, dim) — the
+        # downstream policy slices the last n_obs_steps frames itself.
+        # Mirrors dp_config.yaml's data.obs_key_mapping + task.dataset.obs_slices.
+        raw_obs_map = data_cfg.get("obs_key_mapping", None) or {}
+        raw_obs_slices = data_cfg.get("obs_slices", None) or {}
+        if hasattr(raw_obs_map, "items"):
+            obs_map = {str(k): str(v) for k, v in raw_obs_map.items()}
+        else:
+            obs_map = dict(raw_obs_map)
+        if hasattr(raw_obs_slices, "items"):
+            obs_slices = {
+                str(k): (int(v[0]), int(v[1])) for k, v in raw_obs_slices.items()
+            }
+        else:
+            obs_slices = {
+                str(k): (int(v[0]), int(v[1])) for k, v in dict(raw_obs_slices).items()
+            }
+        self.obs_key_mapping: dict[str, str] = obs_map
+        self.obs_slices: dict[str, tuple[int, int]] = obs_slices
+        # Only the proprio (low_dim) keys we expose to __getitem__: any obs
+        # key that has both a column mapping and a slice configured.
+        self.proprio_keys: tuple[str, ...] = tuple(
+            sorted(k for k in obs_map if k in obs_slices)
+        )
+        self.has_proprio = bool(self.proprio_keys)
+        if self.has_proprio:
+            unknown_cols = {
+                self.obs_key_mapping[k] for k in self.proprio_keys
+            } - {self.state_key}
+            if unknown_cols:
+                raise ValueError(
+                    "VideoFrameDataset only supports proprio sourced from the "
+                    f"state column ({self.state_key!r}); got {sorted(unknown_cols)}."
+                )
         self._res = model_cfg.resolution
         self.transform = transforms.Compose(
             [
+                # [rotate180] Rotate every frame 180° before the model. The .pt
+                # fast path does the same in _frame_from_pt and the rollout
+                # server matches it, keeping train/eval orientation identical.
+                transforms.Lambda(_rotate_180_pil),
                 transforms.Resize((model_cfg.resolution, model_cfg.resolution)),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5] * 3, [0.5] * 3),
@@ -589,6 +636,10 @@ class VideoFrameDataset(Dataset):
         # Per-episode 10D abs actions, keyed by parquet path. Same eviction
         # discipline as _parquet_cache; only populated when abs_action=True.
         self._abs_action_cache: dict[str, np.ndarray] = {}
+        # Per-episode raw `state` arrays (T, state_dim). Populated lazily by
+        # _get_state_array, only when proprio obs are configured.
+        self._state_cache: dict[str, np.ndarray] = {}
+        self._obs_stats_cache: dict[str, dict[str, np.ndarray]] | None = None
 
     def _pt_path(self, parquet_path: str) -> str:
         if parquet_path.endswith(".parquet"):
@@ -627,11 +678,36 @@ class VideoFrameDataset(Dataset):
             oldest = next(iter(self._parquet_cache))
             del self._parquet_cache[oldest]
         cols = [self.image_key, self.action_key]
-        if self.abs_action:
+        if self.abs_action or self.has_proprio:
             cols.append(self.state_key)
         df = pd.read_parquet(path, columns=cols)
         self._parquet_cache[path] = df
         return df
+
+    def _get_state_array(self, parquet_path: str) -> np.ndarray:
+        """Return per-episode state column as np.ndarray (T, state_dim). Cached
+        per parquet path with the same eviction discipline as the other caches.
+        Used by the proprio obs path (Stage 2.2) — the .pt fast path doesn't
+        carry state, so we read the parquet's state column once per episode.
+        """
+        cached = self._state_cache.get(parquet_path)
+        if cached is not None:
+            return cached
+        if len(self._state_cache) >= self._CACHE_MAX:
+            oldest = next(iter(self._state_cache))
+            del self._state_cache[oldest]
+        # Reuse the cached parquet if we already opened it (e.g. via the
+        # fallback decode path or abs_action). Otherwise do a column-scoped
+        # read so we don't blow up the parquet cache with rows we don't use.
+        df = self._parquet_cache.get(parquet_path)
+        if df is None or self.state_key not in df.columns:
+            df = self._read_parquet_columns(parquet_path, [self.state_key])
+        states = np.stack(
+            [np.asarray(v, dtype=np.float32) for v in df[self.state_key].tolist()],
+            axis=0,
+        )
+        self._state_cache[parquet_path] = states
+        return states
 
     def _read_parquet_columns(self, path: str, columns: list[str]) -> pd.DataFrame:
         # Lightweight reader for paths where the .pt fast path serves frames
@@ -745,7 +821,118 @@ class VideoFrameDataset(Dataset):
         # frames_u8: (T, H, W, 3) uint8 at training resolution already.
         # Return (3, H, W) float in [-1, 1] matching transforms.Normalize([0.5]*3,[0.5]*3).
         f = frames_u8[idx].to(torch.float32).permute(2, 0, 1)
-        return f.mul_(1.0 / 127.5).sub_(1.0)
+        f = f.mul_(1.0 / 127.5).sub_(1.0)
+        # [rotate180] Feed the model frames rotated 180° (flip H and W). The
+        # online rollout server applies the same rotation before the model, so
+        # train/eval orientation matches. Covers ctx, target and goal frames.
+        return torch.flip(f, dims=(1, 2))
+
+    def get_obs_stats(self) -> dict[str, dict[str, np.ndarray]]:
+        """Per-proprio-key min/max/mean/std over the training-split state
+        column, used by the IDM's normalizer setup. Disk cache lives next to
+        action_stats.json (one file per slice configuration so toggling the
+        obs layout never silently reuses stale stats).
+        """
+        if not self.has_proprio:
+            return {}
+        if self._obs_stats_cache is not None:
+            return {
+                k: {kk: vv.copy() for kk, vv in v.items()}
+                for k, v in self._obs_stats_cache.items()
+            }
+
+        slice_sig = "_".join(
+            f"{k}-{self.obs_slices[k][0]}-{self.obs_slices[k][1]}"
+            for k in self.proprio_keys
+        )
+        cache_path = self._data_root / "meta" / f"obs_stats__{slice_sig}.json"
+        if cache_path.exists():
+            if self.is_main:
+                log.info(f"Loading cached obs stats from {cache_path}")
+            with open(cache_path) as f:
+                saved = json.load(f)
+            self._obs_stats_cache = {
+                key: {k: np.array(v, dtype=np.float32) for k, v in stat.items()}
+                for key, stat in saved.items()
+            }
+            return {
+                k: {kk: vv.copy() for kk, vv in v.items()}
+                for k, v in self._obs_stats_cache.items()
+            }
+
+        accum: dict[str, dict[str, np.ndarray]] = {}
+        counts: dict[str, int] = {}
+        for ep_idx in tqdm(
+            self.episode_indices,
+            desc="Computing obs stats",
+            disable=not self.is_main,
+        ):
+            path = self.episode_files[ep_idx]
+            states = self._get_state_array(path).astype(np.float64, copy=False)
+            for key in self.proprio_keys:
+                s, e = self.obs_slices[key]
+                arr = states[:, s:e]
+                if key not in accum:
+                    accum[key] = {
+                        "min": arr.min(axis=0),
+                        "max": arr.max(axis=0),
+                        "sum": arr.sum(axis=0),
+                        "sq_sum": np.square(arr).sum(axis=0),
+                    }
+                    counts[key] = arr.shape[0]
+                else:
+                    a = accum[key]
+                    a["min"] = np.minimum(a["min"], arr.min(axis=0))
+                    a["max"] = np.maximum(a["max"], arr.max(axis=0))
+                    a["sum"] += arr.sum(axis=0)
+                    a["sq_sum"] += np.square(arr).sum(axis=0)
+                    counts[key] += arr.shape[0]
+
+        if not accum:
+            raise RuntimeError("Cannot compute obs stats from an empty dataset.")
+
+        stats: dict[str, dict[str, np.ndarray]] = {}
+        for key, a in accum.items():
+            n = counts[key]
+            mean = a["sum"] / n
+            var = np.maximum(a["sq_sum"] / n - np.square(mean), 0.0)
+            stats[key] = {
+                "min": a["min"].astype(np.float32),
+                "max": a["max"].astype(np.float32),
+                "mean": mean.astype(np.float32),
+                "std": np.sqrt(var).astype(np.float32),
+            }
+        self._obs_stats_cache = stats
+        if self.is_main:
+            saved = {
+                key: {k: v.tolist() for k, v in stat.items()}
+                for key, stat in stats.items()
+            }
+            with open(cache_path, "w") as f:
+                json.dump(saved, f)
+            log.info(f"Saved obs stats cache to {cache_path}")
+        return {
+            k: {kk: vv.copy() for kk, vv in v.items()}
+            for k, v in stats.items()
+        }
+
+    def _build_proprio_dict(
+        self, parquet_path: str, start: int
+    ) -> dict[str, torch.Tensor]:
+        """Return {obs_key: tensor of shape (fin, dim)} sliced from `state`."""
+        states = self._get_state_array(parquet_path)
+        out: dict[str, torch.Tensor] = {}
+        window = states[start : start + self.fin]
+        # If the .pt fast path lets us go beyond the parquet's row count (it
+        # shouldn't, but guard anyway), pad by repeating the last row.
+        if window.shape[0] < self.fin:
+            pad = np.repeat(window[-1:], self.fin - window.shape[0], axis=0)
+            window = np.concatenate([window, pad], axis=0)
+        for key in self.proprio_keys:
+            s, e = self.obs_slices[key]
+            arr = window[:, s:e]
+            out[key] = torch.from_numpy(arr.copy()).to(torch.float32)
+        return out
 
     def __getitem__(self, idx):
         parquet_path, start, ep_length = self.samples[idx]
@@ -778,6 +965,15 @@ class VideoFrameDataset(Dataset):
             else:
                 goal = torch.zeros(3, self._res, self._res)
 
+            if self.has_proprio:
+                proprio = self._build_proprio_dict(parquet_path, start)
+                return (
+                    torch.stack(ctx_imgs),
+                    torch.stack(tgt_imgs),
+                    actions,
+                    goal,
+                    proprio,
+                )
             return torch.stack(ctx_imgs), torch.stack(tgt_imgs), actions, goal
 
         # Fallback: original parquet + PIL decode path (kept for bootstrap
@@ -821,6 +1017,15 @@ class VideoFrameDataset(Dataset):
         else:
             goal = torch.zeros(3, self._res, self._res)
 
+        if self.has_proprio:
+            proprio = self._build_proprio_dict(parquet_path, start)
+            return (
+                torch.stack(ctx_imgs),
+                torch.stack(tgt_imgs),
+                actions,
+                goal,
+                proprio,
+            )
         return torch.stack(ctx_imgs), torch.stack(tgt_imgs), actions, goal
 
 
@@ -1347,6 +1552,43 @@ class Trainer:
         if self.is_main:
             log.info(f"Saved: {path} | val_loss={val_loss:.6f}")
 
+    def _save_epoch_checkpoints(self, epoch, val_loss, ran_val):
+        """Per-epoch checkpoint policy. Called on the main rank only.
+
+        Subclasses may override to change which checkpoints are kept (e.g.
+        Stage 2.2 drops best-val_loss snapshots and restricts the permanent
+        keep snapshots to the final 20% of training). ``epoch`` is 0-indexed.
+        """
+        if (epoch % self.checkpoint_every) == 0:
+            self._save_checkpoint(epoch, val_loss, tag="last")
+            # Existing behaviour preserved when keep_every_epochs
+            # is disabled: dump a permanent epoch_NNNN.pt at the
+            # same cadence as `last.pt` (0-indexed).
+            if self.keep_every_epochs <= 0:
+                self._save_checkpoint(epoch, val_loss, tag=f"epoch_{epoch:04d}")
+
+        # Separate, opt-in cadence for permanent snapshots. Uses
+        # 1-indexed completed_epochs in the filename to match the
+        # user-facing "after N epochs of training" semantics, and
+        # always saves on the final epoch so the run ends with a
+        # snapshot regardless of where it lands modulo cadence.
+        if self.keep_every_epochs > 0:
+            completed_epochs = epoch + 1
+            is_keep = (completed_epochs % self.keep_every_epochs == 0)
+            is_last = (completed_epochs == int(self.num_epochs))
+            if is_keep or is_last:
+                self._save_checkpoint(
+                    epoch, val_loss, tag=f"keep_epoch_{completed_epochs:04d}"
+                )
+
+        if ran_val and val_loss < self.best_val_loss:
+            if self.best_ckpt_path and self.best_ckpt_path.exists():
+                self.best_ckpt_path.unlink()
+            self.best_val_loss = val_loss
+            tag = f"best_epoch{epoch:04d}_loss{val_loss:.6f}"
+            self._save_checkpoint(epoch, val_loss, tag=tag)
+            self.best_ckpt_path = self.ckpt_dir / f"{tag}.pt"
+
     def _load_checkpoint(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         unwrap_model(self.model).load_state_dict(_clean_state_dict(ckpt["model"]))
@@ -1365,13 +1607,15 @@ class Trainer:
 
     def _forward(
         self, model, context, target, actions, goal, *,
-        return_pred_frames=True, cached_pred_frames=None,
+        return_pred_frames=True, cached_pred_frames=None, proprio=None,
     ):
         # return_pred_frames=False lets the model skip unpatchify/clamp in
         # the training path where the decoded frames are discarded.
         # cached_pred_frames is consumed only by IDM subclasses (Stage 2.2,
         # pure-IDM); the ARVideoPatchTransformer forward ignores it.
-        del cached_pred_frames
+        # proprio is consumed only by Stage 2.2's IDM with proprio obs; the
+        # Stage 1 backbone ignores it.
+        del cached_pred_frames, proprio
         pred, loss = model(context, target, goal, return_pred_frames=return_pred_frames)
         return pred, loss
 
@@ -1440,13 +1684,29 @@ class Trainer:
 
         with grad_ctx:
             for batch_idx, batch in enumerate(pbar):
-                # Dataset may return a 4-tuple (default) or a 5-tuple with a
-                # prebaked stage1 prediction (Stage 2.2 + cache path).
-                if len(batch) == 5:
-                    context, target, actions, goal, cached_pred = batch
-                else:
+                # Dataset may return:
+                #   4-tuple: (context, target, actions, goal)               — default (Stage 1)
+                #   5-tuple: (..., proprio_dict)                            — Stage 2.2 with proprio
+                #   5-tuple: (..., cached_pred_tensor)                      — Stage 2.2 with cache
+                #   6-tuple: (..., proprio_dict, cached_pred_tensor)        — Stage 2.2 with both
+                # Differentiate the 5-tuple variants by the type of the
+                # trailing element (dict for proprio, Tensor for cache).
+                proprio = None
+                cached_pred = None
+                if len(batch) == 4:
                     context, target, actions, goal = batch
-                    cached_pred = None
+                elif len(batch) == 5:
+                    context, target, actions, goal, extra = batch
+                    if isinstance(extra, dict):
+                        proprio = extra
+                    else:
+                        cached_pred = extra
+                elif len(batch) == 6:
+                    context, target, actions, goal, proprio, cached_pred = batch
+                else:
+                    raise RuntimeError(
+                        f"Unexpected batch shape: len={len(batch)}"
+                    )
 
                 if batch_idx == 0 and self.is_main:
                     warmup_note = (
@@ -1466,6 +1726,11 @@ class Trainer:
                 )
                 if cached_pred is not None:
                     cached_pred = cached_pred.to(self.device, non_blocking=True)
+                if proprio is not None:
+                    proprio = {
+                        k: v.to(self.device, non_blocking=True)
+                        for k, v in proprio.items()
+                    }
 
                 if train:
                     is_last = (accum_step == self.grad_accum_steps - 1) or (
@@ -1487,6 +1752,7 @@ class Trainer:
                                 self.model, context, target, actions, goal,
                                 return_pred_frames=False,
                                 cached_pred_frames=cached_pred,
+                                proprio=proprio,
                             )
                             scaled = loss / self.grad_accum_steps
                         self.scaler.scale(scaled).backward()
@@ -1568,6 +1834,7 @@ class Trainer:
                                 self.model, context, target, actions, goal,
                                 return_pred_frames=False,
                                 cached_pred_frames=cached_pred,
+                                proprio=proprio,
                             )
                     except RuntimeError as e:
                         if self._is_fatal_dist_error(e):
@@ -1942,39 +2209,7 @@ class Trainer:
                 # multiple separate is_main blocks (which previously caused rank 0
                 # to do up to 3 sequential torch.save calls while others waited).
                 if self.is_main:
-                    if (epoch % self.checkpoint_every) == 0:
-                        self._save_checkpoint(epoch, val_loss, tag="last")
-                        # Existing behaviour preserved when keep_every_epochs
-                        # is disabled: dump a permanent epoch_NNNN.pt at the
-                        # same cadence as `last.pt` (0-indexed).
-                        if self.keep_every_epochs <= 0:
-                            self._save_checkpoint(
-                                epoch, val_loss, tag=f"epoch_{epoch:04d}"
-                            )
-
-                    # Separate, opt-in cadence for permanent snapshots. Uses
-                    # 1-indexed completed_epochs in the filename to match the
-                    # user-facing "after N epochs of training" semantics, and
-                    # always saves on the final epoch so the run ends with a
-                    # snapshot regardless of where it lands modulo cadence.
-                    if self.keep_every_epochs > 0:
-                        completed_epochs = epoch + 1
-                        is_keep = (completed_epochs % self.keep_every_epochs == 0)
-                        is_last = (completed_epochs == int(self.num_epochs))
-                        if is_keep or is_last:
-                            self._save_checkpoint(
-                                epoch,
-                                val_loss,
-                                tag=f"keep_epoch_{completed_epochs:04d}",
-                            )
-
-                    if ran_val and val_loss < self.best_val_loss:
-                        if self.best_ckpt_path and self.best_ckpt_path.exists():
-                            self.best_ckpt_path.unlink()
-                        self.best_val_loss = val_loss
-                        tag = f"best_epoch{epoch:04d}_loss{val_loss:.6f}"
-                        self._save_checkpoint(epoch, val_loss, tag=tag)
-                        self.best_ckpt_path = self.ckpt_dir / f"{tag}.pt"
+                    self._save_epoch_checkpoints(epoch, val_loss, ran_val)
 
         finally:
             self._maybe_finish_wandb()

@@ -147,6 +147,81 @@ def _log_episode_split(cfg: DictConfig) -> None:
     print("=" * 78)
 
 
+def _dump_first_batch_obs(cfg: DictConfig) -> None:
+    """DEBUG: save the image obs of the first training batch as PNG.
+
+    Dumps exactly what the dataset feeds the policy (pre-normalizer, [0,1]
+    float -> uint8), so you can eyeball orientation / content / normalization.
+    Controlled by env var TTT_WM_DUMP_FIRST_BATCH (default "1"; set "0" to skip).
+    Files land in ${output_dir}/debug_first_batch/.
+    """
+    if not _is_main_rank():
+        return
+    if os.environ.get("TTT_WM_DUMP_FIRST_BATCH", "1") != "1":
+        return
+
+    import numpy as np
+    import torch
+    from PIL import Image
+    from torch.utils.data import DataLoader
+
+    out_dir = Path(str(cfg.training.output_dir)) / "debug_first_batch"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    dataset = hydra.utils.instantiate(cfg.task.dataset, verbose=False, split="train")
+    # shuffle=False so the dump is deterministic/reproducible (first windows of
+    # the first train episodes). Orientation/normalization are identical to the
+    # shuffled training batches regardless.
+    batch_size = int(OmegaConf.select(cfg, "dataloader.batch_size", default=8))
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    batch = next(iter(loader))
+
+    obs = batch["obs"]
+    rgb_keys = [k for k in obs if obs[k].dim() == 5]  # (B, To, C, H, W)
+    n_samples = min(4, obs[rgb_keys[0]].shape[0]) if rgb_keys else 0
+
+    print("=" * 78)
+    print(f"[train_dp][DEBUG] dumping first-batch image obs to {out_dir}")
+    for key in rgb_keys:
+        t = obs[key]  # (B, To, C, H, W), float in [0,1]
+        print(
+            f"  obs[{key!r}]: shape={tuple(t.shape)} dtype={t.dtype} "
+            f"min={t.min().item():.4f} max={t.max().item():.4f} mean={t.mean().item():.4f}"
+        )
+        for b in range(n_samples):
+            for to in range(t.shape[1]):
+                arr = t[b, to].detach().cpu().numpy()  # (C, H, W) [0,1]
+                arr = np.clip(np.moveaxis(arr, 0, -1) * 255.0, 0, 255).astype(np.uint8)
+                Image.fromarray(arr, mode="RGB").save(
+                    out_dir / f"{key}_sample{b:02d}_obs{to}.png"
+                )
+    print(
+        f"[train_dp][DEBUG] saved {n_samples} samples x {obs[rgb_keys[0]].shape[1] if rgb_keys else 0} "
+        f"obs-steps per rgb key. Set TTT_WM_DUMP_FIRST_BATCH=0 to disable."
+    )
+    print("=" * 78)
+
+
+def _configure_wandb(cfg: DictConfig) -> None:
+    """Honor the `use_wandb` toggle.
+
+    When off, force wandb into disabled mode so no run is created and no login
+    is required (belt-and-suspenders: the workspace also short-circuits to a
+    NullRun when `logging.enabled` is False). Falls back to `logging.enabled`
+    if `use_wandb` is absent.
+    """
+    use_wandb = OmegaConf.select(cfg, "use_wandb", default=None)
+    if use_wandb is None:
+        use_wandb = OmegaConf.select(cfg, "logging.enabled", default=True)
+    if not bool(use_wandb):
+        os.environ["WANDB_MODE"] = "disabled"
+        os.environ.setdefault("WANDB_SILENT", "true")
+        if _is_main_rank():
+            print("wandb logging DISABLED (use_wandb=false).")
+    elif _is_main_rank():
+        print("wandb logging ENABLED.")
+
+
 @hydra.main(version_base=None, config_path="configs", config_name="dp_config")
 def _hydra_main(cfg: DictConfig) -> None:
     diffusion_policy_src = OmegaConf.select(
@@ -161,7 +236,10 @@ def _hydra_main(cfg: DictConfig) -> None:
     _apply_selected_task_overrides(cfg)
     OmegaConf.resolve(cfg)
 
+    _configure_wandb(cfg)
+
     _log_episode_split(cfg)
+    _dump_first_batch_obs(cfg)
 
     from dp.common import cleanup_distributed
     from dp.train_workspace import TrainDiffusionWorkspace

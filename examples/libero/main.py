@@ -31,7 +31,6 @@ class Args:
     port: int = 8000
     resize_size: Optional[int] = None
     replan_steps: int = 5
-    rotate_images_180: bool = False
 
     #################################################################################################################
     # LIBERO environment-specific parameters
@@ -75,6 +74,17 @@ class Args:
     # Directory under which extracted goal frame PNGs are cached. Defaults to
     # `<libero_wm_root>/derived_goal_frames/` when test_tasks_json is in use.
     goal_frames_cache_dir: Optional[str] = None
+
+    # Route (b): consistent (start, goal) eval. When set to the LIBERO-90 HDF5
+    # root (containing `libero_90/<task>_demo.hdf5`), each rollout is started
+    # from a libero_wm demo's OWN initial sim state (demo_j/states[0]) instead
+    # of LIBERO's pruned_init eval states, and that same demo's terminal frame
+    # is forced as the goal -> the (online start, goal) pair is identical to the
+    # within-trajectory pair the policy was trained on. Which demos to roll out
+    # comes from each test_tasks record's `rollout_episode_indices` (a list of
+    # libero_wm episode indices); if absent it defaults to `test_episode_indices`
+    # (the held-out val demo(s)) so the number is fair (no train leakage).
+    init_from_hdf5_root: Optional[str] = None
 
     seed: int = 7  # Random Seed (for reproducibility)
 
@@ -128,6 +138,9 @@ def eval_libero(args: Args) -> None:
         server_metadata.get("action_horizon"),
     )
 
+    # No image rotation is applied anywhere: observation, goal and next frames
+    # are all passed through to the policy in their native orientation.
+
     model_resize_size = server_metadata.get("input_resolution", None)
     resize_size = int(model_resize_size) if args.resize_size is None and model_resize_size is not None else (
         int(args.resize_size) if args.resize_size is not None else 128
@@ -139,6 +152,30 @@ def eval_libero(args: Args) -> None:
             f"replan_steps={args.replan_steps} exceeds the server action horizon={action_horizon}."
         )
 
+    # Obs-history stacking: the policy conditions on n_obs_steps obs that were
+    # CONSECUTIVE env frames during training (gap=1). Since we only call infer
+    # every replan_steps env steps, letting the server accumulate its own
+    # history yields a gap of replan_steps — out-of-distribution conditioning.
+    # When the server supports it, we instead buffer the preprocessed obs at
+    # EVERY env step and ship the last n_obs_steps frames per request
+    # (leading dim = step axis).
+    n_obs_steps = int(server_metadata.get("n_obs_steps") or 1)
+    stack_obs_history = (
+        n_obs_steps > 1 and bool(server_metadata.get("obs_history_stacking", False))
+    )
+    if stack_obs_history:
+        logging.info(
+            "Server supports obs history stacking: sending the last %d consecutive frames per obs key.",
+            n_obs_steps,
+        )
+    elif n_obs_steps > 1:
+        logging.warning(
+            "Server has n_obs_steps=%d but no obs_history_stacking support; its obs "
+            "history will be spaced replan_steps=%d apart instead of the training gap of 1.",
+            n_obs_steps,
+            args.replan_steps,
+        )
+
     requires_next_image = bool(server_metadata.get("requires_next_image", False))
     goal_conditioned = bool(server_metadata.get("goal_conditioned", False))
     # When the policy was trained with abs_action=True it outputs absolute
@@ -147,6 +184,19 @@ def eval_libero(args: Args) -> None:
     abs_action = bool(server_metadata.get("abs_action", False))
     if abs_action:
         logging.info("Server reports abs_action=True; switching OSC controller to use_delta=False.")
+
+    # Decide which end-effector orientation representation to ship in
+    # `observation/ee_ori`, so we stay compatible with policies trained on
+    # either axis-angle [3] (parquet `state[3:6]`) or quaternion [4] (parquet
+    # `ee_quat`). We read the expected dim from the server's per-key obs shapes
+    # and pick the matching rep (axis-angle is sent verbatim from the same
+    # `_quat2axisangle` the dataset used; quaternion is canonicalized to w>=0).
+    ee_ori_dim = _resolve_ee_ori_dim(server_metadata)
+    logging.info(
+        "ee_ori representation: sending %s (dim=%d) for observation/ee_ori",
+        "quaternion[x,y,z,w]" if ee_ori_dim == 4 else "axis-angle",
+        ee_ori_dim,
+    )
 
     # Decide which observation key (if any) to use for shipping the per-task goal frame.
     if requires_next_image:
@@ -320,7 +370,7 @@ def eval_libero(args: Args) -> None:
                         episode_index_override=ep_for_goal,
                     )
                     cached_image = _load_and_preprocess_image(
-                        goal_path, resize_size, args.rotate_images_180
+                        goal_path, resize_size
                     )
                     ep_to_image[ep_for_goal] = cached_image
                     ep_to_path[ep_for_goal] = goal_path
@@ -344,16 +394,93 @@ def eval_libero(args: Args) -> None:
                 logging.warning(msg + " Falling back to goal=None for this task.")
             else:
                 shared_image = _load_and_preprocess_image(
-                    goal_path, resize_size, args.rotate_images_180
+                    goal_path, resize_size
                 )
                 for episode_idx in range(args.num_trials_per_task):
                     task_goal_images[episode_idx] = shared_image
                     task_goal_source_paths[episode_idx] = goal_path
                 logging.info(f"Loaded goal frame for task {task_id} from {goal_path}")
 
+        # Route (b): build a per-episode plan that starts each rollout from a
+        # libero_wm demo's OWN init sim state (HDF5) and forces that same demo's
+        # terminal frame as the goal -> (start, goal) matches the within-traj
+        # training pair exactly. Demos come from the record's
+        # `rollout_episode_indices`; default to the held-out val demo(s) for a
+        # fair (non-leaking) number.
+        hdf5_plan: Optional[List[dict]] = None
+        if args.init_from_hdf5_root is not None:
+            if test_record is None:
+                raise ValueError(
+                    "--init-from-hdf5-root requires --test-tasks-json with a matching record."
+                )
+            if not args.libero_wm_root:
+                raise ValueError(
+                    "--init-from-hdf5-root requires --libero-wm-root to map episodes to HDF5 demos."
+                )
+            # wm_root is only populated above for goal-consuming policies. Goal-free
+            # policies (e.g. DP) still need it here to compute the episode base, so
+            # set it now. The demo init state is used regardless of goals.
+            if wm_root is None:
+                wm_root = pathlib.Path(args.libero_wm_root).expanduser().resolve()
+                if not (wm_root / "meta" / "episodes.jsonl").is_file():
+                    raise FileNotFoundError(
+                        f"libero_wm episodes.jsonl not found under {wm_root}"
+                    )
+            import sys as _sys
+            _sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+            from hdf5_init import demo_init_state as _demo_init_state
+
+            hdf5_root = pathlib.Path(args.init_from_hdf5_root).expanduser().resolve()
+            base = _libero_wm_episode_base(wm_root, test_record["task"])
+            rollout_eps = test_record.get("rollout_episode_indices")
+            if not rollout_eps:
+                rollout_eps = sorted(test_episode_indices) or [
+                    base + i for i in range(args.num_trials_per_task)
+                ]
+            # Goal frames are only needed by goal-consuming policies (Stage 2.2 /
+            # Pure IDM). For goal-free policies (DP) we still want the demo's init
+            # state, so skip the (potentially expensive / cache-building) goal
+            # derivation entirely.
+            need_goal = goal_send_key is not None
+            hdf5_plan = []
+            for ep in rollout_eps:
+                demo_idx = int(ep) - base
+                goal_path = (
+                    _ensure_goal_frame_from_libero_wm(
+                        wm_root=wm_root,
+                        cache_dir=cache_dir,
+                        source_task=test_record["source_task"],
+                        full_task=test_record["task"],
+                        episode_index_override=int(ep),
+                    )
+                    if need_goal
+                    else None
+                )
+                hdf5_plan.append(
+                    {
+                        "ep": int(ep),
+                        "demo_idx": demo_idx,
+                        "init": _demo_init_state(
+                            hdf5_root, test_record["source_task"], demo_idx
+                        ),
+                        "goal": (
+                            _load_and_preprocess_image(goal_path, resize_size)
+                            if goal_path is not None
+                            else None
+                        ),
+                        "goal_path": goal_path,
+                    }
+                )
+            logging.info(
+                "[init_from_hdf5] task_id=%s (%s) base=%d rolling out %d demos: %s",
+                task_id, bddl_stem, base, len(hdf5_plan),
+                [(p["ep"], "test" if p["ep"] in test_episode_indices else "train") for p in hdf5_plan],
+            )
+
         # Start episodes
+        n_episodes = len(hdf5_plan) if hdf5_plan is not None else args.num_trials_per_task
         task_episodes, task_successes = 0, 0
-        for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
+        for episode_idx in tqdm.tqdm(range(n_episodes)):
             logging.info(f"\nTask: {task_description}")
 
             task_goal_image: Optional[np.ndarray] = task_goal_images.get(episode_idx)
@@ -363,7 +490,54 @@ def eval_libero(args: Args) -> None:
             action_plan = collections.deque()
 
             # Set initial states
-            obs = env.set_init_state(initial_states[episode_idx])
+            if hdf5_plan is not None:
+                _plan = hdf5_plan[episode_idx]
+                obs = env.set_init_state(_plan["init"])
+                task_goal_episode_indices[episode_idx] = _plan["ep"]
+                # Goal-free policies (DP) carry no goal frame; only register goal
+                # bookkeeping when a goal was actually derived.
+                if _plan.get("goal") is not None:
+                    task_goal_image = _plan["goal"]
+                    task_goal_images[episode_idx] = _plan["goal"]
+                    task_goal_source_paths[episode_idx] = _plan["goal_path"]
+            else:
+                obs = env.set_init_state(initial_states[episode_idx])
+
+            # [DIAG-PROPRIO] One-time per-task check: compare the eval-side
+            # ee_pos / ee_quat (built exactly as the request payload does) against
+            # the training parquet's frame-0 values for this demo. `obs` here is
+            # the demo's t=0 sim state (pre-settle), so it should line up with the
+            # parquet's first row. Mismatched ee_quat (order/sign) or ee_pos points
+            # straight at a proprio convention bug.
+            if hdf5_plan is not None and not getattr(env, "_diag_proprio_logged", False):
+                env._diag_proprio_logged = True
+                try:
+                    import pyarrow.parquet as pq
+
+                    _ep = hdf5_plan[episode_idx]["ep"]
+                    _pq = wm_root / "data" / f"chunk-{_ep // 1000:03d}" / f"episode_{_ep:06d}.parquet"
+                    _row = pq.ParquetFile(str(_pq)).read(columns=["state", "ee_quat"]).to_pylist()[0]
+                    _train_state = np.asarray(_row["state"], dtype=np.float32)
+                    _train_quat = np.asarray(_row["ee_quat"], dtype=np.float32)
+                    _eval_pos = np.asarray(obs["robot0_eef_pos"], dtype=np.float32)
+                    _eval_quat = _canonicalize_quat(obs["robot0_eef_quat"])
+                    _eval_aa = np.asarray(_quat2axisangle(obs["robot0_eef_quat"]), dtype=np.float32)
+                    logging.info(
+                        "[DIAG-PROPRIO] ep=%s EVAL  ee_pos=%s ee_quat=%s ee_aa=%s",
+                        _ep,
+                        np.round(_eval_pos, 4).tolist(),
+                        np.round(_eval_quat, 4).tolist(),
+                        np.round(_eval_aa, 4).tolist(),
+                    )
+                    logging.info(
+                        "[DIAG-PROPRIO] ep=%s TRAIN ee_pos=%s ee_quat=%s ee_aa(state[3:6])=%s",
+                        _ep,
+                        np.round(_train_state[:3], 4).tolist(),
+                        np.round(_train_quat, 4).tolist(),
+                        np.round(_train_state[3:6], 4).tolist(),
+                    )
+                except Exception as _diag_exc:
+                    logging.warning("[DIAG-PROPRIO] failed: %s", _diag_exc)
 
             # Runtime goal selection: pick the libero_wm demo whose t=0 proprio
             # is closest to the env's t=0 proprio after set_init_state. This
@@ -371,7 +545,8 @@ def eval_libero(args: Args) -> None:
             # the same init state, restoring the training distribution where
             # context and goal share a trajectory.
             if (
-                align_by_proprio
+                hdf5_plan is None
+                and align_by_proprio
                 and goal_send_key is not None
                 and candidate_goal_eps
             ):
@@ -392,7 +567,7 @@ def eval_libero(args: Args) -> None:
                         episode_index_override=ep_for_goal,
                     )
                     cached_image = _load_and_preprocess_image(
-                        goal_path, resize_size, args.rotate_images_180
+                        goal_path, resize_size
                     )
                     runtime_goal_image_cache[ep_for_goal] = cached_image
                     runtime_goal_path_cache[ep_for_goal] = goal_path
@@ -417,43 +592,40 @@ def eval_libero(args: Args) -> None:
             replay_images = []
             replay_input_images = []
             episode_policy_started = False
+            # Rolling buffer of preprocessed obs, one entry per env step
+            # (including the settle-wait steps), so inference requests can
+            # carry the last n_obs_steps CONSECUTIVE frames.
+            obs_history = collections.deque(maxlen=max(n_obs_steps, 1))
 
             logging.info(f"Starting episode {task_episodes+1}...")
             while t < max_steps + args.num_steps_wait:
                 try:
                     replay_images.append(np.ascontiguousarray(obs["agentview_image"]))
 
-                    # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
-                    # and we need to wait for them to fall
-                    if t < args.num_steps_wait:
-                        obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
-                        t += 1
-                        continue
-
-                    # Get preprocessed image
-                    img = np.ascontiguousarray(obs["agentview_image"])
-                    wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"])
-                    if args.rotate_images_180:
-                        img = np.ascontiguousarray(img[::-1, ::-1])
-                        wrist_img = np.ascontiguousarray(wrist_img[::-1, ::-1])
+                    # Preprocess the current obs and record it in the per-step
+                    # history BEFORE the settle-wait gate, so by the first
+                    # inference the buffer already holds n_obs_steps
+                    # CONSECUTIVE frames (training gap=1), not duplicates.
+                    img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+                    wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
                     img = image_tools.convert_to_uint8(
                         image_tools.resize_with_pad(img, resize_size, resize_size)
                     )
                     wrist_img = image_tools.convert_to_uint8(
                         image_tools.resize_with_pad(wrist_img, resize_size, resize_size)
                     )
-
-                    # Save preprocessed image for optional debug replay video
-                    replay_input_images.append(img)
-
-                    if not action_plan:
-                        # Finished executing previous action chunk -- compute new chunk
-                        # Prepare observations dict
-                        _ee_pos = np.asarray(obs["robot0_eef_pos"], dtype=np.float32)
-                        _ee_ori = np.asarray(
-                            _quat2axisangle(obs["robot0_eef_quat"]), dtype=np.float32
-                        )
-                        element = {
+                    _ee_pos = np.asarray(obs["robot0_eef_pos"], dtype=np.float32)
+                    _ee_ori = np.asarray(
+                        _quat2axisangle(obs["robot0_eef_quat"]), dtype=np.float32
+                    )
+                    # Scalar-last [x,y,z,w] quaternion, canonicalized to w>=0
+                    # to match the libero_wm `ee_quat` column. `_ee_ori`
+                    # (axis-angle) matches the parquet `state[3:6]` layout.
+                    # `observation/state` keeps the 8D axis-angle layout.
+                    _ee_quat = _canonicalize_quat(obs["robot0_eef_quat"])
+                    _ee_ori_send = _ee_quat if ee_ori_dim == 4 else _ee_ori
+                    obs_history.append(
+                        {
                             "observation/image": img,
                             "observation/wrist_image": wrist_img,
                             # Full 8D proprio (back-compat) plus pre-sliced ee_pos
@@ -467,9 +639,43 @@ def eval_libero(args: Args) -> None:
                                 )
                             ),
                             "observation/ee_pos": _ee_pos,
-                            "observation/ee_ori": _ee_ori,
-                            "prompt": str(task_description),
+                            "observation/ee_ori": _ee_ori_send,
+                            # Raw 7-DoF Panda joint positions. Matches the
+                            # libero_wm `joint_pos` column (from HDF5
+                            # obs/joint_states) so a policy trained on joint_pos
+                            # gets the same proprio online.
+                            "observation/joint_pos": np.asarray(
+                                obs["robot0_joint_pos"], dtype=np.float32
+                            ),
                         }
+                    )
+
+                    # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
+                    # and we need to wait for them to fall
+                    if t < args.num_steps_wait:
+                        obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
+                        t += 1
+                        continue
+
+                    # Save preprocessed image for optional debug replay video
+                    replay_input_images.append(img)
+
+                    if not action_plan:
+                        # Finished executing previous action chunk -- compute new chunk
+                        if stack_obs_history:
+                            # Ship the last n_obs_steps consecutive frames per
+                            # obs key (leading dim = step axis), so the policy
+                            # sees the training-time obs spacing regardless of
+                            # replan_steps.
+                            element = {
+                                key: np.stack(
+                                    [step[key] for step in obs_history], axis=0
+                                )
+                                for key in obs_history[-1]
+                            }
+                        else:
+                            element = dict(obs_history[-1])
+                        element["prompt"] = str(task_description)
                         if not episode_policy_started:
                             element["reset"] = True
                             episode_policy_started = True
@@ -565,8 +771,7 @@ def eval_libero(args: Args) -> None:
                 video_path = video_root / f"task_{task_id:03d}_episode_{episode_idx:03d}_{suffix}.mp4"
                 rendered_frames = []
                 for frame in replay_images:
-                    arr = np.ascontiguousarray(np.asarray(frame)[::-1, ::-1])
-                    pil = Image.fromarray(arr).resize((228, 228), Image.BILINEAR)
+                    pil = Image.fromarray(np.asarray(frame)[::-1, ::-1]).resize((512, 512), Image.BILINEAR)
                     rendered_frames.append(np.asarray(pil))
                 imageio.mimwrite(
                     video_path,
@@ -587,10 +792,8 @@ def eval_libero(args: Args) -> None:
                 )
                 episode_record["policy_input_video_path"] = str(input_video_path)
 
-            # Dump the per-episode goal frame as a 228x228 PNG next to the video.
-            # We re-load from the cached source PNG and rotate 180 degrees so the
-            # saved goal sits in the same orientation as the rollout video, making
-            # visual A/B pairing of "asked goal" vs "actually reached" trivial.
+            # Dump the per-episode goal frame as a 228x228 PNG next to the video,
+            # in its native parquet orientation (no rotation).
             if args.save_videos and episode_idx in task_goal_source_paths:
                 goal_src_path = task_goal_source_paths[episode_idx]
                 goal_png_path = (
@@ -599,7 +802,6 @@ def eval_libero(args: Args) -> None:
                 with Image.open(goal_src_path) as goal_img:
                     goal_img = (
                         goal_img.convert("RGB")
-                        .transpose(Image.ROTATE_180)
                         .resize((228, 228), Image.BILINEAR)
                     )
                     goal_img.save(goal_png_path)
@@ -825,6 +1027,28 @@ def _online_proprio_from_obs(obs: dict) -> np.ndarray:
     )
 
 
+def _libero_wm_episode_base(wm_root: pathlib.Path, full_task: str) -> int:
+    """Return the smallest libero_wm episode_index whose `tasks` includes
+    `full_task`. libero_wm stores a task's demos contiguously in sorted demo
+    order (prepare_libero90_hdf5.py), so HDF5 demo_j == libero_wm episode
+    (base + j). Used by route (b) to map a libero_wm episode to its HDF5 demo.
+    """
+    eps_path = wm_root / "meta" / "episodes.jsonl"
+    base: Optional[int] = None
+    with open(eps_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            if full_task in (rec.get("tasks") or []):
+                idx = int(rec["episode_index"])
+                base = idx if base is None else min(base, idx)
+    if base is None:
+        raise ValueError(f"No libero_wm episode matches task: {full_task!r}")
+    return base
+
+
 def _ensure_goal_frame_from_libero_wm(
     wm_root: pathlib.Path,
     cache_dir: pathlib.Path,
@@ -957,13 +1181,11 @@ def _lookup_goal_path(index: dict, task_id: int, task_description: str) -> Optio
     return None
 
 
-def _load_and_preprocess_image(path: pathlib.Path, resize_size: int, rotate_180: bool) -> np.ndarray:
+def _load_and_preprocess_image(path: pathlib.Path, resize_size: int) -> np.ndarray:
     """Load an image from disk and apply the same preprocessing pipeline used for agentview frames."""
     with Image.open(path) as pil_img:
         rgb = pil_img.convert("RGB")
         arr = np.asarray(rgb, dtype=np.uint8)
-    if rotate_180:
-        arr = np.ascontiguousarray(arr[::-1, ::-1])
     arr = np.asarray(image_tools.resize_with_pad(arr, resize_size, resize_size))
     return image_tools.convert_to_uint8(arr)
 
@@ -984,6 +1206,33 @@ def _quat2axisangle(quat):
         return np.zeros(3)
 
     return (quat[:3] * 2.0 * math.acos(quat[3])) / den
+
+
+def _canonicalize_quat(quat):
+    """Force a scalar-last [x, y, z, w] quaternion into the w>=0 hemisphere so
+    the online ee_ori matches the canonical quaternion baked into the libero_wm
+    `ee_quat` column (q and -q encode the same rotation)."""
+    quat = np.asarray(quat, dtype=np.float32)
+    return -quat if quat[3] < 0.0 else quat
+
+
+def _resolve_ee_ori_dim(server_metadata: dict, default: int = 4) -> int:
+    """Infer the end-effector orientation dim (3=axis-angle, 4=quaternion) the
+    connected policy expects, from the server's per-key ``obs_shapes``.
+
+    Looks for an orientation-like obs key (name contains ``ori``/``quat``/``rot``)
+    and returns its last dim. Falls back to ``default`` (quaternion) when the
+    server predates ``obs_shapes`` or exposes no orientation key — in which case
+    the dim is irrelevant (the policy does not consume ee_ori).
+    """
+    obs_shapes = server_metadata.get("obs_shapes") or {}
+    for key, shape in obs_shapes.items():
+        kl = str(key).lower()
+        if ("ori" in kl or "quat" in kl or "rot" in kl) and shape:
+            dim = int(shape[-1])
+            if dim in (3, 4):
+                return dim
+    return default
 
 
 if __name__ == "__main__":

@@ -1,0 +1,9 @@
+{
+  "_comment": "Init-match diagnostic for the CURRENT libero_wm (this task = episodes 700-749, base=700). No rollout_episode_indices / test_episode_indices on purpose: the rollout falls back to [base + i for i in range(num_trials_per_task)] = 700..749, i.e. demo_0..demo_49 of the HDF5. Use with --init-from-hdf5-root so each episode starts from that demo's own t=0 sim state.",
+  "records": [
+    {
+      "source_task": "KITCHEN_SCENE2_put_the_middle_black_bowl_on_the_plate",
+      "task": "KITCHEN_SCENE2: put the middle black bowl on the plate"
+    }
+  ]
+}

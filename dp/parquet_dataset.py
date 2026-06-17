@@ -471,6 +471,12 @@ class TTTWMParquetImageDataset(BaseImageDataset):
         if image.size != (width, height):
             image = image.resize((width, height), Image.BILINEAR)
 
+        # [rotate180] Feed every RGB obs to the model rotated 180°. The online
+        # rollout server (examples/serve_policy.py) applies the same 180°
+        # rotation in ensure_uint8_hwc_image right before the model, so training
+        # and eval see images in the identical orientation.
+        image = image.rotate(180)
+
         array = np.asarray(image, dtype=np.float32) / 255.0
         return np.moveaxis(array, -1, 0)
 

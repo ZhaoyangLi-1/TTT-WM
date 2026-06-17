@@ -5,6 +5,29 @@ defaults:
 experiment_name: cosmos_stage2_idm_stage${train.substep}_${data.task_dirname}_gap_${data.frame_gap}
 seed: 42
 
+# Aligned with configs/dp_config.yaml: image + proprioception (ee_pos, ee_ori)
+# from the parquet `state` column (8D = ee_pos(3) + ee_axis_angle(3) + gripper_qpos(2)).
+# `predicted_image` is produced on-the-fly by the frozen Stage-2.1 backbone and
+# is NOT sourced from the dataset; it is appended to obs_dict inside
+# InverseDynamicsModelDP. The dataset only needs to provide image-frame obs
+# and the proprio slices declared in `data.obs_slices` below.
+shape_meta:
+  action:
+    shape: [7]   # abs: [xyz(3), rotation_6d(6), gripper(1)]
+  obs:
+    image:
+      shape: [3, 128, 128]
+      type: rgb
+    predicted_image:
+      shape: [3, 128, 128]
+      type: rgb
+    # ee_pos:
+    #   shape: [3]
+    #   type: low_dim
+    # ee_ori:
+    #   shape: [3]      # axis-angle (matches the action's rot input)
+    #   type: low_dim
+
 data:
   use_goal: true
   frame_gap: 4
@@ -25,6 +48,16 @@ data:
   # state_key: state
   # state_pos_slice: [0, 3]
   # state_rot_slice: [3, 6]
+  # Proprio: same convention as dp_config.yaml. `obs_key_mapping` says which
+  # parquet column each proprio obs key reads from, and `obs_slices` carves
+  # the per-key slice out of that column. VideoFrameDataset reads `state`
+  # once per episode and caches the sliced tensors.
+  # obs_key_mapping:
+  #   ee_pos: state
+  #   ee_ori: state
+  # obs_slices:
+  #   ee_pos: [0, 3]
+  #   ee_ori: [3, 6]
 
 # EMA (DDPM power-law schedule). Read by train_stage1.py:Trainer via the
 # inherited Stage2Part2Trainer. Gated by `training.use_ema` (below), which
@@ -104,6 +137,9 @@ train:
     use_stage1_cache: false
     stage1_cache_dir: ""
     require_cache_sha1: true
+    # Reuse top-level shape_meta so the IDM model and the dataset agree on
+    # which obs keys exist (image, predicted_image, ee_pos, ee_ori).
+    shape_meta: ${shape_meta}
     horizon: 4
     n_obs_steps: 1
     n_action_steps: 4

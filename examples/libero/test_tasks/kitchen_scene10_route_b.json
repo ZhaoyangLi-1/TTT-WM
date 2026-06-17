@@ -1,0 +1,11 @@
+{
+  "_comment": "Route (b): consistent + fair eval. Use with --init-from-hdf5-root <LIBERO-90 HDF5 root>. Each listed libero_wm episode is rolled out FROM ITS OWN demo init sim state (HDF5 demo_(ep-base)/states[0]) and uses ITS OWN terminal frame as the goal -> (start, goal) is identical to the within-trajectory training pair. FAIRNESS: only episodes the Stage 2.2 policy was NOT trained on are leak-free. Put the held-out (val) episode indices from the training log line `[stage2.val] episode_indices=...` into BOTH rollout_episode_indices and test_episode_indices. The single value below ([6048]) is the original 1-episode val split; widen it after retraining with a larger val_fraction to get more fair samples.",
+  "records": [
+    {
+      "source_task": "KITCHEN_SCENE10_put_the_butter_at_the_back_in_the_top_drawer_of_the_cabinet_and_close_it",
+      "task": "KITCHEN_SCENE10: put the butter at the back in the top drawer of the cabinet and close it",
+      "rollout_episode_indices": [6048],
+      "test_episode_indices": [6048]
+    }
+  ]
+}

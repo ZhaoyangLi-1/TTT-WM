@@ -271,8 +271,11 @@ def main() -> None:
             ctx_list = []
             goal_list = []
             for s_idx in chunk:
-                # VideoFrameDataset.__getitem__ returns (ctx, tgt, actions, goal)
-                ctx, _tgt, _actions, goal = ds[s_idx]
+                # VideoFrameDataset.__getitem__ returns a 4-tuple (default) or
+                # a 5-tuple when proprio obs is configured; the prebake only
+                # needs ctx/goal, so slice the first four elements.
+                sample = ds[s_idx]
+                ctx, _tgt, _actions, goal = sample[:4]
                 ctx_list.append(ctx)
                 goal_list.append(goal)
             ctx = torch.stack(ctx_list, dim=0).to(device=device, dtype=dtype)

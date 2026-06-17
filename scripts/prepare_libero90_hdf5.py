@@ -8,6 +8,13 @@ set of LIBERO-90 source tasks as held-out tasks and writes their metadata into
 parquet output so downstream evaluation can read them; train.py filters them
 out at load time via `meta/test_tasks.json`.
 
+No-op filtering (NEW):
+    By default, frames whose action is a "no-op" (near-zero translation +
+    rotation AND an unchanged gripper command) are dropped before writing,
+    mirroring OpenVLA's LIBERO preprocessing. This prevents expressive policies
+    (e.g. diffusion policy) from learning to idle/freeze. Disable with
+    `--no-filter-noops`; tune sensitivity with `--noop-eps`.
+
 Example:
     python scripts/prepare_libero90_hdf5.py \
         --base-root /scr2/zhaoyang/libero \
@@ -16,6 +23,7 @@ Example:
         --num-test-tasks 3 \
         --seed 42 \
         --num-workers 48 \
+        --filter-noops \
         --overwrite
 
 Rerunning without `--overwrite` resumes an existing output root. Tasks already
@@ -34,11 +42,53 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
+import sys
+
 import h5py
 import numpy as np
 import pandas as pd
 from PIL import Image
 from tqdm import tqdm
+
+# Make the repo root importable so we can reuse the canonical rotation helper
+# even when this script is launched as `python scripts/prepare_libero90_hdf5.py`
+# (in which case only scripts/ — not the repo root — is on sys.path).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from dp.action_utils import axis_angle_to_quat  # noqa: E402
+
+# Dimensionality of derived proprio columns added on top of the raw LIBERO-90
+# obs. joint_pos = 7-DoF Panda joints; ee_quat = scalar-last [x,y,z,w] end
+# effector orientation converted from the stored axis-angle. Both are used to
+# backfill schema-consistent NaN columns for base episodes that predate them.
+JOINT_POS_DIM = 7
+EE_QUAT_DIM = 4
+
+
+def compute_keep_mask(actions: np.ndarray, eps: float) -> np.ndarray:
+    """Boolean mask (True = KEEP) marking the non-no-op frames of one demo.
+
+    Mirrors OpenVLA's LIBERO no-op definition: a frame is treated as a no-op
+    when its 6-DoF translation+rotation action component is within ``eps`` of
+    zero AND its gripper command is unchanged from the previous frame. Such
+    frames teach expressive single-step / chunked policies to idle and freeze
+    during rollout, so they are dropped from training. The first frame is always
+    kept so every episode keeps a well-defined start.
+
+    ``actions`` is expected to be ``(T, 7)`` = [dx, dy, dz, d_roll, d_pitch,
+    d_yaw, gripper].
+    """
+    actions = np.asarray(actions, dtype=np.float32)
+    n = actions.shape[0]
+    if n == 0:
+        return np.ones(0, dtype=bool)
+    # Per-frame max magnitude over the 6 motion dims (translation + rotation).
+    motion = np.max(np.abs(actions[:, :6]), axis=-1)
+    gripper = actions[:, -1]
+    prev_gripper = np.concatenate(([gripper[0]], gripper[:-1]))
+    gripper_unchanged = np.isclose(gripper, prev_gripper)
+    is_noop = (motion < eps) & gripper_unchanged
+    is_noop[0] = False  # never drop the first frame
+    return ~is_noop
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,6 +112,37 @@ def parse_args() -> argparse.Namespace:
         help="Parallel worker processes for LIBERO-90 demo conversion. 1 disables parallelism.",
     )
     parser.add_argument("--overwrite", action="store_true", help="Remove output_root before writing.")
+    parser.add_argument(
+        "--filter-noops",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Drop no-op frames (near-zero translation+rotation AND unchanged "
+            "gripper) before writing, mirroring OpenVLA's LIBERO filtering. This "
+            "is on by default; pass --no-filter-noops to keep every frame."
+        ),
+    )
+    parser.add_argument(
+        "--noop-eps",
+        type=float,
+        default=1e-3,
+        help=(
+            "Max |action| over the 6 translation/rotation dims that still counts "
+            "as 'no motion'. Increase if too few frames are dropped, decrease if "
+            "real motion is being filtered. Check the reported drop fraction."
+        ),
+    )
+    parser.add_argument(
+        "--on-missing-joint-pos",
+        choices=["nan", "error"],
+        default="nan",
+        help=(
+            "What to do when a --base-root parquet lacks a derived proprio column "
+            "(joint_pos or ee_quat). 'nan' backfills a schema-consistent all-NaN "
+            "column (and warns); 'error' aborts so the schema mismatch is fixed "
+            "upstream."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -270,6 +351,57 @@ def write_episode_dataframe(
     state["total_frames"] += length
 
 
+# Derived proprio columns that freshly converted LIBERO-90 episodes carry but
+# older base datasets may not: (column name, dimensionality).
+DERIVED_COLUMNS: tuple[tuple[str, int], ...] = (
+    ("joint_pos", JOINT_POS_DIM),
+    ("ee_quat", EE_QUAT_DIM),
+)
+
+
+def _ensure_derived_columns(df: pd.DataFrame, on_missing: str, parquet_path: Path) -> list[str]:
+    """Guarantee the dataframe carries every derived proprio column so merged
+    base episodes share the schema of freshly converted LIBERO-90 episodes.
+
+    Returns the list of columns that had to be backfilled. With
+    ``on_missing="error"`` a missing column aborts instead, surfacing the schema
+    mismatch upstream rather than letting NaN proprio silently flow into training.
+    """
+    backfilled: list[str] = []
+    for col, dim in DERIVED_COLUMNS:
+        if col in df.columns:
+            continue
+        if on_missing == "error":
+            raise ValueError(
+                f"Base parquet {parquet_path} has no `{col}` column but the output "
+                f"schema requires it. Re-generate the base dataset with {col}, or "
+                f"pass --on-missing-joint-pos nan to backfill an all-NaN [{dim}] column."
+            )
+        nan_row = np.full(dim, np.nan, dtype=np.float32)
+        df[col] = [nan_row.copy() for _ in range(len(df))]
+        backfilled.append(col)
+    return backfilled
+
+
+def _filter_base_df_noops(df: pd.DataFrame, eps: float) -> tuple[pd.DataFrame, int]:
+    """Drop no-op rows from a merged base-dataset dataframe.
+
+    Returns the filtered dataframe and the number of dropped rows. Stale
+    per-frame index columns are removed so write_episode_dataframe regenerates
+    them contiguously.
+    """
+    if "actions" not in df.columns or len(df) == 0:
+        return df, 0
+    actions_arr = np.stack([np.asarray(a, dtype=np.float32) for a in df["actions"].to_numpy()])
+    keep_mask = compute_keep_mask(actions_arr, eps)
+    dropped = int((~keep_mask).sum())
+    if dropped == 0:
+        return df, 0
+    df = df.loc[keep_mask].reset_index(drop=True)
+    df = df.drop(columns=[c for c in ("index", "frame_index", "timestamp") if c in df.columns])
+    return df, dropped
+
+
 def merge_base_dataset(
     base_root: Path,
     output_root: Path,
@@ -279,6 +411,9 @@ def merge_base_dataset(
     episode_records: list[dict[str, Any]],
     state: dict[str, Any],
     max_base_episodes: int | None,
+    on_missing_joint_pos: str,
+    filter_noops: bool,
+    noop_eps: float,
 ) -> None:
     with open(base_root / "meta" / "info.json") as f:
         base_info = json.load(f)
@@ -293,6 +428,9 @@ def merge_base_dataset(
         base_episode_recs = base_episode_recs[:max_base_episodes]
 
     base_chunks_size = int(base_info["chunks_size"])
+    backfill_counts: Counter[str] = Counter()
+    base_dropped_frames = 0
+    base_raw_frames = 0
     for rec in tqdm(base_episode_recs, desc="base_episodes"):
         episode_index = int(rec["episode_index"])
         task_name = rec["tasks"][0]
@@ -303,6 +441,14 @@ def merge_base_dataset(
             / f"episode_{episode_index:06d}.parquet"
         )
         df = pd.read_parquet(parquet_path)
+        backfill_counts.update(_ensure_derived_columns(df, on_missing_joint_pos, parquet_path))
+        base_raw_frames += len(df)
+        if filter_noops:
+            df, dropped = _filter_base_df_noops(df, noop_eps)
+            base_dropped_frames += dropped
+            if len(df) == 0:
+                # Entirely no-op base episode; skip so we never write an empty parquet.
+                continue
         write_episode_dataframe(
             df=df,
             task_name=task_name,
@@ -312,6 +458,19 @@ def merge_base_dataset(
             task_records=task_records,
             episode_records=episode_records,
             state=state,
+        )
+
+    for col, count in backfill_counts.items():
+        print(
+            f"WARNING: {count} base episode(s) lacked a `{col}` column; backfilled an "
+            f"all-NaN column so the merged dataset stays schema-consistent. Any policy "
+            f"that conditions on `{col}` must mask/skip these episodes (re-generate the "
+            f"base dataset with `{col}` to avoid NaNs)."
+        )
+    if filter_noops and base_raw_frames > 0:
+        print(
+            f"[no-op filter] base dataset: dropped {base_dropped_frames}/{base_raw_frames} "
+            f"frames ({100.0 * base_dropped_frames / base_raw_frames:.1f}%)."
         )
 
 
@@ -342,6 +501,22 @@ def _convert_hdf5_demo_job(job: dict[str, Any]) -> dict[str, Any]:
             ],
             axis=-1,
         )
+        # Raw 7-DoF Panda joint positions, stored as a separate column so
+        # downstream policies can condition on joint space without re-reading
+        # the source HDF5.
+        joint_pos = obs["joint_states"][:].astype(np.float32)
+        if joint_pos.shape[0] != images.shape[0]:
+            raise ValueError(
+                f"{hdf5_path.name}:{job['demo_key']} has {joint_pos.shape[0]} joint_states "
+                f"but {images.shape[0]} images."
+            )
+        # End-effector orientation as a scalar-last [x,y,z,w] quaternion,
+        # converted from the stored axis-angle (ee_states[:, 3:6]) and
+        # canonicalized to w>=0. Lets a policy condition on a 4D quat (matching
+        # the lpb diffusion-policy obs) instead of the 3D axis-angle in `state`.
+        ee_quat = axis_angle_to_quat(
+            obs["ee_states"][:, 3:6].astype(np.float32)
+        ).astype(np.float32)
 
         if images.shape[0] != actions.shape[0]:
             raise ValueError(
@@ -352,8 +527,16 @@ def _convert_hdf5_demo_job(job: dict[str, Any]) -> dict[str, Any]:
                 f"{hdf5_path.name}:{job['demo_key']} has {wrist_images.shape[0]} wrist frames but {images.shape[0]} images."
             )
 
+        # Which source frames survive no-op filtering. Computed at scan time and
+        # passed in via the job so the pre-allocated global indices match exactly.
+        keep_indices = job.get("keep_indices")
+        if keep_indices is None:
+            keep_indices = list(range(images.shape[0]))
+
         rows = []
-        for frame_idx in range(images.shape[0]):
+        # `new_idx` is the contiguous index in the written episode (post-filter);
+        # `frame_idx` is the original source frame it came from.
+        for new_idx, frame_idx in enumerate(keep_indices):
             rows.append(
                 {
                     "image": {
@@ -365,11 +548,13 @@ def _convert_hdf5_demo_job(job: dict[str, Any]) -> dict[str, Any]:
                         "path": f"{hdf5_path.stem}/{job['demo_key']}/wrist_image/{frame_idx:06d}.png",
                     },
                     "state": state_vec[frame_idx],
+                    "joint_pos": joint_pos[frame_idx],
+                    "ee_quat": ee_quat[frame_idx],
                     "actions": actions[frame_idx],
-                    "timestamp": np.float32(frame_idx / job["fps"]),
-                    "frame_index": np.int64(frame_idx),
+                    "timestamp": np.float32(new_idx / job["fps"]),
+                    "frame_index": np.int64(new_idx),
                     "episode_index": np.int64(job["episode_index"]),
-                    "index": np.int64(job["global_frame_index"] + frame_idx),
+                    "index": np.int64(job["global_frame_index"] + new_idx),
                     "task_index": np.int64(job["task_index"]),
                 }
             )
@@ -395,8 +580,13 @@ def build_hdf5_demo_jobs(
     episode_records: list[dict[str, Any]],
     state: dict[str, Any],
     max_demos_per_task: int | None,
+    filter_noops: bool,
+    noop_eps: float,
 ) -> list[dict[str, Any]]:
     jobs: list[dict[str, Any]] = []
+    total_raw_frames = 0
+    total_dropped_frames = 0
+    skipped_empty_demos = 0
     for hdf5_path in tqdm(hdf5_files, desc="scan_libero90", leave=False):
         with h5py.File(hdf5_path, "r") as h5_file:
             data_group = h5_file["data"]
@@ -425,6 +615,26 @@ def build_hdf5_demo_jobs(
                 if state["image_shape"] is None:
                     state["image_shape"] = list(obs[camera_key].shape[1:])
 
+                # Compute which frames survive no-op filtering *here*, at scan
+                # time, so the global frame indices and episode lengths we
+                # allocate below reflect the post-filter counts (no gaps).
+                if filter_noops:
+                    actions_arr = demo["actions"][:].astype(np.float32)
+                    keep_mask = compute_keep_mask(actions_arr, noop_eps)
+                else:
+                    keep_mask = np.ones(frame_count, dtype=bool)
+                keep_indices = np.nonzero(keep_mask)[0].tolist()
+                kept_count = len(keep_indices)
+
+                total_raw_frames += frame_count
+                total_dropped_frames += frame_count - kept_count
+
+                if kept_count == 0:
+                    # Degenerate demo (entirely no-op) — skip it entirely so we
+                    # never allocate an index range or write an empty parquet.
+                    skipped_empty_demos += 1
+                    continue
+
                 episode_index = int(state["episode_index"])
                 global_frame_index = int(state["global_frame_index"])
                 output_path = (
@@ -444,7 +654,8 @@ def build_hdf5_demo_jobs(
                         "task_index": task_index,
                         "episode_index": episode_index,
                         "global_frame_index": global_frame_index,
-                        "length": frame_count,
+                        "length": kept_count,
+                        "keep_indices": keep_indices,
                         "output_path": str(output_path),
                     }
                 )
@@ -452,12 +663,19 @@ def build_hdf5_demo_jobs(
                     {
                         "episode_index": episode_index,
                         "tasks": [task_name],
-                        "length": frame_count,
+                        "length": kept_count,
                     }
                 )
                 state["episode_index"] += 1
-                state["global_frame_index"] += frame_count
-                state["total_frames"] += frame_count
+                state["global_frame_index"] += kept_count
+                state["total_frames"] += kept_count
+
+    if filter_noops and total_raw_frames > 0:
+        print(
+            f"[no-op filter] LIBERO-90: dropped {total_dropped_frames}/{total_raw_frames} "
+            f"frames ({100.0 * total_dropped_frames / total_raw_frames:.1f}%); "
+            f"skipped {skipped_empty_demos} fully-no-op demo(s)."
+        )
 
     return jobs
 
@@ -475,6 +693,8 @@ def convert_hdf5_dataset(
     state: dict[str, Any],
     max_demos_per_task: int | None,
     num_workers: int,
+    filter_noops: bool,
+    noop_eps: float,
 ) -> None:
     jobs = build_hdf5_demo_jobs(
         hdf5_files=hdf5_files,
@@ -488,6 +708,8 @@ def convert_hdf5_dataset(
         episode_records=episode_records,
         state=state,
         max_demos_per_task=max_demos_per_task,
+        filter_noops=filter_noops,
+        noop_eps=noop_eps,
     )
 
     if not jobs:
@@ -558,6 +780,8 @@ def write_metadata(
             "image": {"dtype": "image", "shape": state["image_shape"], "names": ["height", "width", "channel"]},
             "wrist_image": {"dtype": "image", "shape": state["image_shape"], "names": ["height", "width", "channel"]},
             "state": {"dtype": "float32", "shape": [8], "names": ["state"]},
+            "joint_pos": {"dtype": "float32", "shape": [7], "names": ["joint_pos"]},
+            "ee_quat": {"dtype": "float32", "shape": [4], "names": ["ee_quat"]},
             "actions": {"dtype": "float32", "shape": [7], "names": ["actions"]},
             "timestamp": {"dtype": "float32", "shape": [1], "names": None},
             "frame_index": {"dtype": "int64", "shape": [1], "names": None},
@@ -584,6 +808,8 @@ def main() -> None:
     args = parse_args()
     if args.num_workers < 1:
         raise ValueError("--num-workers must be >= 1")
+    if args.noop_eps < 0:
+        raise ValueError("--noop-eps must be >= 0")
     ensure_output_root(args.output_root, overwrite=args.overwrite)
     existing_output = load_existing_output_dataset(args.output_root)
 
@@ -699,6 +925,9 @@ def main() -> None:
             episode_records=episode_records,
             state=state,
             max_base_episodes=args.max_base_episodes,
+            on_missing_joint_pos=args.on_missing_joint_pos,
+            filter_noops=args.filter_noops,
+            noop_eps=args.noop_eps,
         )
 
     convert_hdf5_dataset(
@@ -714,6 +943,8 @@ def main() -> None:
         state=state,
         max_demos_per_task=args.max_demos_per_task,
         num_workers=args.num_workers,
+        filter_noops=args.filter_noops,
+        noop_eps=args.noop_eps,
     )
 
     write_metadata(

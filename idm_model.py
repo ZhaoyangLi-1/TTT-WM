@@ -122,6 +122,7 @@ class InverseDynamicsModelDP(nn.Module):
         eval_fixed_crop: bool = True,
         stage1_micro_batch: Optional[int] = None,
         freeze_stage1: bool = False,
+        shape_meta: Optional[dict] = None,
     ):
         super().__init__()
         _configure_diffusion_policy_import_path()
@@ -160,21 +161,45 @@ class InverseDynamicsModelDP(nn.Module):
             self.stage1.eval()
 
         self.action_dim = cfg.action_dim
-        self.obs_keys = ("image", "predicted_image")
 
-        shape_meta = {
-            "action": {"shape": [self.action_dim]},
-            "obs": {
-                "image": {
-                    "shape": [cfg.num_channels, cfg.resolution, cfg.resolution],
-                    "type": "rgb",
+        # Build shape_meta. If the caller passes one (Stage 2.2 yaml does),
+        # honor it — that's how proprio obs gets declared. Otherwise fall
+        # back to the legacy image-only layout. We always force the obs
+        # image dims to match the Stage-1 backbone resolution so the
+        # DP vision encoder agrees with the frames we feed it.
+        image_shape = [cfg.num_channels, cfg.resolution, cfg.resolution]
+        if shape_meta is None:
+            shape_meta = {
+                "action": {"shape": [self.action_dim]},
+                "obs": {
+                    "image": {"shape": image_shape, "type": "rgb"},
+                    "predicted_image": {"shape": image_shape, "type": "rgb"},
                 },
-                "predicted_image": {
-                    "shape": [cfg.num_channels, cfg.resolution, cfg.resolution],
-                    "type": "rgb",
-                },
-            },
-        }
+            }
+        else:
+            shape_meta = dict(shape_meta)
+            obs_meta = dict(shape_meta.get("obs", {}))
+            for img_key in ("image", "predicted_image"):
+                if img_key in obs_meta:
+                    entry = dict(obs_meta[img_key])
+                    entry["shape"] = list(image_shape)
+                    entry.setdefault("type", "rgb")
+                    obs_meta[img_key] = entry
+                else:
+                    obs_meta[img_key] = {"shape": image_shape, "type": "rgb"}
+            shape_meta["obs"] = obs_meta
+            shape_meta["action"] = {"shape": [self.action_dim]}
+        self.shape_meta = shape_meta
+
+        obs_meta = shape_meta["obs"]
+        self.rgb_keys: tuple[str, ...] = tuple(
+            k for k, v in obs_meta.items() if v.get("type", "rgb") == "rgb"
+        )
+        self.proprio_keys: tuple[str, ...] = tuple(
+            k for k, v in obs_meta.items() if v.get("type") == "low_dim"
+        )
+        # Public alias used elsewhere (e.g. set_action_stats normalizer loop).
+        self.obs_keys = self.rgb_keys
         noise_scheduler = DDPMScheduler(
             num_train_timesteps=num_train_timesteps,
             beta_start=beta_start,
@@ -224,7 +249,9 @@ class InverseDynamicsModelDP(nn.Module):
         del device, has_goal
 
     def set_action_stats(
-        self, action_stats: dict[str, np.ndarray | torch.Tensor]
+        self,
+        action_stats: dict[str, np.ndarray | torch.Tensor],
+        obs_stats: Optional[dict[str, dict[str, np.ndarray | torch.Tensor]]] = None,
     ) -> None:
         action_min = torch.as_tensor(action_stats["min"], dtype=torch.float32)
         action_max = torch.as_tensor(action_stats["max"], dtype=torch.float32)
@@ -236,37 +263,62 @@ class InverseDynamicsModelDP(nn.Module):
                 f"{action_min.numel()} and {action_max.numel()}."
             )
 
+        normalizer = self._linear_normalizer_cls()
+        normalizer["action"] = self._make_range_normalizer(
+            action_min, action_max, action_mean, action_std,
+        )
+        for obs_key in self.rgb_keys:
+            normalizer[obs_key] = self._image_normalizer_factory()
+
+        obs_stats = obs_stats or {}
+        for obs_key in self.proprio_keys:
+            stats = obs_stats.get(obs_key)
+            if stats is None:
+                raise ValueError(
+                    f"Proprio obs key {obs_key!r} declared in shape_meta but "
+                    f"obs_stats is missing it (got keys {sorted(obs_stats)})."
+                )
+            p_min = torch.as_tensor(stats["min"], dtype=torch.float32)
+            p_max = torch.as_tensor(stats["max"], dtype=torch.float32)
+            p_mean = torch.as_tensor(stats["mean"], dtype=torch.float32)
+            p_std = torch.as_tensor(stats["std"], dtype=torch.float32)
+            normalizer[obs_key] = self._make_range_normalizer(
+                p_min, p_max, p_mean, p_std,
+            )
+        self.policy.set_normalizer(normalizer)
+        policy_device = next(self.policy.parameters()).device
+        self.policy.normalizer.to(device=policy_device)
+
+    def _make_range_normalizer(
+        self,
+        v_min: torch.Tensor,
+        v_max: torch.Tensor,
+        v_mean: torch.Tensor,
+        v_std: torch.Tensor,
+    ):
         output_max = 1.0
         output_min = -1.0
         range_eps = 1e-4
 
-        input_range = action_max - action_min
+        input_range = v_max - v_min
         ignore_dim = input_range < range_eps
         input_range = input_range.clone()
         input_range[ignore_dim] = output_max - output_min
 
         scale = (output_max - output_min) / input_range
-        offset = output_min - scale * action_min
-        offset[ignore_dim] = (
-            (output_max + output_min) / 2.0 - action_min[ignore_dim]
-        )
+        offset = output_min - scale * v_min
+        offset[ignore_dim] = (output_max + output_min) / 2.0 - v_min[ignore_dim]
 
-        normalizer = self._linear_normalizer_cls()
-        normalizer["action"] = self._single_field_normalizer_cls.create_manual(
+        return self._single_field_normalizer_cls.create_manual(
             scale=scale.cpu().numpy(),
             offset=offset.cpu().numpy(),
             input_stats_dict={
-                "min": action_min.cpu().numpy(),
-                "max": action_max.cpu().numpy(),
-                "mean": action_mean.cpu().numpy(),
-                "std": action_std.cpu().numpy(),
+                "min": v_min.cpu().numpy(),
+                "max": v_max.cpu().numpy(),
+                "mean": v_mean.cpu().numpy(),
+                "std": v_std.cpu().numpy(),
             },
         )
-        for obs_key in self.obs_keys:
-            normalizer[obs_key] = self._image_normalizer_factory()
-        self.policy.set_normalizer(normalizer)
-        policy_device = next(self.policy.parameters()).device
-        self.policy.normalizer.to(device=policy_device)
 
     @staticmethod
     def _frames_to_policy_range(frames: torch.Tensor) -> torch.Tensor:
@@ -276,13 +328,37 @@ class InverseDynamicsModelDP(nn.Module):
         self,
         input_frames: torch.Tensor,
         pred_frames: torch.Tensor,
+        proprio: Optional[dict[str, torch.Tensor]] = None,
     ) -> dict[str, torch.Tensor]:
         current_frame = self._frames_to_policy_range(input_frames[:, -1:])
         predicted_frame = self._frames_to_policy_range(pred_frames[:, :1])
-        return {
+        obs: dict[str, torch.Tensor] = {
             "image": current_frame,
             "predicted_image": predicted_frame,
         }
+        if self.proprio_keys:
+            if proprio is None:
+                raise ValueError(
+                    "InverseDynamicsModelDP was configured with proprio obs keys "
+                    f"{self.proprio_keys} but no proprio dict was passed to "
+                    "forward()/generate(). Check that the dataset returns it and "
+                    "the trainer threads it through."
+                )
+            for key in self.proprio_keys:
+                tensor = proprio.get(key)
+                if tensor is None:
+                    raise KeyError(
+                        f"Proprio dict missing key {key!r}; got {sorted(proprio)}."
+                    )
+                # Take the trailing n_obs_steps frames so the time-dim matches
+                # the image obs (which uses input_frames[:, -1:]).
+                if tensor.shape[1] < self.n_obs_steps:
+                    raise ValueError(
+                        f"Proprio key {key!r} has only {tensor.shape[1]} frames, "
+                        f"need >= n_obs_steps={self.n_obs_steps}."
+                    )
+                obs[key] = tensor[:, -self.n_obs_steps :].to(input_frames.device)
+        return obs
 
     def _predict_next_frame(
         self,
@@ -322,6 +398,7 @@ class InverseDynamicsModelDP(nn.Module):
         goal: Optional[torch.Tensor] = None,
         *,
         cached_pred_frames: Optional[torch.Tensor] = None,
+        proprio: Optional[dict[str, torch.Tensor]] = None,
     ):
         del target_frames
 
@@ -339,7 +416,7 @@ class InverseDynamicsModelDP(nn.Module):
                 pred_frames = self._predict_next_frame(input_frames, goal=goal)
         else:
             pred_frames = self._predict_next_frame(input_frames, goal=goal)
-        obs_dict = self._build_obs_dict(input_frames, pred_frames)
+        obs_dict = self._build_obs_dict(input_frames, pred_frames, proprio=proprio)
 
         loss = None
         pred_actions = None
@@ -360,8 +437,9 @@ class InverseDynamicsModelDP(nn.Module):
         self,
         input_frames: torch.Tensor,
         goal: Optional[torch.Tensor] = None,
+        proprio: Optional[dict[str, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         pred_frames = self._predict_next_frame(input_frames, goal=goal)
-        obs_dict = self._build_obs_dict(input_frames, pred_frames)
+        obs_dict = self._build_obs_dict(input_frames, pred_frames, proprio=proprio)
         pred_actions = self.policy.predict_action(obs_dict)["action"]
         return pred_frames, pred_actions

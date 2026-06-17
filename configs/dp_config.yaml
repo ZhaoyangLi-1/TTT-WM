@@ -8,12 +8,21 @@ name: diffusion_policy_tttwm
 exp_name: default
 task_name: tttwm_parquet_image
 
+# Master switch for Weights & Biases logging. Set false (e.g. `use_wandb=false`
+# on the CLI) to train without wandb — no run is created and no login is needed.
+# Drives `logging.enabled` below.
+# 验证已确认:use_wandb=False -> logging.enabled=False;use_wandb=True -> logging.enabled=True
+use_wandb: true
+
 outputs_root: ${oc.env:TTT_WM_OUTPUTS_ROOT,/ariesdv0/zhaoyang/data}
 dataset_root: ${oc.env:TTT_WM_DATA_ROOT,/scr2/zhaoyang/libero_wm}
 
 horizon: 4
-n_obs_steps: 1
-n_action_steps: 4
+n_obs_steps: 2
+n_action_steps: 2
+# horizon: 16
+# n_obs_steps: 2
+# n_action_steps: 8
 obs_as_global_cond: true
 
 shape_meta:
@@ -24,16 +33,26 @@ shape_meta:
       shape: [3, 128, 128]
       type: rgb
     # Proprio: world-frame ee pose, sliced out of the parquet `state` (8D
-    # = ee_pos(3) + ee_axis_angle(3) + gripper_qpos(2)). Required for
-    # abs_action targets — without it the policy cannot anchor predictions
-    # to the current robot state and collapses to the training-mean pose
-    # (the visible upward-drift failure mode).
-    # ee_pos:
-    #   shape: [3]
-    #   type: low_dim
-    # ee_ori:
-    #   shape: [3]      # axis-angle (matches the action's rot input)
-    #   type: low_dim
+    # = ee_pos(3) + ee_axis_angle(3) + gripper_qpos(2)).
+    ee_pos:
+      shape: [3]
+      type: low_dim
+    # ee_ori representation is switchable between axis-angle [3] and quaternion
+    # [4]; the parquet carries BOTH (`state[3:6]` axis-angle and `ee_quat`). To
+    # switch reps, change `shape` here AND the matching `obs_key_mapping`/
+    # `obs_slices` entries below (all three marked "ee_ori rep toggle").
+    #   quaternion [4]: shape [4], obs_key_mapping ee_ori->ee_quat, no slice
+    #   axis-angle [3]: shape [3], obs_key_mapping ee_ori->state, slice [3,6]
+    ee_ori:                # ee_ori rep toggle
+      # shape: [4]      # scalar-last [x,y,z,w] quaternion (from parquet `ee_quat`)
+      shape: [3]    # axis-angle (from parquet `state[3:6]`)
+      type: low_dim
+    # Raw 7-DoF Panda joint positions. Sources directly from the parquet
+    # `joint_pos` column (obs_key_mapping defaults key->same-name column, so no
+    # mapping/slice entry needed).
+    joint_pos:
+      shape: [7]
+      type: low_dim
 
 data:
   action_key: actions
@@ -41,7 +60,10 @@ data:
     # Multiple obs keys can source from the same parquet column; the dataset
     # then takes per-key slices via `task.dataset.obs_slices` below.
     ee_pos: state
-    ee_ori: state
+    # ee_ori rep toggle: quaternion reads the dedicated 4D `ee_quat` column
+    # (no slice); for axis-angle [3] map to `state` and add obs_slices [3,6].
+    # ee_ori: ee_quat      # quaternion [4]
+    ee_ori: state          # axis-angle [3]
   val_ratio: 0.02
   selected_task: "KITCHEN_SCENE10: put the butter at the back in the top drawer of the cabinet and close it"
   max_train_episodes: null
@@ -102,26 +124,29 @@ training:
   resume: false
   resume_path: null
   lr_scheduler: cosine
-  lr_warmup_steps: 600
-  num_epochs: 400
+  lr_warmup_steps: 50
+  num_epochs: 600
   gradient_accumulate_every: 1
   grad_clip: 1.0
   use_ema: true   # gates the `ema:` block above; default True if omitted
-  checkpoint_every: 5
+  checkpoint_every: 20
   # Permanent snapshot every N epochs (NOT subject to topk eviction).
   # Filename is 1-indexed completed-epoch count, e.g. after 50 epochs of
   # training → `keep-epoch=0050.ckpt`. The final epoch is always saved.
   # 0 or null disables.
   keep_every_epochs: 20
-  val_every: 5
-  sample_every: 5
+  # Only keep these snapshots during the final fraction of training, e.g.
+  # 0.5 → last 50% of epochs, 0.2 → last 20%. 1.0 keeps from epoch 0.
+  keep_last_fraction: 0.3
+  val_every: 20
+  sample_every: 20
   max_train_steps: null
   max_val_steps: null
   tqdm_interval_sec: 1.0
 
 dataloader:
   batch_size: 64
-  num_workers: 8
+  num_workers: 2
   shuffle: true
   drop_last: true
   pin_memory: true
@@ -129,7 +154,7 @@ dataloader:
 
 val_dataloader:
   batch_size: 64
-  num_workers: 8
+  num_workers: 2
   shuffle: false
   drop_last: false
   pin_memory: true
@@ -171,21 +196,20 @@ task:
     # state_rot_slice: [3, 6]
     # Per-obs slice into source columns referenced via obs_key_mapping.
     # `state` is 8D = ee_pos(3) + ee_axis_angle(3) + gripper_qpos(2).
-    # obs_slices:
-    #   ee_pos: [0, 3]
-    #   ee_ori: [3, 6]
+    # ee_ori rep toggle: quaternion uses the full 4D `ee_quat` column (no slice
+    # entry); for axis-angle [3] uncomment the `ee_ori: [3, 6]` slice into state.
+    obs_slices:
+      ee_pos: [0, 3]
+      ee_ori: [3, 6]       # axis-angle [3] (ee_ori maps to `state`)
 
 checkpoint:
-  topk:
-    monitor_key: val_loss
-    mode: min
-    k: 3
-    format_str: epoch={epoch:04d}-val_loss={val_loss:.4f}.ckpt
+  # No topk / best-val_loss checkpointing: the trainer keeps `last.ckpt` plus
+  # `keep-epoch=*.ckpt` snapshots (training.keep_every_epochs) only.
   save_last_ckpt: true
   save_last_snapshot: false
 
 logging:
-  enabled: true
+  enabled: ${use_wandb}   # toggle wandb via top-level `use_wandb`
   project: TTT-WM-diffusion-V4
   mode: online
   resume: false

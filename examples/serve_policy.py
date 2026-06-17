@@ -103,6 +103,12 @@ EE_ORI_ALIASES = (
     "observation/ee_ori",
     "ee_ori",
 )
+JOINT_POS_ALIASES = (
+    "observation/joint_pos",
+    "joint_pos",
+    "observation/robot0_joint_pos",
+    "robot0_joint_pos",
+)
 GOAL_IMAGE_ALIASES = (
     "observation/goal_image",
     "goal_image",
@@ -195,6 +201,42 @@ def select_dp_weights(payload: dict[str, Any], use_ema: bool) -> tuple[dict[str,
     raise KeyError("DP checkpoint does not contain `state_dicts['model']` or `state_dicts['ema_model']`.")
 
 
+# One-shot debug dump of the exact image fed to the model, so
+# the rollout orientation can be eyeballed against the training-time dump
+# (train_dp.py::_dump_first_batch_obs). Enabled by default; disable with
+# TTT_WM_DUMP_MODEL_INPUT=0. Target dir from TTT_WM_DUMP_DIR (default ./serve_debug_obs).
+# Saves only the first `_DUMP_MAX` images of the run (covers obs/wrist/goal of
+# the initial inference step), then stops touching the hot path.
+_DUMP_MAX = int(os.environ.get("TTT_WM_DUMP_MODEL_INPUT_N", "8"))
+_dump_count = 0
+
+
+def _maybe_dump_model_input(array_hwc_uint8: np.ndarray) -> None:
+    """Save the model-input image (HWC uint8) as PNG, once."""
+    global _dump_count
+    if os.environ.get("TTT_WM_DUMP_MODEL_INPUT", "1") != "1":
+        return
+    if _dump_count >= _DUMP_MAX:
+        return
+    out_dir = Path(os.environ.get("TTT_WM_DUMP_DIR", "serve_debug_obs"))
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        idx = _dump_count
+        Image.fromarray(array_hwc_uint8, mode="RGB").save(
+            out_dir / f"model_input_{idx:02d}.png"
+        )
+        if idx == 0:
+            logger.info(
+                "[DUMP] saving first %d model-input images (post-rotation) to %s "
+                "(disable with TTT_WM_DUMP_MODEL_INPUT=0)",
+                _DUMP_MAX,
+                out_dir.resolve(),
+            )
+    except Exception as exc:  # never let debug I/O break inference
+        logger.warning("[DUMP] failed to save model-input image: %s", exc)
+    _dump_count += 1
+
+
 def ensure_uint8_hwc_image(value: Any, *, resolution: int) -> np.ndarray:
     array = np.asarray(value)
     if array.ndim != 3:
@@ -217,7 +259,13 @@ def ensure_uint8_hwc_image(value: Any, *, resolution: int) -> np.ndarray:
     image = Image.fromarray(array, mode="RGB")
     if image.size != (resolution, resolution):
         image = image.resize((resolution, resolution), Image.BILINEAR)
-    return np.asarray(image, dtype=np.uint8)
+    array = np.ascontiguousarray(np.asarray(image, dtype=np.uint8))
+    # array = np.ascontiguousarray(np.asarray(image, dtype=np.uint8)[::-1, ::-1])
+    # Image.fromarray(array).save('./test.jpg')
+    # breakpoint()
+    # Dump the first few model-input images for orientation check.
+    _maybe_dump_model_input(array)
+    return array
 
 
 def image_to_dp_tensor(value: Any, *, resolution: int) -> torch.Tensor:
@@ -235,7 +283,8 @@ def image_to_world_model_tensor(value: Any, *, resolution: int) -> torch.Tensor:
 def world_tensor_to_uint8_image(tensor: torch.Tensor) -> np.ndarray:
     array = tensor.detach().cpu().float().clamp(-1.0, 1.0)
     array = ((array + 1.0) * 127.5).round().to(torch.uint8).numpy()
-    return np.moveaxis(array, 0, -1)
+    array = np.moveaxis(array, 0, -1)
+    return np.ascontiguousarray(array)
 
 
 def lowdim_to_tensor(value: Any, *, expected_shape: tuple[int, ...]) -> torch.Tensor:
@@ -271,6 +320,8 @@ def infer_source_alias(obs_key: str, obs_type: str) -> tuple[str, ...]:
         return EE_POS_ALIASES
     if "ee_ori" in key or key == "eef_ori" or key == "ee_quat" or key == "eef_quat":
         return EE_ORI_ALIASES
+    if "joint" in key:
+        return JOINT_POS_ALIASES
     if "state" in key:
         return STATE_ALIASES
     return (obs_key,)
@@ -347,12 +398,27 @@ class DPPolicyAdapter(BasePolicyAdapter):
             "causal": True,
             "checkpoint": str(checkpoint_path),
             "weight_source": weight_source,
+            # No image rotation: all frames are passed to the model in their
+            # native orientation.
+            "image_rotation_180": False,
             "input_resolution": self._infer_input_resolution(),
             "action_horizon": self._horizon,
             "action_dim": self._env_action_dim,
             "abs_action": self._abs_action,
             "n_obs_steps": self._n_obs_steps,
+            # Server accepts time-stacked obs (leading dim = step axis). A
+            # client that supports this ships the last n_obs_steps CONSECUTIVE
+            # env frames per request, so the policy is conditioned on the same
+            # obs spacing it saw in training (gap=1 frame) — instead of the
+            # server-side history that accumulates one frame per infer call
+            # (gap=replan_steps), which is out-of-distribution.
+            "obs_history_stacking": True,
             "policy_obs_keys": list(self._obs_meta.keys()),
+            # Per-obs-key expected shapes so a client can ship the matching
+            # representation (e.g. ee_ori as axis-angle [3] vs quaternion [4]).
+            "obs_shapes": {
+                key: list(attr["shape"]) for key, attr in self._obs_meta.items()
+            },
             **preferred,
         }
 
@@ -376,11 +442,33 @@ class DPPolicyAdapter(BasePolicyAdapter):
             }
         }
 
+    def _value_to_step_items(self, raw_value: Any, attr: dict[str, Any]) -> list[torch.Tensor]:
+        """Convert one client obs value into a list of per-step tensors.
+
+        Accepts either a single step (legacy clients) or a time-stacked array
+        whose leading dim is the step axis. Stacking clients send the last
+        n_obs_steps CONSECUTIVE env frames, matching the training-time obs
+        gap of 1 frame (sample_mode=video_frame takes adjacent rows); the
+        legacy single-frame path degrades to gap=replan_steps because the
+        session history only grows by one frame per infer call.
+        """
+        obs_type = attr.get("type", "low_dim")
+        if obs_type == "rgb":
+            resolution = int(attr["shape"][-1])
+            array = np.asarray(raw_value)
+            if array.ndim == 4:  # (T, H, W, C) or (T, C, H, W)
+                return [image_to_dp_tensor(frame, resolution=resolution) for frame in array]
+            return [image_to_dp_tensor(array, resolution=resolution)]
+        expected_shape = tuple(attr["shape"])
+        array = np.asarray(raw_value, dtype=np.float32)
+        if array.ndim == len(expected_shape) + 1:  # (T, ...) stacked
+            return [lowdim_to_tensor(frame, expected_shape=expected_shape) for frame in array]
+        return [lowdim_to_tensor(array, expected_shape=expected_shape)]
+
     def _build_model_obs(self, obs: dict[str, Any], session: dict[str, Any]) -> dict[str, torch.Tensor]:
         if obs.get("reset"):
             for history in session["history"].values():
                 history.clear()
-
         model_obs: dict[str, torch.Tensor] = {}
         for key, attr in self._obs_meta.items():
             raw_value = try_get(obs, self._source_aliases[key])
@@ -391,19 +479,22 @@ class DPPolicyAdapter(BasePolicyAdapter):
                     f"Missing observation for policy key {key!r}. Tried aliases: {self._source_aliases[key]}"
                 )
 
-            obs_type = attr.get("type", "low_dim")
-            if obs_type == "rgb":
-                resolution = int(attr["shape"][-1])
-                item = image_to_dp_tensor(raw_value, resolution=resolution)
-            else:
-                item = lowdim_to_tensor(raw_value, expected_shape=tuple(attr["shape"]))
-
+            items = self._value_to_step_items(raw_value, attr)
             history: deque[torch.Tensor] = session["history"][key]
-            if not history:
+            if len(items) > 1:
+                # Client ships its own consecutive-frame history; trust it
+                # verbatim instead of accumulating one frame per infer call.
+                history.clear()
+                history.extend(items[-self._n_obs_steps :])
+            elif not history:
                 for _ in range(self._n_obs_steps):
-                    history.append(item.clone())
+                    history.append(items[0].clone())
             else:
-                history.append(item)
+                history.append(items[0])
+            # Left-pad with the oldest frame if the client sent fewer steps
+            # than n_obs_steps (e.g. the very first frame of an episode).
+            while len(history) < self._n_obs_steps:
+                history.appendleft(history[0].clone())
 
             stacked = torch.stack(list(history), dim=0).unsqueeze(0).to(self._device)
             model_obs[key] = stacked
@@ -412,6 +503,7 @@ class DPPolicyAdapter(BasePolicyAdapter):
 
     def infer(self, obs: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
         model_obs = self._build_model_obs(obs, session)
+        # breakpoint()
         start = time.monotonic()
         with torch.no_grad():
             result = self._policy.predict_action(model_obs)
@@ -462,6 +554,9 @@ class Stage2PolicyAdapter(BasePolicyAdapter):
             "causal": True,
             "checkpoint": str(checkpoint_path),
             "weight_source": weight_source,
+            # No image rotation: all frames are passed to the model in their
+            # native orientation.
+            "image_rotation_180": False,
             "input_resolution": self._resolution,
             "frames_in": self._frames_in,
             "action_horizon": self._action_horizon,
@@ -589,6 +684,9 @@ class PureIDMPolicyAdapter(BasePolicyAdapter):
             "causal": False,
             "checkpoint": str(checkpoint_path),
             "weight_source": weight_source,
+            # No image rotation: all frames are passed to the model in their
+            # native orientation.
+            "image_rotation_180": False,
             "input_resolution": self._resolution,
             "action_horizon": self._action_horizon,
             "action_dim": self._env_action_dim,
@@ -1071,7 +1169,7 @@ def main() -> None:
                 continue
             try:
                 # ``default`` (inductor JIT) instead of ``reduce-overhead``: the
-                # diffusion U-Net forward receives ``timesteps`` as a CPU scalar
+                # diffusion U-Net forward receives ``timesteps`` as a CPU scalarF
                 # tensor (it does ``timesteps.to(sample.device)`` internally),
                 # which makes CUDA Graph capture fall back to eager. ``default``
                 # still kernel-fuses without requiring all-cuda inputs.

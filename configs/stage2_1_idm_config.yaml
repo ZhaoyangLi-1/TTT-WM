@@ -7,7 +7,7 @@ seed: 42
 
 data:
   use_goal: true
-  frame_gap: 4
+  frame_gap: 12
   test_task_count: 1
   selected_task: ""                                 # required — must be one of the 3 held-out tasks in meta/test_tasks.json
   task_dirname: ${task_slug:${data.selected_task}}

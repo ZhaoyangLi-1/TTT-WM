@@ -24,7 +24,6 @@ from dp.common import (
     ModelEMA,
     NullLogger,
     NullRun,
-    TopKCheckpointManager,
     align_action_tensors,
     cleanup_distributed,
     dict_apply,
@@ -154,39 +153,6 @@ class TrainDiffusionWorkspace(BaseWorkspace):
                 step_log["train_action_mse_error"]
             )
         return wandb_log
-
-    def _refresh_best_symlink(self, topk_manager) -> None:
-        """Point `<ckpt_dir>/best.ckpt` at the current best topk member.
-
-        Best = min value when `topk.mode == "min"`, else max. The symlink is
-        replaced atomically (rename) so concurrent readers see either the
-        old or new target, never a missing file. Falls back to a copy on
-        filesystems that don't support symlinks.
-        """
-        items = topk_manager.path_value_map
-        if not items:
-            return
-        reverse = topk_manager.mode == "max"
-        best_path = sorted(items.items(), key=lambda kv: kv[1], reverse=reverse)[0][0]
-        save_dir = Path(topk_manager.save_dir)
-        link_path = save_dir / "best.ckpt"
-        tmp_path = save_dir / "best.ckpt.tmp"
-        target = Path(best_path)
-        if not target.is_file():
-            return  # ckpt save may have failed; skip rather than dangle the link
-        try:
-            if tmp_path.exists() or tmp_path.is_symlink():
-                tmp_path.unlink()
-            try:
-                tmp_path.symlink_to(target.name)
-                os.replace(tmp_path, link_path)
-            except OSError:
-                # Filesystem doesn't allow symlinks — fall back to a copy.
-                import shutil
-                shutil.copy2(target, tmp_path)
-                os.replace(tmp_path, link_path)
-        except Exception as exc:
-            print(f"[train_workspace] best.ckpt symlink update failed: {exc}")
 
     def _resolve_training_device(self, cfg: OmegaConf) -> torch.device:
         device_name = str(cfg.training.device)
@@ -355,14 +321,6 @@ class TrainDiffusionWorkspace(BaseWorkspace):
                     f" mode={OmegaConf.select(cfg, 'logging.mode', default='online')})..."
                 )
             wandb_run = self._init_wandb(cfg)
-            topk_manager = (
-                TopKCheckpointManager(
-                    save_dir=os.path.join(self.output_dir, "checkpoints"),
-                    **OmegaConf.to_container(cfg.checkpoint.topk, resolve=True),
-                )
-                if self.is_main
-                else None
-            )
 
             train_sampling_batch = None
             log_path = os.path.join(self.output_dir, "logs.jsonl")
@@ -514,24 +472,11 @@ class TrainDiffusionWorkspace(BaseWorkspace):
                         if cfg.checkpoint.save_last_snapshot:
                             self.save_snapshot()
 
-                        metric_dict = {
-                            key.replace("/", "_"): value for key, value in step_log.items()
-                        }
-                        topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict) if topk_manager is not None else None
-                        if topk_ckpt_path is not None:
-                            self.save_checkpoint(path=topk_ckpt_path)
-
-                        # Maintain a convenience `best.ckpt` symlink pointing at
-                        # the lowest-val_loss (or highest, depending on `mode`)
-                        # member of the topk set, so downstream eval / rollout
-                        # never has to grep filenames.
-                        if topk_manager is not None and topk_manager.path_value_map:
-                            self._refresh_best_symlink(topk_manager)
-
-                    # Periodic permanent snapshots — independent of topk
-                    # eviction, so a long training run leaves a dense ladder
-                    # of ckpts for post-hoc analysis (e.g. every 50 epochs of
-                    # a 3000-epoch run → 60 snapshots that all survive).
+                    # Permanent keep checkpoints. No best-val_loss / topk
+                    # checkpoints are kept. A snapshot is saved every
+                    # `keep_every_epochs` epochs but ONLY during the final
+                    # `keep_last_fraction` of training (e.g. 0.5 → last 50%);
+                    # the final epoch is always saved.
                     # `completed_epochs` is 1-indexed (number of epochs that
                     # have actually run), so the filename matches what the
                     # user typed in `keep_every_epochs`.
@@ -541,7 +486,16 @@ class TrainDiffusionWorkspace(BaseWorkspace):
                     if self.is_main and keep_every_epochs > 0:
                         completed_epochs = self.epoch + 1
                         total_epochs = int(cfg.training.num_epochs)
-                        is_keep_epoch = (completed_epochs % keep_every_epochs == 0)
+                        keep_last_fraction = float(
+                            OmegaConf.select(
+                                cfg, "training.keep_last_fraction", default=0.5
+                            )
+                        )
+                        keep_start_epoch = total_epochs * (1.0 - keep_last_fraction)
+                        in_keep_window = completed_epochs >= keep_start_epoch
+                        is_keep_epoch = in_keep_window and (
+                            completed_epochs % keep_every_epochs == 0
+                        )
                         is_last_epoch = (completed_epochs == total_epochs)
                         if is_keep_epoch or is_last_epoch:
                             keep_path = os.path.join(

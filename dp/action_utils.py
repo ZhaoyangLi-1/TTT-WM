@@ -11,6 +11,40 @@ from __future__ import annotations
 import numpy as np
 
 
+def canonicalize_quat(quat: np.ndarray) -> np.ndarray:
+    """Force a scalar-last ``[x, y, z, w]`` quaternion into the ``w >= 0``
+    hemisphere. A quaternion ``q`` and ``-q`` encode the same rotation, so this
+    removes the double-cover ambiguity and gives every orientation a single
+    canonical representation — important so train-time (derived from axis-angle)
+    and eval-time (raw env ``robot0_eef_quat``) quats agree bit-for-bit in sign.
+    """
+    quat = np.asarray(quat, dtype=np.float32)
+    flip = quat[..., 3:4] < 0.0
+    return np.where(flip, -quat, quat).astype(np.float32)
+
+
+def axis_angle_to_quat(aa: np.ndarray) -> np.ndarray:
+    """Axis-angle (rotation vector) -> scalar-last ``[x, y, z, w]`` quaternion.
+
+    Exact inverse of robosuite's ``quat2axisangle`` (the ``_quat2axisangle`` used
+    by the LIBERO rollout client), so converting the parquet's stored axis-angle
+    recovers the env's original quaternion. Output is canonicalized to ``w >= 0``.
+    """
+    aa = np.asarray(aa, dtype=np.float32)
+    theta = np.linalg.norm(aa, axis=-1, keepdims=True)
+    safe = np.where(theta < 1e-8, np.float32(1.0), theta).astype(np.float32)
+    axis = aa / safe
+    half = 0.5 * theta
+    sin_half = np.sin(half)
+    xyz = axis * sin_half
+    w = np.cos(half)
+    # theta ~ 0 -> identity quaternion [0, 0, 0, 1].
+    xyz = np.where(theta < 1e-8, np.zeros_like(xyz), xyz)
+    w = np.where(theta < 1e-8, np.ones_like(w), w)
+    quat = np.concatenate([xyz, w], axis=-1).astype(np.float32)
+    return canonicalize_quat(quat)
+
+
 def axis_angle_to_rotation_6d(aa: np.ndarray) -> np.ndarray:
     aa = np.asarray(aa, dtype=np.float32)
     theta = np.linalg.norm(aa, axis=-1, keepdims=True)

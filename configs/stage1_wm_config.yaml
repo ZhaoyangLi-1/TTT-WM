@@ -30,7 +30,7 @@ data:
   action_key: actions
   action_dim: 7
   use_goal: true
-  frame_gap: 4
+  frame_gap: 12
   val_split: 0.1
   test_task_count: 3
   test_tasks: []
