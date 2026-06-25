@@ -4,8 +4,8 @@
     {
       "source_task": "KITCHEN_SCENE10_put_the_butter_at_the_back_in_the_top_drawer_of_the_cabinet_and_close_it",
       "task": "KITCHEN_SCENE10: put the butter at the back in the top drawer of the cabinet and close it",
-      "rollout_episode_indices": [6048],
-      "test_episode_indices": [6048]
+      "rollout_episode_indices": [155],
+      "test_episode_indices": [155]
     }
   ]
 }

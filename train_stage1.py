@@ -1995,9 +1995,10 @@ class Trainer:
             self.model.train(prev_mode)
             return
 
-        # Slice first 4 items so we also accept datasets that return
-        # 5-tuples (Stage 2.2 + cached-stage1-pred path). Logging doesn't
-        # need the prebaked pred_frames.
+        # Take the first 4 items (ctx, tgt, actions, goal); datasets may return
+        # 5-/6-tuples (Stage 2.2 proprio and/or cached-stage1-pred path). The
+        # prebaked pred_frames are not needed here (the backbone recomputes
+        # them), but proprio IS needed when the IDM declares proprio obs keys.
         items = [ds[i] for i in indices]
         ctx_list = [it[0] for it in items]
         tgt_list = [it[1] for it in items]
@@ -2008,8 +2009,21 @@ class Trainer:
         actions = torch.stack(act_list).to(self.device)
         goals = torch.stack(goal_list).to(self.device) if self.use_goal else None
 
+        # Proprio (Stage 2.2 with proprio obs): the 5th item is a
+        # {key: (obs_history, dim)} dict. Batch it per key and thread it through
+        # so the IDM obs build has the proprio it expects; models without
+        # proprio leave this None (the base Trainer._forward ignores it).
+        proprio = None
+        if len(items[0]) >= 5 and isinstance(items[0][4], dict):
+            proprio = {
+                k: torch.stack([it[4][k] for it in items]).to(self.device)
+                for k in items[0][4]
+            }
+
         with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
-            pred_frames, _ = self._forward(raw, context, target, actions, goals)
+            pred_frames, _ = self._forward(
+                raw, context, target, actions, goals, proprio=proprio
+            )
 
         if self.ema:
             self.ema.restore(raw)
@@ -2076,9 +2090,10 @@ class Trainer:
             self.model.train(prev_mode)
             return
 
-        # Slice first 4 items so we also accept datasets that return
-        # 5-tuples (Stage 2.2 + cached-stage1-pred path). Logging doesn't
-        # need the prebaked pred_frames.
+        # Take the first 4 items (ctx, tgt, actions, goal); datasets may return
+        # 5-/6-tuples (Stage 2.2 proprio and/or cached-stage1-pred path). The
+        # prebaked pred_frames are not needed here (the backbone recomputes
+        # them), but proprio IS needed when the IDM declares proprio obs keys.
         items = [ds[i] for i in indices]
         ctx_list = [it[0] for it in items]
         tgt_list = [it[1] for it in items]
@@ -2089,8 +2104,21 @@ class Trainer:
         actions = torch.stack(act_list).to(self.device)
         goals = torch.stack(goal_list).to(self.device) if self.use_goal else None
 
+        # Proprio (Stage 2.2 with proprio obs): the 5th item is a
+        # {key: (obs_history, dim)} dict. Batch it per key and thread it through
+        # so the IDM obs build has the proprio it expects; models without
+        # proprio leave this None (the base Trainer._forward ignores it).
+        proprio = None
+        if len(items[0]) >= 5 and isinstance(items[0][4], dict):
+            proprio = {
+                k: torch.stack([it[4][k] for it in items]).to(self.device)
+                for k in items[0][4]
+            }
+
         with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
-            pred_frames, _ = self._forward(raw, context, target, actions, goals)
+            pred_frames, _ = self._forward(
+                raw, context, target, actions, goals, proprio=proprio
+            )
 
         if self.ema:
             self.ema.restore(raw)
