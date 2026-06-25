@@ -30,15 +30,15 @@ shape_meta:
     predicted_image:
       shape: [3, 128, 128]
       type: rgb
-    # ee_pos:
-    #   shape: [3]
-    #   type: low_dim
-    # ee_ori:
-    #   shape: [3]      # axis-angle (matches the action's rot input)
-    #   type: low_dim
-    # joint_pos:
-    #   shape: [7]
-    #   type: low_dim
+    ee_pos:
+      shape: [3]
+      type: low_dim
+    ee_ori:
+      shape: [3]      # axis-angle (matches the action's rot input)
+      type: low_dim
+    joint_pos:
+      shape: [7]
+      type: low_dim
 
 data:
   use_goal: true
@@ -78,13 +78,13 @@ data:
   # or _build_obs_dict raises on the first step. joint_pos reads its own 7D
   # column whole (no slice); ee_pos/ee_ori slice the shared 8D `state` column.
 
-  # obs_key_mapping:
-  #   ee_pos: state
-  #   ee_ori: state
-  #   joint_pos: joint_pos
-  # obs_slices:
-  #   ee_pos: [0, 3]
-  #   ee_ori: [3, 6]       # axis-angle [3] out of the 8D `state` column
+  obs_key_mapping:
+    ee_pos: state
+    ee_ori: state
+    joint_pos: joint_pos
+  obs_slices:
+    ee_pos: [0, 3]
+    ee_ori: [3, 6]       # axis-angle [3] out of the 8D `state` column
 
 # EMA (DDPM power-law schedule). Read by train_stage1.py:Trainer via the
 # inherited Stage2Part2Trainer. Gated by `training.use_ema` (below), which
@@ -227,4 +227,4 @@ hydra:
   job:
     override_dirname: stage${train.substep}_g${data.frame_gap}
   run:
-    dir: ${outputs_root}/stage2_idm/${data.task_dirname}/stage${train.substep}/${now:%Y-%m-%d}/${now:%H-%M-%S}_g${data.frame_gap}
+    dir: ${outputs_root}/stage2_idm/${data.task_dirname}/stage${train.substep}/${now:%Y-%m-%d}/${now:%H-%M-%S}_g${data.frame_gap}_propri

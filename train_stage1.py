@@ -1951,6 +1951,30 @@ class Trainer:
             return []
         return torch.randperm(len(ds))[:n].tolist()
 
+    def _video_or_image(self, frames_thwc, caption):
+        """Build a wandb media object for a frame sequence ``frames_thwc``
+        (T, H, W, C) uint8. Prefers ``wandb.Video`` (mp4), but that needs
+        moviepy; when it is unavailable we fall back to a horizontally-tiled
+        ``wandb.Image`` so logging never crashes the run. Install
+        ``moviepy`` / ``wandb[media]`` to get real videos."""
+        try:
+            return wandb.Video(
+                frames_thwc.transpose(0, 3, 1, 2), fps=4, format="mp4"
+            )
+        except Exception as exc:  # moviepy missing / encode failure
+            if not getattr(self, "_warned_video_fallback", False):
+                log.warning(
+                    "wandb.Video unavailable (%s); logging frame sequences as "
+                    "tiled images instead. `pip install moviepy` (or "
+                    "wandb[media]) to enable video logging.",
+                    exc,
+                )
+                self._warned_video_fallback = True
+            strip = np.concatenate(
+                [frames_thwc[t] for t in range(frames_thwc.shape[0])], axis=1
+            )
+            return wandb.Image(strip, caption=caption)
+
     @torch.no_grad()
     def _log_val_videos(self, n_samples=3, val_loss=None):
         # FIX: only rank 0 enters this function; no ddp_barrier / broadcast needed.
@@ -2016,15 +2040,11 @@ class Trainer:
                     np.concatenate(parts, axis=1), caption=caption
                 )
             else:
-                media[f"val/sample_{i}_target"] = wandb.Video(
-                    np.concatenate([ctx_np, tgt_np], axis=0).transpose(0, 3, 1, 2),
-                    fps=4,
-                    format="mp4",
+                media[f"val/sample_{i}_target"] = self._video_or_image(
+                    np.concatenate([ctx_np, tgt_np], axis=0), "ctx|tgt"
                 )
-                media[f"val/sample_{i}_pred"] = wandb.Video(
-                    np.concatenate([ctx_np, pred_np], axis=0).transpose(0, 3, 1, 2),
-                    fps=4,
-                    format="mp4",
+                media[f"val/sample_{i}_pred"] = self._video_or_image(
+                    np.concatenate([ctx_np, pred_np], axis=0), "ctx|pred"
                 )
                 if self.use_goal and goals is not None:
                     goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
@@ -2101,15 +2121,11 @@ class Trainer:
                     np.concatenate(parts, axis=1), caption=caption
                 )
             else:
-                media[f"train/sample_{i}_target"] = wandb.Video(
-                    np.concatenate([ctx_np, tgt_np], axis=0).transpose(0, 3, 1, 2),
-                    fps=4,
-                    format="mp4",
+                media[f"train/sample_{i}_target"] = self._video_or_image(
+                    np.concatenate([ctx_np, tgt_np], axis=0), "ctx|tgt"
                 )
-                media[f"train/sample_{i}_pred"] = wandb.Video(
-                    np.concatenate([ctx_np, pred_np], axis=0).transpose(0, 3, 1, 2),
-                    fps=4,
-                    format="mp4",
+                media[f"train/sample_{i}_pred"] = self._video_or_image(
+                    np.concatenate([ctx_np, pred_np], axis=0), "ctx|pred"
                 )
                 if self.use_goal and goals is not None:
                     goal_np = self._frames_to_uint8(goals[i].unsqueeze(0))
