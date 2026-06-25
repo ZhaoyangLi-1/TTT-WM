@@ -157,6 +157,10 @@ def resolve_checkpoint_path(path_or_dir: str) -> Path:
     preferred = [
         path / "last.pt",
         path / "best.pt",
+        # Stage 2.2 (aligned with train_dp.py) writes DP-style names; prefer the
+        # rolling latest over any permanent keep-epoch=XXXX.ckpt snapshots,
+        # whether `path` is the run dir or the checkpoints/ dir itself.
+        path / "latest.ckpt",
         path / "checkpoints" / "latest.ckpt",
     ]
     for candidate in preferred:
@@ -538,6 +542,12 @@ class Stage2PolicyAdapter(BasePolicyAdapter):
         model_cfg = cfg["model"]
         data_cfg = cfg["data"]
         self._frames_in = int(model_cfg["frames_in"])
+        # Number of real history frames the IDM obs expects (exposed as the
+        # separate rgb keys image/image_prev1/…). Read straight off the model so
+        # the rollout context window matches training exactly; falls back to
+        # frames_in (legacy). NOTE: this adapter does not feed proprio, so it
+        # only supports image-only (no-proprio) Stage 2.2 checkpoints.
+        self._obs_history = int(getattr(model, "n_obs_steps", self._frames_in))
         self._resolution = int(model_cfg["resolution"])
         self._use_goal = bool(data_cfg.get("use_goal", False))
         self._action_horizon = int(data_cfg.get("frame_gap", 1))
@@ -574,7 +584,7 @@ class Stage2PolicyAdapter(BasePolicyAdapter):
 
     def new_session(self) -> dict[str, Any]:
         return {
-            "image_history": deque(maxlen=self._frames_in),
+            "image_history": deque(maxlen=self._obs_history),
             "warned_missing_goal": False,
         }
 
@@ -590,7 +600,7 @@ class Stage2PolicyAdapter(BasePolicyAdapter):
         image = image_to_world_model_tensor(image_value, resolution=self._resolution)
         history: deque[torch.Tensor] = session["image_history"]
         if not history:
-            for _ in range(self._frames_in):
+            for _ in range(self._obs_history):
                 history.append(image.clone())
         else:
             history.append(image)

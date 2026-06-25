@@ -438,6 +438,20 @@ class VideoFrameDataset(Dataset):
         self.is_main = is_main
         self.fin = model_cfg.frames_in
         self.fout = model_cfg.frames_out
+        # Number of real history input frames to expose as the context window.
+        # Defaults to `fin` (the backbone's context length) so Stage 1 / 2.1 are
+        # unchanged. Stage 2.2 "variant 1" sets data.obs_history > fin to feed
+        # the IDM extra history frames (e.g. 2 history + 1 predicted = 3 images);
+        # the frozen backbone still only consumes its trailing `fin` frames.
+        # Extra history is taken from BEFORE `start` and left-padded (earliest
+        # frame repeated) at episode boundaries, so the sample span is unchanged.
+        self.obs_history = int(data_cfg.get("obs_history", self.fin))
+        if self.obs_history < self.fin:
+            raise ValueError(
+                f"data.obs_history ({self.obs_history}) must be >= "
+                f"model.frames_in ({self.fin})."
+            )
+        self._n_pre = self.obs_history - self.fin  # extra frames before `start`
         self.gap = int(data_cfg.frame_gap)
         self.image_key = data_cfg.get("image_key", "image")
         self.action_key = data_cfg.get("action_key", "actions")
@@ -460,42 +474,36 @@ class VideoFrameDataset(Dataset):
                     f"abs_action=true requires data.action_dim=10, got {action_dim_cfg}"
                 )
 
-        # Optional proprio obs (Stage 2.2): when both obs_key_mapping and
-        # obs_slices are configured, __getitem__ appends a proprio dict as
-        # the 5th tuple element. Each entry has shape (fin, dim) — the
-        # downstream policy slices the last n_obs_steps frames itself.
-        # Mirrors dp_config.yaml's data.obs_key_mapping + task.dataset.obs_slices.
+        # Optional proprio obs (Stage 2.2): any obs key declared in
+        # data.obs_key_mapping is treated as a low_dim proprio obs, sourced from
+        # the mapped parquet column (mirrors TTTWMParquetImageDataset). A slice
+        # in data.obs_slices is OPTIONAL: keys without one take the whole column
+        # (e.g. joint_pos -> `joint_pos`), keys with one carve a sub-range out of
+        # a shared column (e.g. ee_pos/ee_ori out of `state`). __getitem__ then
+        # appends a proprio dict {key: (obs_history, dim)} aligned with the image
+        # context window; the downstream IDM slices the last n_obs_steps itself.
         raw_obs_map = data_cfg.get("obs_key_mapping", None) or {}
         raw_obs_slices = data_cfg.get("obs_slices", None) or {}
-        if hasattr(raw_obs_map, "items"):
-            obs_map = {str(k): str(v) for k, v in raw_obs_map.items()}
-        else:
-            obs_map = dict(raw_obs_map)
-        if hasattr(raw_obs_slices, "items"):
-            obs_slices = {
-                str(k): (int(v[0]), int(v[1])) for k, v in raw_obs_slices.items()
-            }
-        else:
-            obs_slices = {
-                str(k): (int(v[0]), int(v[1])) for k, v in dict(raw_obs_slices).items()
-            }
+        obs_map_items = (
+            raw_obs_map.items() if hasattr(raw_obs_map, "items") else dict(raw_obs_map).items()
+        )
+        obs_slice_items = (
+            raw_obs_slices.items()
+            if hasattr(raw_obs_slices, "items")
+            else dict(raw_obs_slices).items()
+        )
+        obs_map = {str(k): str(v) for k, v in obs_map_items}
+        obs_slices = {str(k): (int(v[0]), int(v[1])) for k, v in obs_slice_items}
         self.obs_key_mapping: dict[str, str] = obs_map
         self.obs_slices: dict[str, tuple[int, int]] = obs_slices
-        # Only the proprio (low_dim) keys we expose to __getitem__: any obs
-        # key that has both a column mapping and a slice configured.
-        self.proprio_keys: tuple[str, ...] = tuple(
-            sorted(k for k in obs_map if k in obs_slices)
-        )
+        # A proprio key is any obs key with a source-column mapping (slice
+        # optional). Sorted for deterministic ordering / cache signatures.
+        self.proprio_keys: tuple[str, ...] = tuple(sorted(obs_map))
         self.has_proprio = bool(self.proprio_keys)
-        if self.has_proprio:
-            unknown_cols = {
-                self.obs_key_mapping[k] for k in self.proprio_keys
-            } - {self.state_key}
-            if unknown_cols:
-                raise ValueError(
-                    "VideoFrameDataset only supports proprio sourced from the "
-                    f"state column ({self.state_key!r}); got {sorted(unknown_cols)}."
-                )
+        # Distinct source columns we must read for proprio.
+        self.proprio_columns: tuple[str, ...] = tuple(
+            sorted({obs_map[k] for k in self.proprio_keys})
+        )
         self._res = model_cfg.resolution
         self.transform = transforms.Compose(
             [
@@ -636,9 +644,9 @@ class VideoFrameDataset(Dataset):
         # Per-episode 10D abs actions, keyed by parquet path. Same eviction
         # discipline as _parquet_cache; only populated when abs_action=True.
         self._abs_action_cache: dict[str, np.ndarray] = {}
-        # Per-episode raw `state` arrays (T, state_dim). Populated lazily by
-        # _get_state_array, only when proprio obs are configured.
-        self._state_cache: dict[str, np.ndarray] = {}
+        # Per-episode proprio source columns (T, dim), keyed by (path, column).
+        # Populated lazily by _get_column_array, only when proprio obs are used.
+        self._column_cache: dict[tuple[str, str], np.ndarray] = {}
         self._obs_stats_cache: dict[str, dict[str, np.ndarray]] | None = None
 
     def _pt_path(self, parquet_path: str) -> str:
@@ -678,36 +686,44 @@ class VideoFrameDataset(Dataset):
             oldest = next(iter(self._parquet_cache))
             del self._parquet_cache[oldest]
         cols = [self.image_key, self.action_key]
-        if self.abs_action or self.has_proprio:
+        if self.abs_action:
             cols.append(self.state_key)
+        if self.has_proprio:
+            cols.extend(self.proprio_columns)
+        cols = list(dict.fromkeys(cols))  # dedup, preserve order
         df = pd.read_parquet(path, columns=cols)
         self._parquet_cache[path] = df
         return df
 
     def _get_state_array(self, parquet_path: str) -> np.ndarray:
-        """Return per-episode state column as np.ndarray (T, state_dim). Cached
-        per parquet path with the same eviction discipline as the other caches.
-        Used by the proprio obs path (Stage 2.2) — the .pt fast path doesn't
-        carry state, so we read the parquet's state column once per episode.
+        """Per-episode `state` column as np.ndarray (T, state_dim)."""
+        return self._get_column_array(parquet_path, self.state_key)
+
+    def _get_column_array(self, parquet_path: str, column: str) -> np.ndarray:
+        """Return a per-episode scalar/vector column as np.ndarray (T, dim),
+        cached per (path, column). Used by the proprio obs path (Stage 2.2) —
+        the .pt fast path doesn't carry these columns, so we read them from the
+        parquet once per episode. Generalizes the old state-only reader so
+        proprio can source from any column (e.g. `joint_pos`).
         """
-        cached = self._state_cache.get(parquet_path)
+        key = (parquet_path, column)
+        cached = self._column_cache.get(key)
         if cached is not None:
             return cached
-        if len(self._state_cache) >= self._CACHE_MAX:
-            oldest = next(iter(self._state_cache))
-            del self._state_cache[oldest]
-        # Reuse the cached parquet if we already opened it (e.g. via the
-        # fallback decode path or abs_action). Otherwise do a column-scoped
-        # read so we don't blow up the parquet cache with rows we don't use.
+        if len(self._column_cache) >= self._CACHE_MAX:
+            oldest = next(iter(self._column_cache))
+            del self._column_cache[oldest]
+        # Reuse the cached parquet if it already carries this column; otherwise
+        # do a column-scoped read so we don't blow up the parquet cache.
         df = self._parquet_cache.get(parquet_path)
-        if df is None or self.state_key not in df.columns:
-            df = self._read_parquet_columns(parquet_path, [self.state_key])
-        states = np.stack(
-            [np.asarray(v, dtype=np.float32) for v in df[self.state_key].tolist()],
+        if df is None or column not in df.columns:
+            df = self._read_parquet_columns(parquet_path, [column])
+        arr = np.stack(
+            [np.asarray(v, dtype=np.float32) for v in df[column].tolist()],
             axis=0,
         )
-        self._state_cache[parquet_path] = states
-        return states
+        self._column_cache[key] = arr
+        return arr
 
     def _read_parquet_columns(self, path: str, columns: list[str]) -> pd.DataFrame:
         # Lightweight reader for paths where the .pt fast path serves frames
@@ -841,10 +857,16 @@ class VideoFrameDataset(Dataset):
                 for k, v in self._obs_stats_cache.items()
             }
 
-        slice_sig = "_".join(
-            f"{k}-{self.obs_slices[k][0]}-{self.obs_slices[k][1]}"
-            for k in self.proprio_keys
-        )
+        # One cache file per (column, slice) configuration so toggling the obs
+        # layout never silently reuses stale stats. Keys without a slice record
+        # "full".
+        def _sig(k: str) -> str:
+            col = self.obs_key_mapping[k]
+            sl = self.obs_slices.get(k)
+            span = f"{sl[0]}-{sl[1]}" if sl is not None else "full"
+            return f"{k}@{col}-{span}"
+
+        slice_sig = "_".join(_sig(k) for k in self.proprio_keys)
         cache_path = self._data_root / "meta" / f"obs_stats__{slice_sig}.json"
         if cache_path.exists():
             if self.is_main:
@@ -868,10 +890,13 @@ class VideoFrameDataset(Dataset):
             disable=not self.is_main,
         ):
             path = self.episode_files[ep_idx]
-            states = self._get_state_array(path).astype(np.float64, copy=False)
             for key in self.proprio_keys:
-                s, e = self.obs_slices[key]
-                arr = states[:, s:e]
+                column = self.obs_key_mapping[key]
+                col_arr = self._get_column_array(path, column).astype(
+                    np.float64, copy=False
+                )
+                sl = self.obs_slices.get(key)
+                arr = col_arr[:, sl[0] : sl[1]] if sl is not None else col_arr
                 if key not in accum:
                     accum[key] = {
                         "min": arr.min(axis=0),
@@ -916,22 +941,34 @@ class VideoFrameDataset(Dataset):
             for k, v in stats.items()
         }
 
+    def _ctx_indices(self, start: int) -> list[int]:
+        """Frame indices of the context window: ``obs_history`` rows ending at
+        the backbone window, with the extra history frames before ``start``
+        left-padded (clamped to >= 0). Shared by the image __getitem__ paths and
+        the proprio reader so the two stay frame-aligned."""
+        pre = [max(0, start - self._n_pre + j) for j in range(self._n_pre)]
+        return pre + [start + t for t in range(self.fin)]
+
     def _build_proprio_dict(
         self, parquet_path: str, start: int
     ) -> dict[str, torch.Tensor]:
-        """Return {obs_key: tensor of shape (fin, dim)} sliced from `state`."""
-        states = self._get_state_array(parquet_path)
+        """Return {obs_key: tensor of shape (obs_history, dim)}, one row per
+        context frame (aligned with the image ctx via _ctx_indices), read from
+        each key's mapped column and optionally sliced."""
+        idxs = self._ctx_indices(start)
         out: dict[str, torch.Tensor] = {}
-        window = states[start : start + self.fin]
-        # If the .pt fast path lets us go beyond the parquet's row count (it
-        # shouldn't, but guard anyway), pad by repeating the last row.
-        if window.shape[0] < self.fin:
-            pad = np.repeat(window[-1:], self.fin - window.shape[0], axis=0)
-            window = np.concatenate([window, pad], axis=0)
         for key in self.proprio_keys:
-            s, e = self.obs_slices[key]
-            arr = window[:, s:e]
-            out[key] = torch.from_numpy(arr.copy()).to(torch.float32)
+            column = self.obs_key_mapping[key]
+            col_arr = self._get_column_array(parquet_path, column)
+            ep_len = col_arr.shape[0]
+            # Clamp on the high side too (guards the .pt fast path overshooting
+            # the parquet's row count); low side already clamped in _ctx_indices.
+            rows = [min(i, ep_len - 1) for i in idxs]
+            window = col_arr[rows]
+            sl = self.obs_slices.get(key)
+            if sl is not None:
+                window = window[:, sl[0] : sl[1]]
+            out[key] = torch.from_numpy(window.copy()).to(torch.float32)
         return out
 
     def __getitem__(self, idx):
@@ -943,7 +980,9 @@ class VideoFrameDataset(Dataset):
             frames_u8 = pt_payload["frames"]   # (T, H, W, 3) uint8
             actions_t = pt_payload["actions"]  # (T, action_dim) float32
 
-            ctx_imgs = [self._frame_from_pt(frames_u8, start + t) for t in range(self.fin)]
+            # obs_history context frames (extra history before `start` is
+            # left-padded inside _ctx_indices), aligned with the proprio reader.
+            ctx_imgs = [self._frame_from_pt(frames_u8, j) for j in self._ctx_indices(start)]
             tgt_imgs = [
                 self._frame_from_pt(frames_u8, start + self._target_offset + t)
                 for t in range(self.fout)
@@ -981,8 +1020,8 @@ class VideoFrameDataset(Dataset):
         df = self._read_parquet(parquet_path)
 
         ctx_imgs = []
-        for t in range(self.fin):
-            img_data = df.iloc[start + t][self.image_key]
+        for frame_idx in self._ctx_indices(start):
+            img_data = df.iloc[frame_idx][self.image_key]
             img = Image.open(io.BytesIO(img_data["bytes"])).convert("RGB")
             ctx_imgs.append(self.transform(img))
 
@@ -1533,7 +1572,7 @@ class Trainer:
 
     # --- Checkpointing ---
 
-    def _save_checkpoint(self, epoch, val_loss, tag="last"):
+    def _save_checkpoint(self, epoch, val_loss, tag="last", *, filename=None):
         raw = unwrap_model(self.model)
         payload = {
             "epoch": epoch,
@@ -1547,7 +1586,11 @@ class Trainer:
         }
         if self.ema is not None:
             payload["ema"] = self.ema.state_dict()
-        path = self.ckpt_dir / f"{tag}.pt"
+        # ``filename`` lets a subclass pick a custom name/extension (e.g. Stage
+        # 2.2 writes DP-style latest.ckpt / keep-epoch=XXXX.ckpt); the payload
+        # format is unchanged so serve_policy / prebake still load it via
+        # torch.load regardless of extension.
+        path = self.ckpt_dir / (filename or f"{tag}.pt")
         torch.save(payload, path)
         if self.is_main:
             log.info(f"Saved: {path} | val_loss={val_loss:.6f}")
@@ -1642,6 +1685,13 @@ class Trainer:
                 wandb.finish()
             else:
                 wandb.finish(exit_code=exit_code)
+
+    def _wandb_log(self, payload: dict, *, step: int | None = None) -> None:
+        """Single funnel for all wandb scalar/media logging. The base passes
+        ``step`` straight through (``None`` -> wandb's own auto-incrementing
+        step), so Stage 1 / 2.1 logging is unchanged. Stage 2.2 overrides this
+        to index every metric by ``global_step`` (matching train_dp.py)."""
+        wandb.log(payload, step=step)
 
     def _abort_all_ranks(self, message: str, epoch: int | None = None):
         log.error(f"[Rank {self.rank}] {message}")
@@ -1800,7 +1850,7 @@ class Trainer:
                             lr = self.scheduler.get_last_lr()[0]
 
                             if self.use_wandb:
-                                wandb.log(
+                                self._wandb_log(
                                     {
                                         "train/loss": avg,
                                         "train/lr": lr,
@@ -1890,7 +1940,7 @@ class Trainer:
     def _frames_to_uint8(frames):
         x = (frames.float().clamp(-1, 1) * 0.5 + 0.5) * 255.0
         arr = x.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
-        arr = np.rot90(arr, 2, axes=(1, 2)).copy()
+        # arr = np.rot90(arr, 2, axes=(1, 2)).copy()
         return arr
 
     def _sample_indices_for_logging(self, ds, n_samples: int):
@@ -1984,7 +2034,7 @@ class Trainer:
 
         if val_loss is not None:
             media["val/loss"] = val_loss
-        wandb.log(media)
+        self._wandb_log(media)
 
     @torch.no_grad()
     def _log_train_samples(self, n_samples=3):
@@ -2067,7 +2117,7 @@ class Trainer:
                         goal_np[0], caption="goal"
                     )
 
-        wandb.log(media)
+        self._wandb_log(media)
 
     # --- Main loop ---
 

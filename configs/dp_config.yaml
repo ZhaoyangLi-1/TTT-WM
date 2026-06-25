@@ -17,12 +17,12 @@ use_wandb: true
 outputs_root: ${oc.env:TTT_WM_OUTPUTS_ROOT,/ariesdv0/zhaoyang/data}
 dataset_root: ${oc.env:TTT_WM_DATA_ROOT,/scr2/zhaoyang/libero_wm}
 
-horizon: 4
-n_obs_steps: 2
-n_action_steps: 2
-# horizon: 16
+# horizon: 4
 # n_obs_steps: 2
-# n_action_steps: 8
+# n_action_steps: 2
+horizon: 12
+n_obs_steps: 2
+n_action_steps: 6
 obs_as_global_cond: true
 
 shape_meta:
@@ -129,17 +129,17 @@ training:
   gradient_accumulate_every: 1
   grad_clip: 1.0
   use_ema: true   # gates the `ema:` block above; default True if omitted
-  checkpoint_every: 20
+  checkpoint_every: 50
   # Permanent snapshot every N epochs (NOT subject to topk eviction).
   # Filename is 1-indexed completed-epoch count, e.g. after 50 epochs of
   # training → `keep-epoch=0050.ckpt`. The final epoch is always saved.
   # 0 or null disables.
-  keep_every_epochs: 20
+  keep_every_epochs: 50
   # Only keep these snapshots during the final fraction of training, e.g.
   # 0.5 → last 50% of epochs, 0.2 → last 20%. 1.0 keeps from epoch 0.
-  keep_last_fraction: 0.3
-  val_every: 20
-  sample_every: 20
+  keep_last_fraction: 0.4
+  val_every: 50
+  sample_every: 50
   max_train_steps: null
   max_val_steps: null
   tqdm_interval_sec: 1.0
@@ -210,7 +210,7 @@ checkpoint:
 
 logging:
   enabled: ${use_wandb}   # toggle wandb via top-level `use_wandb`
-  project: TTT-WM-diffusion-V4
+  project: TTT-WM-diffusion-Latest
   mode: online
   resume: false
   name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${data.selected_task}

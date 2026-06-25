@@ -52,7 +52,7 @@ train:
 
   gradient_accumulate_every: 1  
   optimizer:
-    lr: 1.0e-4             
+    lr: 1.0e-5             
     weight_decay: 7.0e-3
     betas: [0.9, 0.98]    
     no_decay_norm: true

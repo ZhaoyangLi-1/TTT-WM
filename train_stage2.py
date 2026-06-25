@@ -638,32 +638,53 @@ class Stage2Part2Trainer(_Stage2Mixin, Trainer):
     def _stage_tag(self) -> str:
         return "2.2"
 
+    def _wandb_log(self, payload: dict, *, step: int | None = None) -> None:
+        # Stage 2.2 indexes every wandb metric by global_step (aligned with
+        # train_dp.py). Stage 2.1 keeps the base auto-step behaviour untouched.
+        super()._wandb_log(
+            payload, step=self.global_step if step is None else step
+        )
+
     def _save_epoch_checkpoints(self, epoch, val_loss, ran_val):
-        """Stage 2.2 checkpoint policy (overrides the base Trainer).
+        """Stage 2.2 checkpoint policy — aligned with train_dp.py / dp_config.
 
           * NO best-val_loss / topk checkpoints are kept.
-          * NO every-N-epochs keep across the whole run.
-          * ``last.pt`` still rolls every ``checkpoint_every`` for resume.
-          * A permanent ``keep_epoch_XXXX.pt`` is written every
-            ``keep_every_epochs`` epochs but ONLY during the final 20% of
-            training; the final epoch is always saved. ``completed_epochs``
-            (= ``epoch + 1``) is 1-indexed so the filename matches the
-            user-facing "after N epochs of training" semantics.
+          * A rolling ``latest.ckpt`` is written every ``checkpoint_every``
+            epochs (gated by ``train.save_last_ckpt``), for resume.
+          * A permanent ``keep-epoch=XXXX.ckpt`` is written every
+            ``keep_every_epochs`` epochs but ONLY during the final
+            ``train.keep_last_fraction`` of training; the final epoch is always
+            saved. ``completed_epochs`` (= ``epoch + 1``) is 1-indexed so the
+            filename matches the user-facing "after N epochs" semantics.
+
+        Filenames mirror the diffusion_policy workspace (latest.ckpt /
+        keep-epoch=XXXX.ckpt); the checkpoint dict format stays the Stage
+        trainer's own (model/ema/optimizer/...), so serve_policy / prebake /
+        Stage-2.1-loading still read it via torch.load regardless of extension.
         """
         del ran_val  # val_loss-based "best" checkpoints intentionally dropped
-        if (epoch % self.checkpoint_every) == 0:
-            self._save_checkpoint(epoch, val_loss, tag="last")
+
+        save_last = bool(
+            OmegaConf.select(self.cfg, "train.save_last_ckpt", default=True)
+        )
+        if save_last and (epoch % self.checkpoint_every) == 0:
+            self._save_checkpoint(epoch, val_loss, filename="latest.ckpt")
 
         keep_every = int(self.keep_every_epochs)
         if keep_every > 0:
             total_epochs = int(self.num_epochs)
             completed_epochs = epoch + 1
-            in_last_20pct = completed_epochs >= total_epochs * 0.8
-            is_keep = in_last_20pct and (completed_epochs % keep_every == 0)
+            keep_last_fraction = float(
+                OmegaConf.select(self.cfg, "train.keep_last_fraction", default=0.5)
+            )
+            keep_start_epoch = total_epochs * (1.0 - keep_last_fraction)
+            in_keep_window = completed_epochs >= keep_start_epoch
+            is_keep = in_keep_window and (completed_epochs % keep_every == 0)
             is_last = completed_epochs == total_epochs
             if is_keep or is_last:
                 self._save_checkpoint(
-                    epoch, val_loss, tag=f"keep_epoch_{completed_epochs:04d}"
+                    epoch, val_loss,
+                    filename=f"keep-epoch={completed_epochs:04d}.ckpt",
                 )
 
     def _build_datasets(self):

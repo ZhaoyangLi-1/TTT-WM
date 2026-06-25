@@ -15,22 +15,39 @@ shape_meta:
   action:
     shape: [7]   # abs: [xyz(3), rotation_6d(6), gripper(1)]
   obs:
+    # The IDM rebuilds the obs keys authoritatively from train.idm.n_obs_steps,
+    # so this block is for clarity / proprio declaration only:
+    #   * Images become SEPARATE single-frame rgb keys image (i_k), image_prev1
+    #     (i_{k-1}), … up to n_obs_steps, plus predicted_image (î, produced
+    #     on-the-fly by the frozen Stage-2.1 backbone). Only declare `image` /
+    #     `predicted_image` here; the image_prev{i} keys are auto-generated.
+    #   * Each low_dim proprio key is declared at its BASE dim (e.g. ee_pos=3);
+    #     the IDM flattens its n_obs_steps-frame history into the feature dim
+    #     internally (ee_pos -> 3*n_obs_steps), so do NOT pre-multiply here.
     image:
       shape: [3, 128, 128]
       type: rgb
     predicted_image:
       shape: [3, 128, 128]
       type: rgb
-    # ee_pos:
-    #   shape: [3]
-    #   type: low_dim
-    # ee_ori:
-    #   shape: [3]      # axis-angle (matches the action's rot input)
-    #   type: low_dim
+    ee_pos:
+      shape: [3]
+      type: low_dim
+    ee_ori:
+      shape: [3]      # axis-angle (matches the action's rot input)
+      type: low_dim
+    joint_pos:
+      shape: [7]
+      type: low_dim
 
 data:
   use_goal: true
-  frame_gap: 4
+  frame_gap: 12
+  # Variant 2: the IDM stacks the trailing train.idm.n_obs_steps real frames on
+  # the time axis, so the dataset must supply exactly that many context frames.
+  # obs_history is NOT an independent knob — it tracks n_obs_steps (and is always
+  # >= model.frames_in=1, the only frame the frozen backbone actually consumes).
+  obs_history: ${train.idm.n_obs_steps}
   test_task_count: 1
   selected_task: ""                                 # required — must be one of the 3 held-out tasks in meta/test_tasks.json
   task_dirname: ${task_slug:${data.selected_task}}
@@ -52,12 +69,22 @@ data:
   # parquet column each proprio obs key reads from, and `obs_slices` carves
   # the per-key slice out of that column. VideoFrameDataset reads `state`
   # once per episode and caches the sliced tensors.
-  # obs_key_mapping:
-  #   ee_pos: state
-  #   ee_ori: state
-  # obs_slices:
-  #   ee_pos: [0, 3]
-  #   ee_ori: [3, 6]
+  #
+  # These MUST stay active: `shape_meta.obs` above declares ee_pos/ee_ori/
+  # joint_pos as low_dim obs, so InverseDynamicsModelDP expects all three in
+  # the obs dict. The dataset's proprio keys come ONLY from obs_key_mapping
+  # (train_stage1.py: proprio_keys = sorted(obs_key_mapping)), NOT from
+  # shape_meta — so every low_dim key in shape_meta needs a mapping entry here
+  # or _build_obs_dict raises on the first step. joint_pos reads its own 7D
+  # column whole (no slice); ee_pos/ee_ori slice the shared 8D `state` column.
+
+  obs_key_mapping:
+    ee_pos: state
+    ee_ori: state
+    joint_pos: joint_pos
+  obs_slices:
+    ee_pos: [0, 3]
+    ee_ori: [3, 6]       # axis-angle [3] out of the 8D `state` column
 
 # EMA (DDPM power-law schedule). Read by train_stage1.py:Trainer via the
 # inherited Stage2Part2Trainer. Gated by `training.use_ema` (below), which
@@ -93,7 +120,7 @@ val_dataloader:
 
 train:
   compile: false
-  epochs: 400
+  epochs: 600
   gradient_accumulate_every: 1
   optimizer:
     lr: 1.0e-4
@@ -106,17 +133,25 @@ train:
     warmup_fraction: 0.03
     min_lr: 0.0
   lr_scheduler: cosine
-  checkpoint_every: 10
-  # Permanent snapshot every N epochs (NOT subject to topk eviction or
-  # `last.pt` overwrite). Filename uses 1-indexed completed-epoch count,
-  # e.g. after 50 epochs of training → `keep_epoch_0050.pt`. The final
-  # epoch is always saved too. 0 or null disables this and falls back to
-  # the legacy behaviour where `epoch_NNNN.pt` is dumped at every
-  # `checkpoint_every`. With epochs=3000, keep_every_epochs=50 → 60 ckpts
-  # at {50, 100, ..., 2950, 3000}.
-  keep_every_epochs: 20
-  val_every: 5
-  sample_every: 5
+  # Checkpointing — aligned with train_dp.py / dp_config.yaml. Stage 2.2 writes
+  # diffusion_policy-style filenames into ${train.ckpt_dir}:
+  #   * latest.ckpt          — rolling, every `checkpoint_every` epochs (resume)
+  #   * keep-epoch=XXXX.ckpt  — permanent, every `keep_every_epochs` epochs, but
+  #                             ONLY within the final `keep_last_fraction` of
+  #                             training; the final epoch is always saved.
+  # The checkpoint dict format is unchanged (model/ema/optimizer/...), so it
+  # still loads via torch.load in serve_policy / prebake.
+  checkpoint_every: 50
+  # Gate for the rolling latest.ckpt (mirrors dp_config checkpoint.save_last_ckpt).
+  save_last_ckpt: true
+  # Permanent keep-epoch snapshot cadence (1-indexed completed-epoch count in
+  # the filename, e.g. keep-epoch=0050.ckpt). 0/null disables keep snapshots.
+  keep_every_epochs: 50
+  # Only write keep snapshots during the final fraction of training (mirrors
+  # dp_config training.keep_last_fraction). 0.4 -> last 40% of epochs.
+  keep_last_fraction: 0.4
+  val_every: 50
+  sample_every: 50
   max_train_steps: null
   max_val_steps: null
   grad_clip: 1.0
@@ -138,11 +173,21 @@ train:
     stage1_cache_dir: ""
     require_cache_sha1: true
     # Reuse top-level shape_meta so the IDM model and the dataset agree on
-    # which obs keys exist (image, predicted_image, ee_pos, ee_ori).
+    # which obs keys exist (image, predicted_image, ee_pos, ee_ori, joint_pos).
     shape_meta: ${shape_meta}
-    horizon: 4
-    n_obs_steps: 1
-    n_action_steps: 4
+    # Diffusion action horizon = frame_gap: the frozen WM predicts a frame
+    # frame_gap steps ahead and the IDM recovers the frame_gap actions between
+    # the current frame and that predicted frame. n_actions also defaults to
+    # frame_gap, so horizon == frame_gap == n_actions.
+    horizon: ${data.frame_gap}
+    # Number of real history frames in the obs. The IDM exposes them as separate
+    # rgb keys (image=i_k, image_prev1=i_{k-1}, …) and flattens proprio history
+    # across the same n_obs_steps frames into the feature dim, so the underlying
+    # DP runs at T=1 — no temporal stacking needed. This single knob drives both
+    # the image-key count and the proprio history depth.
+    n_obs_steps: 2
+    # Receding-horizon executed steps (must be <= horizon).
+    n_action_steps: 6
     num_train_timesteps: 100
     num_inference_steps: 100
     beta_start: 0.0001
@@ -165,7 +210,7 @@ train:
 
 wandb:
   enabled: true
-  project: TTT-WM-diffusion-V4
+  project: TTT-WM-diffusion-Latest
   name: ${now:%Y.%m.%d-%H.%M.%S}_stage${train.substep}_${data.task_dirname}_gap${data.frame_gap}
   mode: online
   resume: false
@@ -182,4 +227,4 @@ hydra:
   job:
     override_dirname: stage${train.substep}_g${data.frame_gap}
   run:
-    dir: ${outputs_root}/stage2_idm/${data.task_dirname}/stage${train.substep}/${now:%Y-%m-%d}/${now:%H-%M-%S}_g${data.frame_gap}
+    dir: ${outputs_root}/stage2_idm/${data.task_dirname}/stage${train.substep}/${now:%Y-%m-%d}/${now:%H-%M-%S}_g${data.frame_gap}_propri

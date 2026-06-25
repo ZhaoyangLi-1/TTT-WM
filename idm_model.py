@@ -162,33 +162,58 @@ class InverseDynamicsModelDP(nn.Module):
 
         self.action_dim = cfg.action_dim
 
-        # Build shape_meta. If the caller passes one (Stage 2.2 yaml does),
-        # honor it — that's how proprio obs gets declared. Otherwise fall
-        # back to the legacy image-only layout. We always force the obs
-        # image dims to match the Stage-1 backbone resolution so the
-        # DP vision encoder agrees with the frames we feed it.
+        # Single obs layout (no temporal stacking): the n_obs_steps real history
+        # frames are exposed as SEPARATE single-timestep rgb keys —
+        #   image      = i_k        (most recent)
+        #   image_prev1= i_{k-1}
+        #   …          = i_{k-(n-1)}
+        # plus the single predicted_image (î) produced by the frozen backbone.
+        # The DP policy therefore runs with n_obs_steps=1 (every key is T=1);
+        # temporal context is carried by the distinct image keys, not the time
+        # axis. Proprio history rides along by being flattened across the same
+        # n_obs_steps frames into the feature dim (see _build_obs_dict), so it
+        # also stays T=1 — this is what lets proprio carry n_obs_steps frames
+        # WITHOUT temporal stacking. A single knob, n_obs_steps, drives both the
+        # image-key count and the proprio history depth.
+        #   n_obs_steps=2 → obs = {image=i_k, image_prev1=i_{k-1},
+        #                          predicted_image=î, <proprio>=[p_{k-1};p_k]}
+        if self.n_obs_steps < 1:
+            raise ValueError(f"n_obs_steps must be >= 1, got {self.n_obs_steps}.")
+        self.predicted_image_key = "predicted_image"
+        self.history_image_keys: tuple[str, ...] = tuple(
+            "image" if i == 0 else f"image_prev{i}"
+            for i in range(self.n_obs_steps)
+        )
+        # The frozen backbone only ever consumes its trained context length
+        # (cfg.frames_in); when the dataset hands us extra history frames for
+        # the obs, we slice the trailing frames_in before the AR decode.
+        self._backbone_fin = int(getattr(cfg, "frames_in", 1))
+
+        # Build shape_meta authoritatively from n_obs_steps. The history +
+        # predicted image keys are rebuilt every time (their dims are forced to
+        # the Stage-1 backbone resolution so the DP vision encoder agrees with
+        # the frames we feed it). Each low_dim (proprio) key the caller declared
+        # is expanded from its base dim D to D * n_obs_steps, because its history
+        # is flattened into the feature dim; we remember the base dim so
+        # _build_obs_dict and set_action_stats can reproduce the expansion.
         image_shape = [cfg.num_channels, cfg.resolution, cfg.resolution]
-        if shape_meta is None:
-            shape_meta = {
-                "action": {"shape": [self.action_dim]},
-                "obs": {
-                    "image": {"shape": image_shape, "type": "rgb"},
-                    "predicted_image": {"shape": image_shape, "type": "rgb"},
-                },
-            }
-        else:
-            shape_meta = dict(shape_meta)
-            obs_meta = dict(shape_meta.get("obs", {}))
-            for img_key in ("image", "predicted_image"):
-                if img_key in obs_meta:
-                    entry = dict(obs_meta[img_key])
-                    entry["shape"] = list(image_shape)
-                    entry.setdefault("type", "rgb")
-                    obs_meta[img_key] = entry
-                else:
-                    obs_meta[img_key] = {"shape": image_shape, "type": "rgb"}
-            shape_meta["obs"] = obs_meta
-            shape_meta["action"] = {"shape": [self.action_dim]}
+        passed_obs = dict((shape_meta or {}).get("obs", {}))
+        self._proprio_base_dim: dict[str, int] = {}
+        proprio_meta: dict = {}
+        for k, v in passed_obs.items():
+            if v.get("type") != "low_dim":
+                continue
+            base = int(np.prod([int(s) for s in v["shape"]]))
+            self._proprio_base_dim[k] = base
+            proprio_meta[k] = {"shape": [base * self.n_obs_steps], "type": "low_dim"}
+        obs_meta: dict = {}
+        for img_key in (*self.history_image_keys, self.predicted_image_key):
+            obs_meta[img_key] = {"shape": list(image_shape), "type": "rgb"}
+        obs_meta.update(proprio_meta)
+        shape_meta = {
+            "action": {"shape": [self.action_dim]},
+            "obs": obs_meta,
+        }
         self.shape_meta = shape_meta
 
         obs_meta = shape_meta["obs"]
@@ -214,7 +239,11 @@ class InverseDynamicsModelDP(nn.Module):
             noise_scheduler=noise_scheduler,
             horizon=self.horizon,
             n_action_steps=self.n_action_steps,
-            n_obs_steps=self.n_obs_steps,
+            # Every obs key is T=1 (image history is separate keys, proprio
+            # history is flattened into the feature dim), so the underlying DP
+            # always runs with a single observation step. self.n_obs_steps is
+            # the user-facing history depth used only when building the obs dict.
+            n_obs_steps=1,
             num_inference_steps=num_inference_steps,
             obs_as_global_cond=obs_as_global_cond,
             crop_shape=tuple(crop_shape),
@@ -271,6 +300,16 @@ class InverseDynamicsModelDP(nn.Module):
             normalizer[obs_key] = self._image_normalizer_factory()
 
         obs_stats = obs_stats or {}
+        # Proprio is flattened to n_obs_steps copies along the feature dim, so
+        # tile each (base-dim) stat n_obs_steps times to match the (B,1,n*D)
+        # obs and the expanded shape_meta dim. Every frame shares the same
+        # per-channel stats, so plain repetition is exact regardless of order.
+        def _tile_stat(v):
+            return (
+                torch.as_tensor(v, dtype=torch.float32)
+                .reshape(-1)
+                .repeat(self.n_obs_steps)
+            )
         for obs_key in self.proprio_keys:
             stats = obs_stats.get(obs_key)
             if stats is None:
@@ -278,12 +317,9 @@ class InverseDynamicsModelDP(nn.Module):
                     f"Proprio obs key {obs_key!r} declared in shape_meta but "
                     f"obs_stats is missing it (got keys {sorted(obs_stats)})."
                 )
-            p_min = torch.as_tensor(stats["min"], dtype=torch.float32)
-            p_max = torch.as_tensor(stats["max"], dtype=torch.float32)
-            p_mean = torch.as_tensor(stats["mean"], dtype=torch.float32)
-            p_std = torch.as_tensor(stats["std"], dtype=torch.float32)
             normalizer[obs_key] = self._make_range_normalizer(
-                p_min, p_max, p_mean, p_std,
+                _tile_stat(stats["min"]), _tile_stat(stats["max"]),
+                _tile_stat(stats["mean"]), _tile_stat(stats["std"]),
             )
         self.policy.set_normalizer(normalizer)
         policy_device = next(self.policy.parameters()).device
@@ -324,18 +360,35 @@ class InverseDynamicsModelDP(nn.Module):
     def _frames_to_policy_range(frames: torch.Tensor) -> torch.Tensor:
         return frames.clamp(-1.0, 1.0).add(1.0).mul(0.5)
 
+    @staticmethod
+    def _take_history(frames: torch.Tensor, n: int) -> torch.Tensor:
+        """Return the trailing ``n`` frames along the time axis, left-padding by
+        repeating the earliest available frame when fewer than ``n`` are given
+        (e.g. the first step of a rollout). Training supplies exactly ``n``."""
+        T = frames.shape[1]
+        if T < n:
+            pad = frames[:, :1].expand(frames.shape[0], n - T, *frames.shape[2:])
+            frames = torch.cat([pad, frames], dim=1)
+        return frames[:, -n:]
+
     def _build_obs_dict(
         self,
         input_frames: torch.Tensor,
         pred_frames: torch.Tensor,
         proprio: Optional[dict[str, torch.Tensor]] = None,
     ) -> dict[str, torch.Tensor]:
-        current_frame = self._frames_to_policy_range(input_frames[:, -1:])
-        predicted_frame = self._frames_to_policy_range(pred_frames[:, :1])
-        obs: dict[str, torch.Tensor] = {
-            "image": current_frame,
-            "predicted_image": predicted_frame,
-        }
+        # Separate single-frame rgb keys: image (i_k) + image_prev{i} (i_{k-i}),
+        # plus the single predicted_image. Every key is T=1.
+        obs: dict[str, torch.Tensor] = {}
+        hist = self._take_history(input_frames, self.n_obs_steps)  # (B, n, …)
+        for i, key in enumerate(self.history_image_keys):
+            # history_image_keys[0]="image" is the most recent frame (hist[-1]);
+            # image_prev{i} is i steps older (hist[n-1-i]).
+            sl = self.n_obs_steps - 1 - i
+            obs[key] = self._frames_to_policy_range(hist[:, sl : sl + 1])
+        obs[self.predicted_image_key] = self._frames_to_policy_range(
+            pred_frames[:, :1]
+        )
         if self.proprio_keys:
             if proprio is None:
                 raise ValueError(
@@ -350,14 +403,14 @@ class InverseDynamicsModelDP(nn.Module):
                     raise KeyError(
                         f"Proprio dict missing key {key!r}; got {sorted(proprio)}."
                     )
-                # Take the trailing n_obs_steps frames so the time-dim matches
-                # the image obs (which uses input_frames[:, -1:]).
-                if tensor.shape[1] < self.n_obs_steps:
-                    raise ValueError(
-                        f"Proprio key {key!r} has only {tensor.shape[1]} frames, "
-                        f"need >= n_obs_steps={self.n_obs_steps}."
-                    )
-                obs[key] = tensor[:, -self.n_obs_steps :].to(input_frames.device)
+                # Flatten the trailing n_obs_steps proprio frames into the
+                # feature dim (oldest→newest), giving (B, 1, n*D) so the key
+                # stays T=1 like the rgb keys. _take_history left-pads when the
+                # dataset supplies fewer frames (e.g. the first rollout step).
+                ph = self._take_history(
+                    tensor.to(input_frames.device), self.n_obs_steps
+                )  # (B, n, D)
+                obs[key] = ph.reshape(ph.shape[0], 1, -1)  # (B, 1, n*D)
         return obs
 
     def _predict_next_frame(
@@ -365,6 +418,11 @@ class InverseDynamicsModelDP(nn.Module):
         input_frames: torch.Tensor,
         goal: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # The obs may carry more history frames than the backbone was trained
+        # on (n_obs_steps > frames_in); the AR backbone only consumes its
+        # trailing frames_in context frames.
+        if input_frames.shape[1] > self._backbone_fin:
+            input_frames = input_frames[:, -self._backbone_fin :]
         micro_batch = self.stage1_micro_batch
         if micro_batch is not None:
             return _run_stage1_in_chunks(
