@@ -606,8 +606,14 @@ def eval_libero(args: Args) -> None:
                     # history BEFORE the settle-wait gate, so by the first
                     # inference the buffer already holds n_obs_steps
                     # CONSECUTIVE frames (training gap=1), not duplicates.
-                    img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
-                    wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+                    # Send frames in their NATIVE robosuite orientation. The
+                    # policy server rotates every RGB input 180° in
+                    # ensure_uint8_hwc_image to match the training pipeline
+                    # (dp/parquet_dataset.py rotates every parquet frame 180°).
+                    # Rotating here too would double-rotate obs while leaving the
+                    # goal frame un-rotated -> obs upright but goal upside-down.
+                    img = np.ascontiguousarray(obs["agentview_image"])
+                    wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"])
                     img = image_tools.convert_to_uint8(
                         image_tools.resize_with_pad(img, resize_size, resize_size)
                     )
@@ -785,15 +791,20 @@ def eval_libero(args: Args) -> None:
                 input_video_path = (
                     video_root / f"task_{task_id:03d}_episode_{episode_idx:03d}_{suffix}_policy_input.mp4"
                 )
+                # replay_input_images hold frames in native orientation (as sent
+                # to the server). The server rotates them 180° before the model,
+                # so rotate here too to visualize the true policy input.
                 imageio.mimwrite(
                     input_video_path,
-                    [np.asarray(x) for x in replay_input_images],
+                    [np.ascontiguousarray(np.asarray(x)[::-1, ::-1]) for x in replay_input_images],
                     fps=10,
                 )
                 episode_record["policy_input_video_path"] = str(input_video_path)
 
-            # Dump the per-episode goal frame as a 228x228 PNG next to the video,
-            # in its native parquet orientation (no rotation).
+            # Dump the per-episode goal frame as a 228x228 PNG next to the video.
+            # Rotate 180° so the saved file matches the TRUE model-input
+            # orientation (the server rotates the goal 180° in
+            # ensure_uint8_hwc_image), rather than the native parquet orientation.
             if args.save_videos and episode_idx in task_goal_source_paths:
                 goal_src_path = task_goal_source_paths[episode_idx]
                 goal_png_path = (
@@ -803,6 +814,7 @@ def eval_libero(args: Args) -> None:
                     goal_img = (
                         goal_img.convert("RGB")
                         .resize((228, 228), Image.BILINEAR)
+                        .rotate(180)
                     )
                     goal_img.save(goal_png_path)
                 episode_record["goal_image_path"] = str(goal_png_path)

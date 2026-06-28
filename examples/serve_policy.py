@@ -263,10 +263,12 @@ def ensure_uint8_hwc_image(value: Any, *, resolution: int) -> np.ndarray:
     image = Image.fromarray(array, mode="RGB")
     if image.size != (resolution, resolution):
         image = image.resize((resolution, resolution), Image.BILINEAR)
-    array = np.ascontiguousarray(np.asarray(image, dtype=np.uint8))
-    # array = np.ascontiguousarray(np.asarray(image, dtype=np.uint8)[::-1, ::-1])
-    # Image.fromarray(array).save('./test.jpg')
-    # breakpoint()
+    # [rotate180] Single rotation point for EVERY RGB model input (obs image,
+    # wrist, goal, next_image). Training rotates every parquet RGB frame 180°
+    # (dp/parquet_dataset.py::_decode_rgb_value), so the server must apply the
+    # identical 180° here to keep training and eval in the same orientation.
+    # Clients send frames in their native orientation; do NOT rotate client-side.
+    array = np.ascontiguousarray(np.asarray(image, dtype=np.uint8)[::-1, ::-1])
     # Dump the first few model-input images for orientation check.
     _maybe_dump_model_input(array)
     return array
@@ -772,7 +774,10 @@ def load_dp_adapter(
     diffusion_policy_src: str | None,
 ) -> BasePolicyAdapter:
     payload = load_checkpoint_payload(checkpoint_path, map_location="cpu")
-    cfg = copy.deepcopy(payload["cfg"])
+    # Checkpoints may store `cfg` as a plain dict or as an OmegaConf DictConfig.
+    # Downstream code (OmegaConf.select/resolve, cfg.policy, hydra.instantiate)
+    # requires a DictConfig, so normalize here.
+    cfg = OmegaConf.create(copy.deepcopy(payload["cfg"]))
     register_omegaconf_resolvers()
     maybe_configure_diffusion_policy(diffusion_policy_src, cfg)
     OmegaConf.resolve(cfg)

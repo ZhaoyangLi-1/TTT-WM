@@ -34,25 +34,25 @@ shape_meta:
       type: rgb
     # Proprio: world-frame ee pose, sliced out of the parquet `state` (8D
     # = ee_pos(3) + ee_axis_angle(3) + gripper_qpos(2)).
-    ee_pos:
-      shape: [3]
-      type: low_dim
-    # ee_ori representation is switchable between axis-angle [3] and quaternion
-    # [4]; the parquet carries BOTH (`state[3:6]` axis-angle and `ee_quat`). To
-    # switch reps, change `shape` here AND the matching `obs_key_mapping`/
-    # `obs_slices` entries below (all three marked "ee_ori rep toggle").
-    #   quaternion [4]: shape [4], obs_key_mapping ee_ori->ee_quat, no slice
-    #   axis-angle [3]: shape [3], obs_key_mapping ee_ori->state, slice [3,6]
-    ee_ori:                # ee_ori rep toggle
-      # shape: [4]      # scalar-last [x,y,z,w] quaternion (from parquet `ee_quat`)
-      shape: [3]    # axis-angle (from parquet `state[3:6]`)
-      type: low_dim
-    # Raw 7-DoF Panda joint positions. Sources directly from the parquet
-    # `joint_pos` column (obs_key_mapping defaults key->same-name column, so no
-    # mapping/slice entry needed).
-    joint_pos:
-      shape: [7]
-      type: low_dim
+    # ee_pos:
+    #   shape: [3]
+    #   type: low_dim
+    # # ee_ori representation is switchable between axis-angle [3] and quaternion
+    # # [4]; the parquet carries BOTH (`state[3:6]` axis-angle and `ee_quat`). To
+    # # switch reps, change `shape` here AND the matching `obs_key_mapping`/
+    # # `obs_slices` entries below (all three marked "ee_ori rep toggle").
+    # #   quaternion [4]: shape [4], obs_key_mapping ee_ori->ee_quat, no slice
+    # #   axis-angle [3]: shape [3], obs_key_mapping ee_ori->state, slice [3,6]
+    # ee_ori:                # ee_ori rep toggle
+    #   # shape: [4]      # scalar-last [x,y,z,w] quaternion (from parquet `ee_quat`)
+    #   shape: [3]    # axis-angle (from parquet `state[3:6]`)
+    #   type: low_dim
+    # # Raw 7-DoF Panda joint positions. Sources directly from the parquet
+    # # `joint_pos` column (obs_key_mapping defaults key->same-name column, so no
+    # # mapping/slice entry needed).
+    # joint_pos:
+    #   shape: [7]
+    #   type: low_dim
 
 data:
   action_key: actions
@@ -198,9 +198,9 @@ task:
     # `state` is 8D = ee_pos(3) + ee_axis_angle(3) + gripper_qpos(2).
     # ee_ori rep toggle: quaternion uses the full 4D `ee_quat` column (no slice
     # entry); for axis-angle [3] uncomment the `ee_ori: [3, 6]` slice into state.
-    obs_slices:
-      ee_pos: [0, 3]
-      ee_ori: [3, 6]       # axis-angle [3] (ee_ori maps to `state`)
+    # obs_slices:
+    #   ee_pos: [0, 3]
+    #   ee_ori: [3, 6]       # axis-angle [3] (ee_ori maps to `state`)
 
 checkpoint:
   # No topk / best-val_loss checkpointing: the trainer keeps `last.ckpt` plus
@@ -213,7 +213,7 @@ logging:
   project: TTT-WM-diffusion-Latest
   mode: online
   resume: false
-  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${data.selected_task}
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${data.selected_task}_pure_img
   tags:
     - diffusion_policy
     - ttt_wm
@@ -227,4 +227,4 @@ hydra:
   run:
     # `${task_slug:...}` strips ":" / spaces from data.selected_task so the
     # path stays filesystem-friendly. Resolver registered in dp/runtime.py.
-    dir: ${outputs_root}/dp/${task_slug:${data.selected_task}}/${now:%Y%m%d_%H%M%S}
+    dir: ${outputs_root}/dp/${task_slug:${data.selected_task}}/${now:%Y%m%d_%H%M%S}_pure_img
