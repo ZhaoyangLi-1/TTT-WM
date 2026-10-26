@@ -209,7 +209,7 @@ train:
 
 
 wandb:
-  enabled: true
+  enabled: false
   project: TTT-WM-diffusion-Latest
   name: ${now:%Y.%m.%d-%H.%M.%S}_stage${train.substep}_${data.task_dirname}_gap${data.frame_gap}
   mode: online

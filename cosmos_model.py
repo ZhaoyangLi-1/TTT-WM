@@ -689,6 +689,393 @@ class ARVideoPatchTransformer(nn.Module):
         ).clamp(-1, 1)
 
 
+# ===========================================================================
+# OSCAR integration
+# ===========================================================================
+#
+# Everything below adapts the Cosmos-style AR transformer above so it can be
+# dropped into OSCAR's rectified-flow Video2World pipeline **as the denoiser
+# network** (`self.net`). It does NOT touch ARVideoPatchTransformer /
+# ARPatchConfig, so TTT-WM Stage-1/Stage-2 trainers keep working.
+#
+# Differences vs. ARVideoPatchTransformer:
+#   * operates on VAE *latents* (arbitrary C / H / W / T), not raw RGB pixels;
+#   * is a *timestep-conditioned flow-matching denoiser* (predicts velocity),
+#     not a deterministic next-patch regressor — there is no MSE / generate()
+#     here; sampling is done by OSCAR's rectified-flow scheduler;
+#   * self-attention is *block-causal in time*: every latent frame attends to
+#     itself (bidirectionally in space) plus all *past* frames — so the model
+#     is autoregressive across time while still denoising a whole frame's
+#     tokens jointly (which is what a flow-matching denoiser needs);
+#   * adds T5 text cross-attention + AdaLN timestep/action modulation.
+#
+# The consumer of these classes is
+#   worldsim/_src/predict2/networks/cosmos_ar_dit.py  (in the oscar repo),
+# which wraps CosmosOSCARDenoiser in the OSCAR `net` interface.
+
+import math as _math
+
+from dataclasses import dataclass as _dataclass
+from einops import rearrange as _rearrange
+
+
+@_dataclass
+class OSCARARConfig:
+    """Config for the OSCAR-mode causal flow-matching denoiser."""
+
+    # ---- latent tensor geometry ----
+    in_channels: int = 16          # VAE latent channels (the conditioning mask
+                                   # channel is added on top when concat_mask)
+    out_channels: int = 16
+    concat_mask: bool = True        # +1 frame-replace conditioning-mask channel
+    patch_spatial: int = 2
+    patch_temporal: int = 1         # only 1 is supported here
+    # upper bounds used to size the RoPE tables (must be >= runtime values)
+    max_frames: int = 48            # max latent frames
+    max_img_h: int = 128            # max latent H (pre spatial-patch)
+    max_img_w: int = 128            # max latent W (pre spatial-patch)
+
+    # ---- transformer ----
+    d_model: int = 512
+    n_heads: int = 8
+    n_layers: int = 8
+    mlp_ratio: float = 4.0
+    dropout: float = 0.0
+    qk_norm: bool = True
+
+    # ---- conditioning ----
+    crossattn_emb_channels: int = 1024   # T5 hidden size
+    action_dim: int = 14                 # per-frame action dim (0 disables action)
+    action_frames: int = 80              # number of action steps (num_frames - 1)
+
+    @property
+    def head_dim(self) -> int:
+        return self.d_model // self.n_heads
+
+    @property
+    def _mask_ch(self) -> int:
+        return 1 if self.concat_mask else 0
+
+    @property
+    def patch_in_dim(self) -> int:
+        return (self.in_channels + self._mask_ch) * self.patch_spatial * self.patch_spatial * self.patch_temporal
+
+    @property
+    def patch_out_dim(self) -> int:
+        return self.out_channels * self.patch_spatial * self.patch_spatial * self.patch_temporal
+
+
+# ---------------------------------------------------------------------------
+# Latent patch utilities  (frame-major token order: (t, h, w))
+# ---------------------------------------------------------------------------
+
+def patchify_latent(x_BCTHW: torch.Tensor, p: int):
+    """(B, C, T, H, W) -> tokens (B, T*nh*nw, C*p*p), returns (tokens, T, nh, nw)."""
+    B, C, T, H, W = x_BCTHW.shape
+    assert H % p == 0 and W % p == 0, f"latent H/W {H}x{W} not divisible by patch {p}"
+    tokens = _rearrange(
+        x_BCTHW, "b c t (nh ph) (nw pw) -> b (t nh nw) (c ph pw)", ph=p, pw=p
+    )
+    return tokens, T, H // p, W // p
+
+
+def unpatchify_latent(tokens: torch.Tensor, p: int, C: int, T: int, nh: int, nw: int) -> torch.Tensor:
+    """(B, T*nh*nw, C*p*p) -> (B, C, T, nh*p, nw*p)."""
+    return _rearrange(
+        tokens, "b (t nh nw) (c ph pw) -> b c t (nh ph) (nw pw)",
+        t=T, nh=nh, nw=nw, ph=p, pw=p, c=C,
+    )
+
+
+def build_thw_indices(T: int, nh: int, nw: int, device: torch.device):
+    """Flattened (t, h, w) position indices of length L = T*nh*nw, frame-major."""
+    t = torch.arange(T, device=device).view(T, 1, 1).expand(T, nh, nw).reshape(-1)
+    h = torch.arange(nh, device=device).view(1, nh, 1).expand(T, nh, nw).reshape(-1)
+    w = torch.arange(nw, device=device).view(1, 1, nw).expand(T, nh, nw).reshape(-1)
+    return t.long(), h.long(), w.long()
+
+
+# ---------------------------------------------------------------------------
+# 3-D factored RoPE  (separate temporal / height / width rotations)
+# ---------------------------------------------------------------------------
+
+class RoPE3D(nn.Module):
+    """Splits head_dim into (t, h, w) segments, each rotated by its own index.
+
+    Segment sizes follow the Cosmos DiT convention: dim_h = dim_w = (D//6)*2,
+    dim_t = D - dim_h - dim_w. The sin/cos tables are non-persistent buffers,
+    recomputed by reset_parameters() (needed because OSCAR builds the net on a
+    meta device and then to_empty()'s it, which leaves buffers uninitialized).
+    """
+
+    def __init__(self, cfg: OSCARARConfig):
+        super().__init__()
+        d = cfg.head_dim
+        dim_h = (d // 6) * 2
+        dim_w = dim_h
+        dim_t = d - dim_h - dim_w
+        assert dim_t % 2 == 0 and dim_h % 2 == 0, f"bad rope split for head_dim={d}"
+        self.dim_t, self.dim_h, self.dim_w = dim_t, dim_h, dim_w
+        self.len_t = cfg.max_frames
+        self.len_h = cfg.max_img_h // cfg.patch_spatial
+        self.len_w = cfg.max_img_w // cfg.patch_spatial
+        for name, (dim, ln) in {
+            "t": (dim_t, self.len_t),
+            "h": (dim_h, self.len_h),
+            "w": (dim_w, self.len_w),
+        }.items():
+            cos, sin = _build_sin_cos(dim, ln)
+            self.register_buffer(f"{name}_cos", cos, persistent=False)
+            self.register_buffer(f"{name}_sin", sin, persistent=False)
+
+    def reset_parameters(self) -> None:
+        dev = self.t_cos.device
+        for name, dim, ln in (
+            ("t", self.dim_t, self.len_t),
+            ("h", self.dim_h, self.len_h),
+            ("w", self.dim_w, self.len_w),
+        ):
+            cos, sin = _build_sin_cos(dim, ln)
+            getattr(self, f"{name}_cos").copy_(cos.to(dev))
+            getattr(self, f"{name}_sin").copy_(sin.to(dev))
+
+    def forward(self, q, k, t_idx, h_idx, w_idx):
+        # q, k: (B, L, H, D)
+        qt, qh, qw = q.split([self.dim_t, self.dim_h, self.dim_w], dim=-1)
+        kt, kh, kw = k.split([self.dim_t, self.dim_h, self.dim_w], dim=-1)
+
+        def rot(x, name, idx):
+            cos = getattr(self, f"{name}_cos").index_select(0, idx)
+            sin = getattr(self, f"{name}_sin").index_select(0, idx)
+            return apply_rope(x, cos, sin)
+
+        q = torch.cat([rot(qt, "t", t_idx), rot(qh, "h", h_idx), rot(qw, "w", w_idx)], dim=-1)
+        k = torch.cat([rot(kt, "t", t_idx), rot(kh, "h", h_idx), rot(kw, "w", w_idx)], dim=-1)
+        return q, k
+
+
+# ---------------------------------------------------------------------------
+# Timestep embedding  (sin-cos -> MLP), mirrors OSCAR's Timesteps numerics
+# ---------------------------------------------------------------------------
+
+class _SinusoidalTimestep(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, t_BT: torch.Tensor) -> torch.Tensor:
+        # t_BT: (B, Tt) -> (B, Tt, dim). fp32 internally like the Cosmos DiT.
+        in_dtype = t_BT.dtype
+        half = self.dim // 2
+        exponent = -_math.log(10000.0) * torch.arange(
+            half, dtype=torch.float32, device=t_BT.device
+        ) / half
+        freqs = torch.exp(exponent)                       # (half,)
+        args = t_BT.float().unsqueeze(-1) * freqs          # (B, Tt, half)
+        emb = torch.cat([args.cos(), args.sin()], dim=-1)  # (B, Tt, dim)
+        return emb.to(in_dtype)
+
+
+class TimestepMLP(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.sin = _SinusoidalTimestep(dim)
+        self.linear_1 = nn.Linear(dim, dim)
+        self.act = nn.SiLU()
+        self.linear_2 = nn.Linear(dim, dim)
+
+    def forward(self, t_BT: torch.Tensor) -> torch.Tensor:
+        return self.linear_2(self.act(self.linear_1(self.sin(t_BT))))
+
+
+# ---------------------------------------------------------------------------
+# Attention (SDPA): block-causal-in-time self-attn + text cross-attn
+# ---------------------------------------------------------------------------
+
+class SelfAttentionCausal(nn.Module):
+    def __init__(self, cfg: OSCARARConfig):
+        super().__init__()
+        self.n_heads = cfg.n_heads
+        self.head_dim = cfg.head_dim
+        self.d_model = cfg.d_model
+        self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=False)
+        self.out = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.rope = RoPE3D(cfg)
+        self.q_norm = RMSNorm(cfg.head_dim) if cfg.qk_norm else nn.Identity()
+        self.k_norm = RMSNorm(cfg.head_dim) if cfg.qk_norm else nn.Identity()
+
+    def forward(self, x, t_idx, h_idx, w_idx, attn_mask):
+        B, L, _ = x.shape
+        qkv = self.qkv(x).reshape(B, L, 3, self.n_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)                     # each (B, L, H, D)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        q, k = self.rope(q, k, t_idx, h_idx, w_idx)
+        q = q.transpose(1, 2)                            # (B, H, L, D)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        o = o.transpose(1, 2).reshape(B, L, self.d_model)
+        return self.out(o)
+
+
+class TextCrossAttention(nn.Module):
+    def __init__(self, cfg: OSCARARConfig):
+        super().__init__()
+        self.n_heads = cfg.n_heads
+        self.head_dim = cfg.head_dim
+        self.d_model = cfg.d_model
+        self.q_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.kv_proj = nn.Linear(cfg.crossattn_emb_channels, 2 * cfg.d_model, bias=False)
+        self.out = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.q_norm = RMSNorm(cfg.head_dim) if cfg.qk_norm else nn.Identity()
+        self.k_norm = RMSNorm(cfg.head_dim) if cfg.qk_norm else nn.Identity()
+
+    def forward(self, x, ctx):
+        B, L, _ = x.shape
+        S = ctx.shape[1]
+        q = self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim)
+        kv = self.kv_proj(ctx).reshape(B, S, 2, self.n_heads, self.head_dim)
+        k, v = kv.unbind(dim=2)
+        q = self.q_norm(q).transpose(1, 2)
+        k = self.k_norm(k).transpose(1, 2)
+        v = v.transpose(1, 2)
+        o = F.scaled_dot_product_attention(q, k, v)
+        o = o.transpose(1, 2).reshape(B, L, self.d_model)
+        return self.out(o)
+
+
+# ---------------------------------------------------------------------------
+# AdaLN-modulated transformer block
+# ---------------------------------------------------------------------------
+
+def _modulate(x, shift, scale):
+    return x * (1 + scale) + shift
+
+
+class OSCARBlock(nn.Module):
+    def __init__(self, cfg: OSCARARConfig):
+        super().__init__()
+        self.norm1 = RMSNorm(cfg.d_model)
+        self.self_attn = SelfAttentionCausal(cfg)
+        self.norm2 = RMSNorm(cfg.d_model)
+        self.cross_attn = TextCrossAttention(cfg)
+        self.norm3 = RMSNorm(cfg.d_model)
+        self.mlp = SwiGLUMLP(cfg.d_model, cfg.mlp_ratio, cfg.dropout)
+        self.ada_self = nn.Sequential(nn.SiLU(), nn.Linear(cfg.d_model, 3 * cfg.d_model))
+        self.ada_cross = nn.Sequential(nn.SiLU(), nn.Linear(cfg.d_model, 3 * cfg.d_model))
+        self.ada_mlp = nn.Sequential(nn.SiLU(), nn.Linear(cfg.d_model, 3 * cfg.d_model))
+
+    def forward(self, x, emb, ctx, idx, attn_mask):
+        t_idx, h_idx, w_idx = idx
+        shift, scale, gate = self.ada_self(emb).chunk(3, dim=-1)
+        x = x + gate * self.self_attn(_modulate(self.norm1(x), shift, scale), t_idx, h_idx, w_idx, attn_mask)
+        shift, scale, gate = self.ada_cross(emb).chunk(3, dim=-1)
+        x = x + gate * self.cross_attn(_modulate(self.norm2(x), shift, scale), ctx)
+        shift, scale, gate = self.ada_mlp(emb).chunk(3, dim=-1)
+        x = x + gate * self.mlp(_modulate(self.norm3(x), shift, scale))
+        return x
+
+
+# ---------------------------------------------------------------------------
+# The denoiser
+# ---------------------------------------------------------------------------
+
+class CosmosOSCARDenoiser(nn.Module):
+    """Causal flow-matching denoiser on VAE latents. Predicts velocity.
+
+    forward(x_BCTHW, timesteps_BT, crossattn_emb, action) -> velocity_BCTHW,
+    where x_BCTHW already has the conditioning-mask channel concatenated when
+    cfg.concat_mask is True (the OSCAR adapter does that concat).
+    """
+
+    def __init__(self, cfg: OSCARARConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.patch_embed = nn.Linear(cfg.patch_in_dim, cfg.d_model, bias=False)
+        self.embed_norm = RMSNorm(cfg.d_model)
+        self.t_embed = TimestepMLP(cfg.d_model)
+        self.t_norm = RMSNorm(cfg.d_model)
+        if cfg.action_dim > 0 and cfg.action_frames > 0:
+            self.action_embed = nn.Sequential(
+                nn.Linear(cfg.action_dim * cfg.action_frames, cfg.d_model * 4),
+                nn.GELU(approximate="tanh"),
+                nn.Linear(cfg.d_model * 4, cfg.d_model),
+            )
+        else:
+            self.action_embed = None
+        self.blocks = nn.ModuleList([OSCARBlock(cfg) for _ in range(cfg.n_layers)])
+        self.out_norm = RMSNorm(cfg.d_model)
+        self.head = nn.Linear(cfg.d_model, cfg.patch_out_dim, bias=False)
+
+        # Skip real init while on the meta device (OSCAR calls init_weights()
+        # again after to_empty()); otherwise initialize now.
+        if not any(p.is_meta for p in self.parameters()):
+            self._init_weights()
+
+    def _init_weights(self) -> None:
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, RMSNorm):
+                nn.init.ones_(m.scale)
+            elif isinstance(m, RoPE3D):
+                m.reset_parameters()
+        # Zero-init AdaLN gates + output head (+ action) so the net starts as a
+        # near-identity / zero-velocity map — stable start for flow matching.
+        for blk in self.blocks:
+            for ada in (blk.ada_self, blk.ada_cross, blk.ada_mlp):
+                nn.init.zeros_(ada[-1].weight)
+                if ada[-1].bias is not None:
+                    nn.init.zeros_(ada[-1].bias)
+        nn.init.zeros_(self.head.weight)
+        if self.action_embed is not None:
+            nn.init.zeros_(self.action_embed[-1].weight)
+            nn.init.zeros_(self.action_embed[-1].bias)
+
+    def forward(self, x_BCTHW, timesteps_BT, crossattn_emb, action=None):
+        cfg = self.cfg
+        B = x_BCTHW.shape[0]
+        device = x_BCTHW.device
+
+        tokens, T, nh, nw = patchify_latent(x_BCTHW, cfg.patch_spatial)
+        h = self.embed_norm(self.patch_embed(tokens))          # (B, L, D)
+        t_idx, h_idx, w_idx = build_thw_indices(T, nh, nw, device)
+
+        # ---- timestep (+ action) embedding, one vector per latent frame ----
+        t = timesteps_BT
+        if t.ndim == 1:
+            t = t[:, None]                                     # (B, 1)
+        temb = self.t_embed(t)                                 # (B, Tt, D)
+        if self.action_embed is not None and action is not None:
+            a = action.reshape(B, -1)
+            exp = cfg.action_dim * cfg.action_frames
+            if a.shape[1] < exp:
+                a = F.pad(a, (0, exp - a.shape[1]))
+            elif a.shape[1] > exp:
+                a = a[:, :exp]
+            temb = temb + self.action_embed(a.to(temb.dtype)).unsqueeze(1)
+        temb = self.t_norm(temb)
+
+        if temb.shape[1] == T:
+            emb_frames = temb
+        else:                                                  # single timestep -> broadcast
+            emb_frames = temb[:, :1].expand(B, T, temb.shape[-1])
+        emb_tokens = emb_frames.repeat_interleave(nh * nw, dim=1)  # (B, L, D)
+
+        # ---- block-causal temporal mask (True = attend) ----
+        attn_mask = t_idx.unsqueeze(1) >= t_idx.unsqueeze(0)   # (L, L) bool
+
+        idx = (t_idx, h_idx, w_idx)
+        for blk in self.blocks:
+            h = blk(h, emb_tokens, crossattn_emb, idx, attn_mask)
+
+        out = self.head(self.out_norm(h))                      # (B, L, patch_out_dim)
+        return unpatchify_latent(out, cfg.patch_spatial, cfg.out_channels, T, nh, nw)
+
+
 # ---------------------------------------------------------------------------
 # Consistency helper  (compare training path vs KV-cache path for the first
 # supervised patch — pred_patches[0], which maps to the first patch of tgt[0])
